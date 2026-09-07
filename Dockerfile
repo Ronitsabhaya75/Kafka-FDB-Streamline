@@ -17,6 +17,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential clang cmake ninja-build git \
     libssl-dev liblz4-dev zlib1g-dev pkg-config \
+    libjemalloc-dev \
     python3 python3-dev python3-pip python3-venv \
     curl ca-certificates \
   && rm -rf /var/lib/apt/lists/*
