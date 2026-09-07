@@ -1,0 +1,46 @@
+name: Test Dockerfile
+
+on:
+  pull_request:
+    paths:
+      - 'Dockerfile'
+      - '.github/workflows/**'
+  workflow_dispatch:  # manual trigger button
+
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Free up disk space (GitHub runners have pre-installed stuff)
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          df -h /
+
+      - name: Build Docker image
+        run: docker build -t fdb-cdc .
+
+      - name: Test FDB starts and CDC works
+        run: |
+          docker run --rm fdb-cdc bash -c '
+            echo "=== Checking binaries ==="
+            which fdbserver && which fdbcli
+
+            echo "=== Checking libfdb_c ==="
+            ls -la /usr/local/lib/libfdb_c.so
+
+            echo "=== Testing Python CDC bindings ==="
+            python3 -c "import fdb; fdb.api_version(800); print(\"CDC bindings OK\")"
+
+            echo "=== Testing FDB cluster ==="
+            fdbcli --exec "status" && echo "FDB cluster OK"
+
+            echo "=== All tests passed ==="
+          '

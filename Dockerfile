@@ -31,6 +31,7 @@ RUN git clone --branch dev/tclinkenbeard/python-native-cdc-bindings \
 
 WORKDIR /fdb
 
+
 # Rebase onto latest main for Boost / build fixes
 ENV GIT_COMMITTER_NAME="docker" GIT_COMMITTER_EMAIL="docker@build" GIT_EDITOR=true
 RUN git remote add upstream https://github.com/apple/foundationdb.git \
@@ -66,6 +67,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates curl \
   && rm -rf /var/lib/apt/lists/*
 
+# ---------- 5. Copy built binaries ----------
 # Copy built binaries
 COPY --from=builder /fdb/build/bin/fdbserver /usr/local/bin/
 COPY --from=builder /fdb/build/bin/fdbcli    /usr/local/bin/
