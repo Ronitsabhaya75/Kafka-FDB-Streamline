@@ -51,6 +51,7 @@ RUN mkdir build \
       -DCMAKE_C_COMPILER=clang \
       -DCMAKE_CXX_COMPILER=clang++ \
       -DCMAKE_CXX_FLAGS="-stdlib=libc++" \
+      -DBUILD_TESTING=OFF \
       .. \
  && ninja fdbserver fdbcli fdb_c
 
