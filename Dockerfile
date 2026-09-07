@@ -15,12 +15,13 @@ ENV DEBIAN_FRONTEND=noninteractive
 
 # ---------- 1. Build dependencies ----------
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential clang cmake ninja-build git \
+    build-essential clang ninja-build git \
     libssl-dev liblz4-dev zlib1g-dev pkg-config \
     libjemalloc-dev \
     libc++-dev libc++abi-dev \
     python3 python3-dev python3-pip python3-venv \
     curl ca-certificates \
+  && pip3 install --break-system-packages cmake \
   && rm -rf /var/lib/apt/lists/*
 
 # Use clang as the default compiler (matches FDB CI)
@@ -51,7 +52,7 @@ RUN mkdir build \
       -DCMAKE_C_COMPILER=clang \
       -DCMAKE_CXX_COMPILER=clang++ \
       -DCMAKE_CXX_FLAGS="-stdlib=libc++" \
-      -DBUILD_TESTING=OFF \
+      -DCMAKE_POLICY_DEFAULT_CMP0028=OLD \
       .. \
  && ninja fdbserver fdbcli fdb_c
 
