@@ -1,0 +1,5 @@
+{
+  "dev.containers.dockerPath": "/usr/local/bin/docker",
+  "dev.containers.dockerComposePath": "/Users/ronitsabhaya/.docker/bin/docker-compose",
+  "docker.dockerPath": "/usr/local/bin/docker"
+}
