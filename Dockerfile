@@ -13,7 +13,7 @@ RUN cd /fdb && \
     -DUSE_JEMALLOC=OFF \
     -DCMAKE_POLICY_DEFAULT_CMP0028=OLD \
     .. && \
-    ninja fdbserver fdbcli fdb_c
+    ninja fdbserver fdbcli fdb_c fdb_python
 
 FROM --platform=linux/amd64 ubuntu:24.04 AS runtime
 
@@ -30,10 +30,7 @@ RUN mkdir -p /var/lib/foundationdb/data \
 COPY --from=builder /fdb/build/bin/fdbserver /usr/local/bin/
 COPY --from=builder /fdb/build/bin/fdbcli /usr/local/bin/
 COPY --from=builder /fdb/build/lib/libfdb_c.so /usr/local/lib/
-COPY --from=builder /fdb/bindings/python /opt/fdb-python
-
-
-COPY --from=builder /fdb/build/bindings/python/fdb/fdboptions.py /opt/fdb-python/fdb/
+COPY --from=builder /fdb/build/bindings/python /opt/fdb-python
 
 RUN chmod +x /usr/local/bin/fdbserver /usr/local/bin/fdbcli
 
@@ -67,7 +64,7 @@ echo "Starting fdbserver in auto-restart loop..."
 sleep 2
 
 echo "Configuring new database..."
-fdbcli --exec "configure new single memory ; status" 2>/dev/null || true
+fdbcli --exec "configure new single memory ; configure native_cdc_enabled ; status" 2>/dev/null || true
 
 echo ""
 echo "============================================"
