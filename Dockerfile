@@ -46,14 +46,16 @@ RUN ldconfig
 
 RUN cd /opt/fdb-python && pip3 install --break-system-packages --verbose .
 
-RUN echo "docker:docker@127.0.0.1:4500" > /etc/foundationdb/fdb.cluster
-
 ENV FDB_CLUSTER_FILE=/etc/foundationdb/fdb.cluster
 ENV LD_LIBRARY_PATH=/usr/local/lib
 
 COPY <<'EOF' /usr/local/bin/start-fdb.sh
 #!/bin/bash
 set -e
+
+if [ ! -f "$FDB_CLUSTER_FILE" ] || [ ! -s "$FDB_CLUSTER_FILE" ]; then
+    echo "${FDB_CLUSTER_STRING:-docker:docker@127.0.0.1:4500}" > "$FDB_CLUSTER_FILE"
+fi
 
 echo "Starting fdbserver in auto-restart loop..."
 (
