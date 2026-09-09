@@ -6,6 +6,7 @@ services:
       dockerfile: Dockerfile
     volumes:
       - ..:/workspace
+    working_dir: /workspace
     ports:
       - "4500:4500"
     environment:

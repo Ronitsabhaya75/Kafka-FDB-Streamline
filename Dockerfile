@@ -76,7 +76,10 @@ echo ""
 
 exec "$@"
 EOF
-RUN chmod +x /usr/local/bin/start-fdb.sh
+RUN chmod +x /usr/local/bin/start-fdb.sh && \
+    echo 'export PS1="\[\e[1;36m\]🐳 [fdb-dev]\[\e[m\] \[\e[1;34m\]\w\[\e[m\] \[\e[1;32m\]#\[\e[m\] "' >> /root/.bashrc
+
+WORKDIR /workspace
 
 EXPOSE 4500
 
