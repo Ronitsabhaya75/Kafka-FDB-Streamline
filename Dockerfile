@@ -13,7 +13,15 @@ RUN cd /fdb && \
     -DUSE_JEMALLOC=OFF \
     -DCMAKE_POLICY_DEFAULT_CMP0028=OLD \
     .. && \
-    ninja fdbserver fdbcli fdb_c fdb_python
+    ninja fdbserver fdbcli fdb_c fdb_python && \
+    find /fdb/build -name "fdboptions.py" -ls && \
+    find /fdb/build -name "fdboptions.py" -exec cp {} /fdb/build/bindings/python/fdb/fdboptions.py \; 2>/dev/null; \
+    if [ ! -f /fdb/build/bindings/python/fdb/fdboptions.py ]; then \
+      echo "fdboptions.py not found via find, trying vexillographer generation..." && \
+      python3 /fdb/bindings/python/fdb/fdboptions.py.cmake /fdb/fdbclient/vexillographer/fdb.options \
+        > /fdb/build/bindings/python/fdb/fdboptions.py 2>/dev/null || true; \
+    fi && \
+    ls -la /fdb/build/bindings/python/fdb/
 
 FROM --platform=linux/amd64 ubuntu:24.04 AS runtime
 
@@ -77,6 +85,7 @@ echo ""
 exec "$@"
 EOF
 RUN chmod +x /usr/local/bin/start-fdb.sh && \
+    echo 'export PS1="\[\e[1;36m\]🐳 [fdb-dev]\[\e[m\] \[\e[1;34m\]\w\[\e[m\] \[\e[1;32m\]#\[\e[m\] "' >> /etc/bash.bashrc && \
     echo 'export PS1="\[\e[1;36m\]🐳 [fdb-dev]\[\e[m\] \[\e[1;34m\]\w\[\e[m\] \[\e[1;32m\]#\[\e[m\] "' >> /root/.bashrc
 
 WORKDIR /workspace
