@@ -1,5 +1,8 @@
 # FoundationDB native CDC, deep dive
 
+Trello: [Research FoundationDB CDC Architecture & API](https://trello.com/c/DLfs4a8S)
+(`DLfs4a8S`).
+
 Source-read only, 2026-09-09. No cluster contacted, no binding imported, no probe run. Nothing here
 carries ⚑LIVE.
 
@@ -11,12 +14,17 @@ carries ⚑LIVE.
 | 2 | Python API | Five future-returning `Database` methods (`register_cdc_stream`, `remove_cdc_stream`, `list_cdc_streams`, `create_cdc_consumer`, `resume_cdc_consumer`), plus a `CdcConsumer` handle with `consume` / `acknowledge` (futures) and `get_position` / `close` (synchronous). Five value types, one non-exhaustive enum. `consume()` and `acknowledge()` take no arguments. No `asyncio`. All of it prospective on unmerged PR #13925. | [§2](#2-python-api-deliverable-2) |
 | 3 | Limitations | At-least-once only. One oversized commit version stalls a stream permanently (`server_overloaded`, and no way to skip the version). No error mapping shipped, and the standard retry predicate is wrong about two of the three CDC error codes. Unacked streams retain TLog history with no age bound. **P1: #13925 and #13971 redefine the same symbols at the same API version, undetectable at load.** | [§3](#3-known-limitations-and-gaps-deliverable-3) |
 | 4 | API version | API 800, hard-gated, raising synchronously below it. Selecting 800 also removes tenants and metaclusters, blob granules, ChangeFeed, storage cache servers, the configuration database and dynamic knobs, and encryption at rest. No released FDB has CDC. 7.4.7 has zero CDC symbols, and 8.0.0 is unreleased with no date. | [§4](#4-api-version-requirements-deliverable-4) |
+| 5 | Directory Layer | CDC registers **byte ranges**, not paths. Child **directories** get independent prefixes and will not appear on a parent stream. Nested **subspaces** share the prefix and will. Register `[rawPrefix, strinc(rawPrefix))`, never `dir.range()`. | [§2.5](#25-registering-a-directorys-range-) |
+| 6 | Kafka proposal mapping | CDC identity is `(version, array index)`. `sequence_no` and `VersionEnd` are bridge inventions. Empty `consume()` that still advances the cursor is the native idle watermark. | [§5](#5-mapping-onto-the-kafka-proposal) |
 
 ## How to read this
 
 Ninety seconds: the table above, the state diagram in [§1.1](#11-the-state-machine-), the reference
 table in [§2.1](#21-reference-table-), and the ranked limitations table in
-[§3](#3-known-limitations-and-gaps-deliverable-3). That is the whole ticket.
+[§3](#3-known-limitations-and-gaps-deliverable-3). Directory Layer is
+[§2.5.1](#251-directory-layer-why-the-connector-keys-off-directories-). Replay is
+[under §3](#replay-under-at-least-once-). Proposal mapping is
+[§5](#5-mapping-onto-the-kafka-proposal). That is the whole ticket.
 
 Headings are marked ▲ must-read (you will get this wrong if you skip it) or ▽ skim (reference). Each
 section opens with a one-line takeaway. The takeaways alone give the claims without the evidence.
@@ -337,6 +345,39 @@ and immutable, and that mutation is silently invisible. `validateNativeCdcStream
 directory's prefix contractually stable. A `move` changes nothing about an already-registered range,
 and `developer-guide.rst:141-216` promises nothing either way.
 
+### 2.5.1 Directory Layer: why the connector keys off directories ▲
+
+> In one line: a directory is a contiguous exclusive key range. CDC tracks key ranges, not paths.
+> Child directories are not in that range.
+
+From the [Developer Guide — Directories](https://apple.github.io/foundationdb/developer-guide.html#directories)
+(`developer-guide.rst` directories section, **pin**):
+
+- A directory is a hierarchical path (tuple of strings) mapped by a high-contention allocator onto a
+  **short independent prefix**.
+- `create` / `open` / `create_or_open` return a `DirectorySubspace` that is both a directory and a
+  subspace.
+- **Subdirectories do not nest under the parent prefix.** `('alpha',)` and `('alpha','bravo')` get
+  unrelated prefixes. You cannot range-read a directory and its descendants together, and a CDC
+  stream on the parent **will not** see writes into the child directory.
+- **Directory partitions** (`layer=b'partition'`) *do* prepend the parent prefix to descendants, at
+  the cost of longer keys and no cross-partition moves.
+- Nested **subspaces** (`users['profile']`) *do* share the directory prefix; they are keys under the
+  subspace, not separate directories. Writes there **will** appear on a stream registered for that
+  directory's prefix range ([§2.5](#25-registering-a-directorys-range-)).
+
+CDC has no directory object. It only accepts `[begin, end)` in normal user key space. For this
+project that means:
+
+1. `dir = fdb.directory.create_or_open(db, ('my_data',))`, then register
+   `[rawPrefix, strinc(rawPrefix))` as in §2.5. That captures **this directory's content keys only**.
+2. Writes into child **directories** do not appear on that stream.
+3. Writes into nested **subspaces** of the same directory do.
+4. After #13971, one stream can union several directory prefixes (parent + selected children) under
+   one cursor and one ack. Independent per-directory progress still needs **separate streams**.
+
+That is the entire reason the connector proposal keys off directories.
+
 ### 2.6 Below the API, and the #13971 break ▽
 
 #13925 adds no C code. It prototypes twelve existing `fdb_c.h` symbols lazily on first CDC use, so a
@@ -386,6 +427,36 @@ result. Mapping a CDC record back to an application-level call is unsound.
 | **Coalescing erases operations.** `set(k,v)` then `add(k,d)` collapses to one `SET_VALUE` of `doLittleEndianAdd(v,d)`, and the `ADD` is gone. | Read-your-writes write map. `add`+`add` merge when operand sizes match and stack when they do not (`:520-528`). `set` then `compare_and_clear` can emit a clear. | `WriteMap.cpp:402-409`, `:413-421`; `ReadYourWrites.cpp:1952-1958` |
 | **Order is clears first, then key order**, with adjacent single-key clears merged into one wider `CLEAR_RANGE`. | "Clear ranges must be done first because of keys that are both cleared and set to a new value." `clear(k)` always surfaces as `CLEAR_RANGE(k, k‖\x00)`, since there is no single-key clear type, and `clear_range` is clipped to the registered range, so a replayed clear is uninterpretable without that range. | `ReadYourWrites.cpp:1918`, `:1919-1932`, from `:1386`; `NativeAPI.cpp:4081-4100` |
 | **No timestamp, no txn id, no txn boundary.** Only `(version, array index)`. | Several transactions share one commit version with nothing separating them, so the version group is the only atomicity unit. Preserve it. FDB versions are not wall-clock, so synthesise any timestamp at ingest and label it as synthetic. | `api-c.rst:594-598` |
+
+### Replay under at-least-once ▲
+
+> In one line: SET and CLEAR replay harmlessly. ADD, XOR, and APPEND_IF_FITS do not. Exactly-once
+> difficulty for the connector is determined by whether the source directory uses those ops.
+
+CDC returns **raw operations**, not post-images (`fdb_c.h` `FDBMutationType` / `FDBCdcMutationType`,
+**pin** `:194-232`). Atomic ops are applied at the storage server without reading the old value, so
+the bridge cannot flatten them into SET. L5 already requires the sink to tolerate whole-batch
+replay. Whether that replay is *safe* depends on `CdcMutation.type`:
+
+| Code | Type | Idempotent under replay? | Notes |
+|---|---|---|---|
+| 0 | `SET_VALUE` | Yes | `param1=key`, `param2=value` |
+| 1 | `CLEAR_RANGE` | Yes as a range op; awkward as a Kafka tombstone | Clipped to the stream range; split at gaps after #13971. No single-key clear type. |
+| 2 | `ADD` | **No** — replay double-counts | Little-endian integer add; overflow truncates to operand width |
+| 6 | `AND` | Bitwise: usually stable once applied | Deprecated name; missing value stores `param`. At API ≥ 510 rewritten to `AND_V2` (19) before CDC sees it |
+| 7 | `OR` | Same | |
+| 8 | `XOR` | **No** — replay toggles again | |
+| 9 | `APPEND_IF_FITS` | **No** | Appends `param`; silent no-op if the result would exceed max value size |
+| 12 | `MAX` | Yes (unsigned int max) | |
+| 13 | `MIN` | Yes (unsigned int min) | Missing value stores `param`. At API ≥ 510 rewritten to `MIN_V2` (18) |
+| 14 / 15 | `SET_VERSIONSTAMPED_*` | Treat as SET | Declared but **dead on the wire**; rewritten to `SET_VALUE` before CDC tagging (fidelity table above) |
+| 16 / 17 | `BYTE_MAX` / `BYTE_MIN` | Yes (lexicographic) | |
+| 18 / 19 | `MIN_V2` / `AND_V2` | Yes / bitwise | What `MIN` / `AND` actually arrive as at API 800 |
+| 20 | `COMPARE_AND_CLEAR` | Conditional | Clears the key if current value equals operand; replay depends on current value |
+
+CDC does **not** materialize the result of an atomic. A sink that wants a current value must apply
+the op itself or take a snapshot. `CLEAR_RANGE` cannot be expressed as one keyed tombstone on a
+compacted Kafka topic.
 
 ### Errors we have to map ▲
 
@@ -516,6 +587,28 @@ branch, no `8.0.0` tag, newest upstream tag `7.4.7`. 7.4.8 is in flight on `rele
 So nothing released can run this CDC path. It needs a `main` / 8.0.0 build (the pin, `c50931feb`),
 API 800, `ENABLE_NATIVE_CDC` on the server processes, and, for Python, the unmerged #13925 on top,
 with L2 open until #13925 and #13971 are reconciled upstream.
+
+---
+
+## 5. Mapping onto the Kafka proposal
+
+> In one line: the native record is `(version, array index)`. `sequence_no` and `VersionEnd` are
+> ours. Empty consume that still moves the cursor is the idle watermark.
+
+The connector proposal's Protobuf (`FDBVersionIndex`, `FDBMutationRecord`, `VersionEnd`) is **not**
+what `consume()` returns. CDC groups mutations by commit version and stops there
+(`CdcConsumeResult` → `CdcVersionedMutations` → `CdcMutation`, [§2.2](#22-value-types-)).
+
+| Proposal field | Native CDC | What the bridge does |
+|---|---|---|
+| `fdb_version` | `CdcVersionedMutations.version` | Copy. One version can contain several transactions; they are not separable. |
+| `sequence_no` | **Absent.** Intra-version order is tuple index only | Assign it in the bridge as the index inside `CdcVersionedMutations.mutations`. Dedup key: `(stream_id, version, sequence_no)`. |
+| `VersionEnd` | **Absent.** No end-of-version or heartbeat record | Emit one after a complete version group. An **empty** `consume()` that still advances `last_consumed_version` is the native idle/gap signal; translate that into `VersionEnd` so downstream can move "current" without stalling. |
+| Mutation payload | `type` + `param1` + `param2` bytes | Forward as-is. Do not collapse atomics to SET ([replay table](#replay-under-at-least-once-)). |
+| Checkpoint | In-memory `CdcCursor` plus cluster `minVersion` | Persist `CdcCursor` (or equivalent) **before** `acknowledge()`. Empty replies still move the cursor; checkpoint them. |
+
+Required order stays [§1.3](#13-acknowledgement-semantics-): consume → durably publish + checkpoint
+→ acknowledge. Ack is not atomic with Kafka. Expect rewind after CDC proxy replacement.
 
 ---
 
