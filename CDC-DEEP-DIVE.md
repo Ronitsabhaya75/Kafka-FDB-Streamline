@@ -4,24 +4,27 @@ Trello: [Research FoundationDB CDC Architecture & API](https://trello.com/c/DLfs
 (`DLfs4a8S`).
 
 Source-read only, 2026-09-09. No cluster contacted, no binding imported, no probe run. Nothing here
-carries ⚑LIVE.
+carries ⚑LIVE. Revised 2026-09-11 for review on PR #3: baseline snapshot (§1.6), threading (§2.7),
+retention monitoring (§3, *Retention*), Kafka key and partitioning (§5.1).
 
 ## TL;DR
 
 | # | Deliverable | The answer | |
 |---|---|---|---|
 | 1 | Stream lifecycle | `register_cdc_stream` → `create_cdc_consumer` (or `resume_cdc_consumer` from a persisted cursor) → `consume` → durably apply **and checkpoint** → `acknowledge` → `close`. `close()` neither acks nor removes. Removal is terminal. Re-registering the name mints a new `stream_id`, killing every persisted cursor that names the old one. | [§1](#1-cdc-stream-lifecycle-deliverable-1) |
-| 2 | Python API | Five future-returning `Database` methods (`register_cdc_stream`, `remove_cdc_stream`, `list_cdc_streams`, `create_cdc_consumer`, `resume_cdc_consumer`), plus a `CdcConsumer` handle with `consume` / `acknowledge` (futures) and `get_position` / `close` (synchronous). Five value types, one non-exhaustive enum. `consume()` and `acknowledge()` take no arguments. No `asyncio`. All of it prospective on unmerged PR #13925. | [§2](#2-python-api-deliverable-2) |
-| 3 | Limitations | At-least-once only. One oversized commit version stalls a stream permanently (`server_overloaded`, and no way to skip the version). No error mapping shipped, and the standard retry predicate is wrong about two of the three CDC error codes. Unacked streams retain TLog history with no age bound. **P1: #13925 and #13971 redefine the same symbols at the same API version, undetectable at load.** | [§3](#3-known-limitations-and-gaps-deliverable-3) |
+| 2 | Python API | Five future-returning `Database` methods (`register_cdc_stream`, `remove_cdc_stream`, `list_cdc_streams`, `create_cdc_consumer`, `resume_cdc_consumer`), plus a `CdcConsumer` handle with `consume` / `acknowledge` (futures) and `get_position` / `close` (synchronous). Five value types, one non-exhaustive enum. `consume()` and `acknowledge()` take no arguments. No `asyncio`; `wait()` parks only its caller (§2.7). All of it prospective on unmerged PR #13925. | [§2](#2-python-api-deliverable-2) |
+| 3 | Limitations | At-least-once only. One oversized commit version stalls a stream permanently (`server_overloaded`, and no way to skip the version). No error mapping shipped, and the standard retry predicate is wrong about two of the three CDC error codes. Unacked streams retain TLog history with no age bound, and a TLog disk at 5 % free stops commits cluster-wide. **P1: #13925 and #13971 redefine the same symbols at the same API version, undetectable at load.** | [§3](#3-known-limitations-and-gaps-deliverable-3) |
 | 4 | API version | API 800, hard-gated, raising synchronously below it. Selecting 800 also removes tenants and metaclusters, blob granules, ChangeFeed, storage cache servers, the configuration database and dynamic knobs, and encryption at rest. No released FDB has CDC. 7.4.7 has zero CDC symbols, and 8.0.0 is unreleased with no date. | [§4](#4-api-version-requirements-deliverable-4) |
 | 5 | Directory Layer | CDC registers **byte ranges**, not paths. Child **directories** get independent prefixes and will not appear on a parent stream. Nested **subspaces** share the prefix and will. Register `[rawPrefix, strinc(rawPrefix))`, never `dir.range()`. | [§2.5](#25-registering-a-directorys-range-) |
-| 6 | Kafka proposal mapping | CDC identity is `(version, array index)`. `sequence_no` and `VersionEnd` are bridge inventions. Empty `consume()` that still advances the cursor is the native idle watermark. | [§5](#5-mapping-onto-the-kafka-proposal) |
+| 6 | Kafka proposal mapping | CDC identity is `(version, array index)`. `sequence_no` and `VersionEnd` are bridge inventions. Empty `consume()` that still advances the cursor is the native idle watermark. The Kafka key picks a partition, not the partition count, and no key gives atomicity. Default: one partition per stream, FDB key as record key, `VersionEnd` per group; Kafka transactions next. | [§5](#5-mapping-onto-the-kafka-proposal), [§5.1](#51-kafka-record-key-partitioning-and-atomicity-) |
+| 7 | Baseline snapshot | CDC starts at the registration commit version and never returns state. Register **first**, then range-read the directory in chunks, one transaction and one read version `R_i` each (5 s MVCC limit), then replay CDC dropping every mutation piece at `v ≤ R_i` in its chunk. Exact for every mutation type. Snapshot-then-register silently loses `(R, C)`. | [§1.6](#16-baseline-snapshot-and-handoff-) |
 
 ## How to read this
 
 Ninety seconds: the table above, the state diagram in [§1.1](#11-the-state-machine-), the reference
 table in [§2.1](#21-reference-table-), and the ranked limitations table in
-[§3](#3-known-limitations-and-gaps-deliverable-3). Directory Layer is
+[§3](#3-known-limitations-and-gaps-deliverable-3). Baseline snapshot is
+[§1.6](#16-baseline-snapshot-and-handoff-). Directory Layer is
 [§2.5.1](#251-directory-layer-why-the-connector-keys-off-directories-). Replay is
 [under §3](#replay-under-at-least-once-). Proposal mapping is
 [§5](#5-mapping-onto-the-kafka-proposal). That is the whole ticket.
@@ -36,26 +39,10 @@ Appendices hold derivations only.
 
 | Ref | SHA | Meaning |
 |---|---|---|
-| `../foundationdb` | `c50931feb` | the pin. 8.0.0, API 800 (`CMakeLists.txt:27`, `flow/ApiVersions.cmake:2`) |
-| `upstream/main` | `b870261ee` | upstream head when read |
-| PR #13925 (`pr13925`) | `ee1fa01e6` | Python CDC bindings. Open, `mergeable_state: dirty` |
-| PR #13971 (`pr13971`) | `c7fb905dc` | multi-range CDC streams. Open, `mergeable_state: dirty` |
-
-### Four premise corrections
-
-The ticket got four things wrong, and one of them cannot be worked around.
-
-1. **CDC is not in FoundationDB 7.4.7.** Zero CDC symbols
-   (`git show 7.4.7:bindings/c/foundationdb/fdb_c.h | grep -ci cdc` → 0). `release-7.4` is now
-   `VERSION 7.4.8`, still without CDC. The ticket's 7.4.7 doc-tree citation cannot be satisfied.
-2. **The feature did not land via #13925 or #13971.** CDC landed on `main` via #13287 (feature) and
-   #13674 (C bindings). #13925 is the *Python* follow-up, #13971 the *multi-range* follow-up. Neither
-   merged, neither in the pin.
-3. **`register_stream()` and `ack()` do not exist.** Real names in TL;DR row 2 and §2.1
-   (`impl.py:1424-1485`, `:1586-1605` @ `ee1fa01e6`).
-4. **A directory's CDC range is `[rawPrefix, strinc(rawPrefix))`, not `dir.range()`.** Different
-   ranges, silent difference, permanent registration. Rule in
-   [§2.5](#25-registering-a-directorys-range-). The `Proposal.md` sample predates it.
+| Pin | [`c50931feb`](https://github.com/apple/foundationdb/commit/c50931feb) | 8.0.0, API 800 (`CMakeLists.txt:27`, `flow/ApiVersions.cmake:2`) |
+| `upstream/main` | [`b870261ee`](https://github.com/apple/foundationdb/commit/b870261ee) | upstream head when read |
+| [PR #13925](https://github.com/apple/foundationdb/pull/13925) | [`ee1fa01e6`](https://github.com/apple/foundationdb/commit/ee1fa01e6) | Python CDC bindings. Open, `mergeable_state: dirty` |
+| [PR #13971](https://github.com/apple/foundationdb/pull/13971) | [`c7fb905dc`](https://github.com/apple/foundationdb/commit/c7fb905dc) | multi-range CDC streams. Open, `mergeable_state: dirty` |
 
 ### Verified vs prospective
 
@@ -123,19 +110,19 @@ stateDiagram-v2
 
 > **Signature risk.** The first edge is the least stable thing here. PR #13971 (`c7fb905dc`, open)
 > replaces the C signature with `(name, name_length, ranges, range_count)` under the *same* symbol at
-> the *same* API version, no `_v2` (`13971.diff:50-68`, `:87-94`). See L2 in §3.
+> the *same* API version, no `_v2`. See L2 in §3.
 
 ### 1.2 Who holds what state ▽
 
 | Lives where | What | Source |
 |---|---|---|
 | Cluster (transaction state) | `\xff/cdc/name/<name>` → `CDCStreamId`; `\xff/cdc/maxStreamId` (monotonic allocation); `\xff/cdc/keys/<streamId>` → the **immutable** `KeyRange`; `\xff/cdc/tagHistory/<streamId>/<version>/<tag>` | `design/cdc.md:335-343` |
-| Cluster (storage-backed) | `\xff\x02/cdc/minVersion/<streamId>` → `Version`, the retention watermark. Versionstamped at registration, advances to `V+1` on ack | `design/cdc.md:356-371` |
+| Cluster (storage-backed) | `\xff\x02/cdc/minVersion/<streamId>` → `Version`, the retention watermark. Versionstamped at registration, advances to `V+1` on ack. `<streamId>` is an 8-byte little-endian `uint64`, not decimal text. The value is a 10-byte versionstamp until the first ack, then a protocol-versioned `int64`. Read it through `list_cdc_streams()`, not raw | `design/cdc.md:356-371`; `SystemData.cpp:791, 910-950` |
 | Client handle (in memory) | `CdcConsumer`, an owned native handle, not a `Future`. Its only client-visible state is the delivered position, via `get_position()` | `impl.py:1547-1615` |
-| **Your application (durable)** | `CdcCursor(stream_id, last_consumed_version)`, which "contains no process-local state". `resume_cdc_consumer` never reads the acked position back from the cluster; it rebuilds the handle from those two ints | `13925.diff:1048`; `impl.py:1465-1480` |
+| **Your application (durable)** | `CdcCursor(stream_id, last_consumed_version)`, which "contains no process-local state". `resume_cdc_consumer` never reads the acked position back from the cluster; it rebuilds the handle from those two ints | `impl.py:1465-1480` |
 
 `min_version` reaches the client only via `list_cdc_streams()`, and it is "a retention frontier, not a
-snapshot version for the registered key range" (`13925.diff:1077-1078`). Never a read version.
+snapshot version for the registered key range" (#13925). Never a read version.
 Retention releases per CDC *tag*, at `safePop(T) = min(minVersion(S))` over every live stream sharing
 the tag, so a slow sibling stream pins your history too (`design/cdc.md:591-594`).
 
@@ -149,19 +136,23 @@ the tag, so a slow sibling stream pins your history too (`design/cdc.md:591-594`
 (`impl.py:1598-1605`). It advances cluster `minVersion` to `V + 1` (`design/cdc.md:369-371`;
 `native_cdc_tests.py:286-287`), releasing history through it. Re-acking a durable position moves
 nothing (`native_cdc_tests.py:281-287`). It is "not atomic with writes to a downstream system or an
-application checkpoint" (`13925.diff:1139-1140`), and CDC methods are not on `Transaction`, so
-`@fdb.transactional` cannot make them so (`13925.diff:1004-1006`).
+application checkpoint" (#13925), and CDC methods are not on `Transaction`, so
+`@fdb.transactional` cannot make them so.
 
 **Why the order is not negotiable.** Acking before you have durably applied *and* checkpointed turns
 a crash into data loss. The ack releases TLog history through that version and the un-checkpointed
 work cannot be replayed. Checkpointing first turns a crash into duplicate delivery instead, which you
 must tolerate regardless, since "unacknowledged mutations may be redelivered after CDC proxy
-replacement" (`13925.diff:1058-1059`).
+replacement" (#13925).
 
-Do this even when the reply is empty. "Even an empty reply can advance the cursor", so never skip the
-checkpoint because `mutations` is empty (`13925.diff:1110-1113`). Empty replies are the norm.
-`consume()` is a long poll over a bounded `CDC_PROXY_CONSUME_POLL_TIMEOUT` lease (5.0 s,
-`fdbserver/core/ServerKnobs.cpp:186`).
+Never ack a position you have not checkpointed. "Even an empty reply can advance the cursor" (#13925),
+so an ack after an empty reply still needs its checkpoint first. Skipping both the checkpoint and the ack
+for an empty reply is safe, which is why [§2.7](#27-threads-blocking-and-the-network-thread-) can
+coalesce them. Empty replies are the norm.
+`consume()` is a long poll. The proxy caps each server-side lease at `CDC_PROXY_CONSUME_POLL_TIMEOUT`
+(5.0 s, `fdbserver/core/ServerKnobs.cpp:186`; `CDCProxy.cpp:1544-1552`), but the client renews an
+empty, unadvanced lease itself (`NativeCdc.cpp:809-814`), so `wait()` returns only on data, an
+advanced watermark, or an error ([§2.7](#27-threads-blocking-and-the-network-thread-)).
 
 `close()` releases the handle and acknowledges nothing. `min_version` is unchanged across a close
 (`impl.py:1570-1576`, `native_cdc_tests.py:257-258`).
@@ -174,16 +165,16 @@ checkpoint because `mutations` is empty (`13925.diff:1110-1113`). Empty replies 
 `resume_cdc_consumer(cursor)` checks only that `stream_id` is in `[0, 2**64)` and
 `last_consumed_version` in `[-2**63, 2**63)`, raising `ValueError` otherwise and `TypeError` for
 non-ints (`impl.py:1465-1480`). "Stream existence and cursor validity are checked when consuming or
-acknowledging, not by this method" (`13925.diff:1049-1051`). `get_position()` echoes the cursor until
+acknowledging, not by this method" (#13925). `get_position()` echoes the cursor until
 the first consume (`native_cdc_tests.py:267`).
 
 So resume only from a durably processed checkpoint, wait for a fresh read version to reach
 `cursor.last_consumed_version`, then reissue `acknowledge()` and wait on it. That closes the crash
-window between persisting the checkpoint and completing its acknowledgement (`13925.diff:1193-1195`).
+window between persisting the checkpoint and completing its acknowledgement (#13925).
 A resumed handle "lacks the original handle's delivery proof", so a cursor ahead of that read version
 draws `client_invalid_operation` even if the data was previously delivered. Upstream is explicit:
 "bound the read-version wait rather than retrying all invalid-operation errors"
-(`13925.diff:1050-1058`; proxy check at `fdbserver/cdcproxy/CDCProxy.cpp:1527-1535`).
+(#13925; proxy check at `fdbserver/cdcproxy/CDCProxy.cpp:1527-1535`).
 
 The other direction is `transaction_too_old`. Either the cursor is behind the already-acked
 watermark, or the required tagged data was popped, and the latter "indicat[es] a retention invariant
@@ -194,7 +185,7 @@ violation rather than a supported expiration policy" (`design/cdc.md:282-286`;
 ### 1.5 Removal, retention, and admission ▽
 
 - **Removal is terminal.** Re-registering the name "does not redirect their cursors to the new
-  stream" (`13925.diff:1033-1034`). It allocates a fresh id from `\xff/cdc/maxStreamId`, so every
+  stream" (#13925). It allocates a fresh id from `\xff/cdc/maxStreamId`, so every
   persisted `CdcCursor` naming the old id is dead. `remove_cdc_stream` is idempotent
   (`native_cdc_tests.py:311-312`).
 - **The range is immutable for the life of a `stream_id`.** Changing one means remove plus
@@ -204,7 +195,75 @@ violation rather than a supported expiration policy" (`design/cdc.md:282-286`;
 - **Admission.** Registering a *new* stream requires `ENABLE_NATIVE_CDC` on the server processes
   (§4.3). With it disabled, listing, removal, consumer creation, resume, consumption and
   acknowledgement keep working (`design/cdc.md:709-713`). Upstream advises "Register long-lived
-  streams rather than a stream per request" (`13925.diff:1027`).
+  streams rather than a stream per request" (#13925).
+
+### 1.6 Baseline snapshot and handoff ▲
+
+> In one line: register first, snapshot in chunks each stamped with its own read version, then replay
+> CDC dropping every mutation at or below its chunk's version. Snapshot first and you lose data.
+
+**What a fresh consumer sees.** Registration versionstamps `minVersion` with its own commit version
+`C` (`NativeCdc.cpp:442-443`; `design/cdc.md:228-231`). The proxy sets
+`bufferedThrough = minVersion - 1` (`CDCProxy.cpp:1183-1186`), and a `-1` cursor begins at the
+stream's *current* `minVersion` (`:1538`). A fresh consumer on a never-acked stream therefore gets
+every covered mutation at versions `≥ C` and no state. On an already-acked stream it starts at
+`last ack + 1`. Registration returns only the id (`CDCProxyInterface.h:59-61`). `min_version` equals
+`C` only until the first ack, and is "a retention frontier, not a snapshot version"
+(#13925). The protocol below never needs `C`.
+
+**No single-transaction snapshot.** Reads fail with `transaction_too_old` about 5 s after the read
+version (`MAX_READ_TRANSACTION_LIFE_VERSIONS`, `fdbserver/core/ServerKnobs.cpp:152`;
+`known-limitations.rst:86-89`). A directory is read across many transactions at many versions, the
+same inconsistent-copy-plus-log shape as FDB backup (`backups.rst:18`), with CDC as the log. Blob
+granules and ChangeFeed are deleted from the 8.0 binary (#12435, #12470, both in the pin). BulkDump
+writes one version per subrange (`bulkdump.rst:15` @ `upstream/main`), the same shape, and probably
+the same rule (UNVERIFIED: whether the manifest version is a read version). Upstream describes one
+consistent snapshot version `V` and warns that "a scan across unrelated read versions followed by
+registration can miss concurrent writes" (main `design/cdc.md:950-957`). The per-chunk filter below
+is our derivation from the same contract.
+
+**Protocol.**
+
+1. `register_cdc_stream(...).wait()`. Every later read version is `≥ C` (`api-c.rst:728`).
+2. Tile `[rawPrefix, strinc(rawPrefix))` (§2.5) into chunks, one transaction each. Take `R_i`, read
+   from `b_i` within a time or row budget well under 5 s, and end at `e_i = last_key + b"\x00"` (or
+   the range end). Record `(b_i, e_i, R_i)`. No gaps. On `transaction_too_old`, redo the chunk from
+   `b_i` rather than stitching two versions into one chunk. Split points:
+   `Transaction.get_range_split_points` (**pin** `impl.py:545`).
+3. Publish each chunk's rows plus a chunk marker (§5). Checkpoint the chunk map durably with the cursor.
+4. Consume. Forward a mutation piece in chunk `i` **iff** chunk `i` is snapshotted **and** `v > R_i`.
+   Split `CLEAR_RANGE` at chunk boundaries first. Once `v > max R_i`, the filter is a no-op: steady
+   state.
+
+**Interleaved variant (bounded retention).** Step 4 can run *during* step 2. Drop pieces in chunks not
+yet snapshotted, and before reading each chunk wait for a read version `≥ last_consumed_version`,
+bounded as in §1.4, since that frontier may briefly lead the read version (`design/cdc.md:565-566`).
+Take `R_j`, read chunk *j* and mark it snapshotted on the consume thread between replies; never process
+a reply while a chunk read is in flight, or its `v > R_j` pieces for chunk *j* are silently dropped.
+Acks then proceed normally. The sequential form holds all covered CDC on TLogs for the snapshot's
+whole duration (L3), and a recovery in that window keeps the cluster below `FULLY_RECOVERED`
+(`design/cdc.md:682-690`).
+
+**Why it converges.** Chunk `i` is exactly its keys' state at `R_i`, and CDC holds every version
+`≥ C`, where `C ≤ R_i`. Applying `v > R_i` in version order reproduces every later state, atomics
+included. The boundary is `≤ R_i` dropped, because a read at `R_i` already contains version `R_i`.
+
+| Op class | Replay all of `≥ C` over the snapshot (no filter) | With the `v ≤ R_i` filter |
+|---|---|---|
+| `SET_VALUE`, `CLEAR_RANGE`, `MAX`/`MIN_V2`, `AND_V2`/`OR`, `BYTE_MIN`/`BYTE_MAX` | Converges if each key sees one op family (SET/CLEAR, numeric `MAX`/`MIN_V2`, bitwise `AND_V2`/`OR`, lexicographic `BYTE_*`). Mixed families on one key can diverge. Downstream briefly sees pre-snapshot values | Exact |
+| `ADD`, `XOR`, `APPEND_IF_FITS` | **Wrong.** `(C, R_i]` applied twice ([replay table](#replay-under-at-least-once-)) | Exact |
+| `COMPARE_AND_CLEAR` | Depends on the current value | Exact |
+
+**What breaks it.**
+
+| Mistake | Effect | Guard |
+|---|---|---|
+| Snapshot before registration | `(R, C)` in neither source, silently | Register first |
+| Any ack between registration and the first consume | The fresh cursor starts past `min R_i + 1` (`CDCProxy.cpp:1538`), losing the gap | Sequential form only. Single writer (L4) is the real guard; asserting `min_version ≤ min R_i + 1` before the first consume catches a violation but cannot prevent one |
+| Chunk stitched across a retry | One `R_i` no longer describes the chunk | Redo the chunk |
+| Gaps, or `dir.range()` instead of the raw range | Keys with no `R_i`, missing from the snapshot | Tile the §2.5 range exactly |
+| `CLEAR_RANGE` forwarded whole | Deletes keys a later chunk shows re-set | Split at chunk bounds |
+| `<` instead of `≤` | Atomics at `v = R_i` double-apply | `≤` |
 
 ---
 ## 2. Python API (deliverable 2)
@@ -217,14 +276,14 @@ unmerged. #13971 breaks two signatures ([§2.6](#26-below-the-api-and-the-13971-
 
 ### 2.1 Reference table ▲
 
-Five methods on `Database` (`13925.diff:162-222`), five on `CdcConsumer` (`13925.diff:296-356`), none
+Five methods on `Database`, five on `CdcConsumer`, none
 on `Transaction` or `Tenant`, which "cannot be made atomic with application writes by using
-`transactional`" (`13925.diff:1004-1006`). No defaults, type annotations, options, limits or timeouts.
+`transactional`". No defaults, type annotations, options, limits or timeouts.
 
 | Call | Parameters | Returns | Resolved value | Sync? |
 |---|---|---|---|---|
 | `Database.register_cdc_stream` | `name, begin_key, end_key`, all `bytes` | `FutureUInt64` | `int` stream id (unsigned 64-bit) | future |
-| `Database.remove_cdc_stream` | `name: bytes` | `FutureVoid` | `None`, idempotent (`tests:311-312`) | future |
+| `Database.remove_cdc_stream` | `name: bytes` | `FutureVoid` | `None`, idempotent (`native_cdc_tests.py:311-312`) | future |
 | `Database.list_cdc_streams` | none | `FutureCdcStreamInfoArray` | `list[CdcStreamInfo]` | future |
 | `Database.create_cdc_consumer` | `name: bytes` | `FutureCdcConsumer` | `CdcConsumer` | future |
 | `Database.resume_cdc_consumer` | `cursor: CdcCursor` | `FutureCdcConsumer` | `CdcConsumer` | future |
@@ -238,23 +297,23 @@ Errors:
 
 | Raised | When |
 |---|---|
-| `RuntimeError("Native CDC requires API version 800 or later")`, or, at API 800 with a `libfdb_c` lacking the experimental symbols, `RuntimeError("The loaded FoundationDB C library does not support native CDC")` `from AttributeError` | first statement of all five `Database` methods, before coercion and before any future exists (`13925.diff:164, 182, 190, 197, 209`) |
-| `TypeError("Key must be of type bytes")` | key args via `keyToBytes()`, so `str` or anything without `as_foundationdb_key()` (**pin** `impl.py:1525-1530`; call sites `13925.diff:165-167, 183, 198`) |
-| `ValueError` | `resume_cdc_consumer` range-checks both cursor fields via `operator.index()` (`13925.diff:210-217`; `tests:347-368`) |
-| `ValueError("CDC consumer is closed")` | `consume`/`acknowledge`/`get_position` after `close()` (`13925.diff:304-354`) |
-| `fdb.FDBError` **from the future, not the call** | all native errors: bad name, range conflict, missing stream (`tests:317-323`) |
+| `RuntimeError("Native CDC requires API version 800 or later")`, or, at API 800 with a `libfdb_c` lacking the experimental symbols, `RuntimeError("The loaded FoundationDB C library does not support native CDC")` `from AttributeError` | first statement of all five `Database` methods, before coercion and before any future exists (`impl.py:1426, 1444, 1452, 1459, 1471`) |
+| `TypeError("Key must be of type bytes")` | key args via `keyToBytes()`, so `str` or anything without `as_foundationdb_key()` (**pin** `impl.py:1525-1530`) |
+| `ValueError` | `resume_cdc_consumer` range-checks both cursor fields via `operator.index()` (`native_cdc_tests.py:347-368`) |
+| `ValueError("CDC consumer is closed")` | `consume`/`acknowledge`/`get_position` after `close()` |
+| `fdb.FDBError` **from the future, not the call** | all native errors: bad name, range conflict, missing stream (`native_cdc_tests.py:317-323`) |
 
 - One `consume` or `acknowledge` outstanding per handle. Acks affect the whole stream, and `close()`
-  neither acks nor removes it (`13925.diff:288-295`).
+  neither acks nor removes it. Enforced in C, where the second future fails
+  `client_invalid_operation` (`NativeCdc.cpp:833-839`). §2.7.
 - `FutureCdcConsumer.wait()` memoizes its `CdcConsumer` under a lock. Each C getter transfers a
-  reference, so repeated `wait()`/`result()` return one identical object (`13925.diff:104-123`;
-  `tests:221-223`).
+  reference, so repeated `wait()`/`result()` return one identical object (`native_cdc_tests.py:221-223`).
 - Only the `Database` methods are gated. The seven `Cdc*` names export at any API version, covered by
-  a CI job at `--api-version 740` (`13925.diff:5-19`).
+  a CI job at `--api-version 740`.
 
 ### 2.2 Value types ▽
 
-Immutable `NamedTuple`s plus one `IntEnum` (`13925.diff:228-286`).
+Immutable `NamedTuple`s plus one `IntEnum`.
 
 | Type | Fields |
 |---|---|
@@ -272,16 +331,15 @@ SET_VERSIONSTAMPED_KEY=14 SET_VERSIONSTAMPED_VALUE=15 BYTE_MIN=16 BYTE_MAX=17
 MIN_V2=18 AND_V2=19 COMPARE_AND_CLEAR=20
 ```
 
-**Never call `CdcMutationType(code)` unguarded.** `CdcMutation.type` is a plain `int` (`tests:117`),
-code `255` round-trips (`tests:68, 108`), and callers must "handle an unrecognized raw `uint8_t`
+**Never call `CdcMutationType(code)` unguarded.** `CdcMutation.type` is a plain `int` (`native_cdc_tests.py:117`),
+code `255` round-trips (`native_cdc_tests.py:68, 108`), and callers must "handle an unrecognized raw `uint8_t`
 value" (`api-c.rst:583-584`).
 
 ### 2.3 What a mutation record is ▲
 
-Nesting is `CdcConsumeResult` → `CdcVersionedMutations` → `CdcMutation` (§2.2,
-`13925.diff:124-153`). `param1`/`param2` are Python-owned `bytes` copied with `ctypes.string_at`,
-independent of the native arena (`tests:96-117`), and a null pointer of length 0 decodes to `b""`
-(`tests:74`). Per type (`13925.diff:1064-1071`): `SET_VALUE` gives key and value, `CLEAR_RANGE` gives
+Nesting is `CdcConsumeResult` → `CdcVersionedMutations` → `CdcMutation` (§2.2). `param1`/`param2` are Python-owned `bytes` copied with `ctypes.string_at`,
+independent of the native arena (`native_cdc_tests.py:96-117`), and a null pointer of length 0 decodes to `b""`
+(`native_cdc_tests.py:74`). Per type: `SET_VALUE` gives key and value, `CLEAR_RANGE` gives
 begin and end clipped to the registered range, atomic ops give key and operand. Raw operations, never
 a materialized post-mutation value.
 
@@ -289,7 +347,7 @@ a materialized post-mutation value.
 boundary, sequence number or proxy id appears in any of the twelve CDC declarations at
 `fdb_c.h:400-467`. One commit version covers a whole commit batch, so several transactions' mutations
 share a version, inseparably. Intra-version order is tuple order, but upstream asserts it only
-order-insensitively (`assertCountEqual`, `tests:243, 299`).
+order-insensitively (`assertCountEqual`, `native_cdc_tests.py:243, 299`).
 
 **Which types can appear.** CDC delivers committed effects, so three groups never reach a consumer:
 
@@ -301,14 +359,14 @@ order-insensitively (`assertCountEqual`, `tests:243, 299`).
 - **6 `AND`, 13 `MIN`** are rewritten client-side to `AND_V2`/`MIN_V2` above API 510, so only a
   separate legacy client at API < 510 could emit them.
 
-Replies carry complete commit-version groups only, which callers must "preserve"
-(`13925.diff:1100-1104`). `consume()` takes no arguments, so there is no row or byte limit, no
+Replies carry complete commit-version groups only, which callers must "preserve".
+`consume()` takes no arguments, so there is no row or byte limit, no
 caller-settable timeout, and no streaming mode. An empty reply is legal and still advances the cursor
-(`tests:121-131`). There is no end-of-stream marker.
+(`native_cdc_tests.py:121-131`). There is no end-of-stream marker.
 
 ### 2.4 Usage, illustrative and untested ▲
 
-From the upstream doc example (`13925.diff:1160-1191`), exercised by `tests:202-315`.
+From the #13925 doc example, exercised by `native_cdc_tests.py:202-315`.
 
 ```python
 fdb.api_version(800)
@@ -381,18 +439,80 @@ That is the entire reason the connector proposal keys off directories.
 ### 2.6 Below the API, and the #13971 break ▽
 
 #13925 adds no C code. It prototypes twelve existing `fdb_c.h` symbols lazily on first CDC use, so a
-`libfdb_c` at API 800 without them still serves non-CDC callers (`13925.diff:428-431`;
-`tests:325-345`). Struct layout: [Appendix A](#appendix-a-abi-layout-receipt-).
+`libfdb_c` at API 800 without them still serves non-CDC callers (`native_cdc_tests.py:325-345`). Struct layout: [Appendix A](#appendix-a-abi-layout-receipt-).
 
 **The signatures in §2.1 will not survive #13971 unchanged.** It replaces
 `fdb_database_register_cdc_stream`'s four trailing key parameters with
 `(FDBKeyRange const* ranges, int range_count)` and swaps `FDBCdcStreamInfo`'s `key_range` for `ranges`
 plus `range_count` (52 bytes down to 40), under the same symbol names at the same API 800
-(`13971.diff:77-95`), while touching zero files under `bindings/python`
-(`grep -c bindings/python 13971.diff` → 0). Landed as written, `register_cdc_stream` would pass seven
+(#13971), while touching zero files under `bindings/python`. Landed as written, `register_cdc_stream` would pass seven
 C arguments to a five-argument function and `CdcStreamInfo.begin_key`/`.end_key` would read a layout
 that no longer exists. Expect `register_cdc_stream(name, ranges)` and `CdcStreamInfo.ranges`
 post-merge. Until then §2.1 is the #13925-only contract. Full analysis: L2 in §3.
+
+### 2.7 Threads, blocking and the network thread ▲
+
+> In one line: `wait()` parks only its own thread, and the network thread is shared but never blocked
+> by it. The hazards are per handle, not per `Future`: one op outstanding, no consume before the
+> previous batch is acked, never block in a callback.
+
+Python behaviour is **prospective** on #13925 @ `ee1fa01e6`; client and server mechanics are the pin.
+
+**One network thread per process.** `fdb_setup_network()` "can only be called once" and "it is not
+possible to run more than one network thread" (`api-c.rst:188, :198`). The binding runs it as daemon
+`fdb-network-thread` (`impl.py:2349-2360, :2510-2516`), and `fdb.open()` caches one `Database` per
+cluster file (`impl.py:2530-2547`). Every CDC and KV call from every thread is marshalled onto it. The
+consumer is "confined to the network thread" (`ThreadSafeTransaction.cpp:109-135`). The option
+`client_threads_per_version` "implies disable_local_client", so it needs external client libraries
+(`fdb.options:121-123`). Unevaluated.
+
+| Operation | Blocks | Mechanism |
+|---|---|---|
+| `Future.wait()` | The calling thread only, with the GIL released | Not `fdb_future_block_until_ready`. It registers `on_ready` and parks on a per-thread `multiprocessing.Semaphore` (`impl.py:733-756`). The library is loaded as `ctypes.CDLL` (`impl.py:1819-1830`). |
+| Outstanding `consume()` | Nothing client-side | The proxy holds the request until the stream's buffered frontier passes the cursor, which tag peeks advance even with no mutations, or for up to `CDC_PROXY_CONSUME_POLL_TIMEOUT` (5.0 s, server knob), then replies empty at the old cursor (`CDCProxy.cpp:771-791, 1468-1482, 1544-1552`). The client re-polls on an empty, unadvanced reply (`NativeCdc.cpp:809-814`), so **`wait()` does not return at lease expiry**. It returns on mutations, an advanced watermark, or an error, so an idle stream probably returns empty-but-advanced replies at peek cadence (UNVERIFIED). No timeout parameter. |
+| `on_ready` callback | The network thread, so every FDB op in the process | Runs there, or immediately on the caller if the future is ready (`api-python.rst:1194`), after taking the GIL. "…performing CPU intensive tasks will block the FoundationDB client thread and therefore all database access from that client" (`developer-guide.rst:430`). |
+| `wait()` inside a callback on an unready future | **Silent** deadlock | Documented: "Blocking in a callback on a non-ready future will cause a deadlock" (`developer-guide.rst:430`). C raises `blocked_from_network_thread` only on its own block path (`ThreadHelper.h:313-317`). Python's semaphore path skips that check. |
+| Reply decode | The network thread, then the caller | C++ deep-copies each reply on the network thread (`ThreadSafeTransaction.cpp:67-90`). Python copies again on the waiting thread (`impl.py:942-970`). Up to 10 MB per reply (L1). |
+
+| Hazard | Real? | Evidence |
+|---|---|---|
+| Two threads `wait()` on one `Future` | No. Callbacks chain, and each waiter has its own semaphore. | `ThreadHelper.h:399-402`; `impl.py:740-746` |
+| Two Python owners of one native consumer | Handled. Memoized under a lock, since each C getter transfers a reference. | `impl.py:922-939`; `fdb_c.cpp:436-439` |
+| `close()` racing `consume()` on the C pointer | Handled. Both take `CdcConsumer._lock`. | `impl.py:1559, 1570-1605` |
+| A second `consume`/`acknowledge` while one is outstanding | **Real.** The second future fails with `client_invalid_operation`. The Python lock guards only issuing the call. | `NativeCdc.cpp:833-839, :880-886` |
+| `consume()` N+1 before `acknowledge()` of N | **Real, data loss.** The ack covers the latest delivered position, including the unproduced batch. | `NativeCdc.cpp:848` |
+| `close()` with a consume in flight | Does not cancel it. The reply is still valid, but the handle can no longer ack. | `ThreadSafeTransaction.cpp:118-127` |
+| `cancel()` (or dropping an unready future), then consume again | **Real, up to 5 s.** The handle frees at once, but the proxy holds `activeConsumes` until data arrives or the lease expires, so the next consume from any handle can draw `client_invalid_operation`. Inferred, not observed. | `fdb_c.cpp:270-280`; `NativeCdc.cpp:810-811, :827-829`; `CDCProxy.cpp:1511-1520` |
+| `get_position()` from another thread | Safe. It reads a spinlocked copy that lags an outstanding consume. | `ThreadSafeTransaction.cpp:62-65, :84-96, :137` |
+
+**Kafka.** confluent-kafka `produce()` only enqueues and raises `BufferError` when the queue is full.
+Delivery callbacks fire only inside `poll()`/`flush()` on the calling thread, and librdkafka's
+threads send regardless
+([Producer.c](https://github.com/confluentinc/confluent-kafka-python/blob/master/src/confluent_kafka/src/Producer.c),
+[librdkafka INTRODUCTION.md](https://github.com/confluentinc/librdkafka/blob/master/INTRODUCTION.md)).
+`poll` and `flush` release the GIL (`CallState_begin`,
+[confluent_kafka.h](https://github.com/confluentinc/confluent-kafka-python/blob/master/src/confluent_kafka/src/confluent_kafka.h)).
+A shared `Producer` is thread-safe, but `flush()` waits on every thread's messages and callbacks fire
+on whichever thread polls.
+
+**asyncio.** Unsupported. `api-python.rst:1293-1308` documents only `None`, `gevent` and `debug`.
+`impl.py:2448-2467` keeps an undocumented `event_model="asyncio"` that mutates
+`asyncio.futures._FUTURE_CLASSES`. That name is absent from the CPython 3.14.5 stdlib, so treat the
+model as dead. To bridge, use `await loop.run_in_executor(pool, fut.wait)`, or
+`fut.on_ready(lambda _: loop.call_soon_threadsafe(settle))` with `settle` calling `fut.wait()` on the
+loop thread. Never decode on the network thread.
+
+**Recommended bridge model.**
+
+1. One `Database` per process. One thread per stream owns that stream's `CdcConsumer` and its own
+   `Producer`. No handle crosses threads except the supervisor's `cancel()` at shutdown, followed by
+   `close()`, never an ack.
+2. Strictly serial per stream: `consume().wait()` → produce → `flush()` with no delivery error →
+   checkpoint → `acknowledge().wait()` → consume (§1.3). Any delivery failure means no ack.
+3. Empty replies may be coalesced: consume again without acking, then checkpoint and ack at most every
+   few seconds or when a reply carries data. Safe because an empty reply carries nothing to lose.
+4. No blocking, decoding or Kafka calls inside `on_ready`.
+5. Scale by streams per process, then by processes. One stream cannot be parallelised (L4).
 
 ---
 ## 3. Known limitations and gaps (deliverable 3)
@@ -407,13 +527,13 @@ artifact.
 | # | Limitation | Consequence for a Kafka bridge | Status | Evidence |
 |---|---|---|---|---|
 | **L1** | One commit version whose CDC mutations exceed the consume-reply budget (`CDC_PROXY_CONSUME_REPLY_BYTES`, 10 MB) throws `server_overloaded` (1211) at that version on every attempt. Buffer-limit trips set a per-stream flag initialised `false` and never cleared. | Permanent stall. One fat transaction wedges the stream at a fixed version, with no way to skip the version and no forward progress, and the flag survives until the proxy is replaced or the stream re-initialised. `server_overloaded` is not in the retryable predicate, so it arrives raw and a naive loop spins. | Pin | `CDCProxy.cpp:1583-1590` (`firstVersionTooLarge` → `throw server_overloaded()`); flag `:82`, set `:631`/`:652`/`:964`, read `:740`/`:1480`/`:1556`, never cleared; `fdbserver/core/ServerKnobs.cpp:179` |
-| **L2** | #13925 and #13971 redefine the same exported symbols at the same API version, with no `_v2` and no version guard. `fdb_database_register_cdc_stream` goes 7 args to 5. `FDBCdcStreamInfo` goes 52 bytes to 40, so `CdcStreamInfo.begin_key`/`.end_key` (§2.2) cease to exist as fields. The value-type break is as bad as the signature break. | Silent memory corruption, both directions. `dlsym` resolves by name and succeeds, so nothing fails at load. See *ABI risk* below. | **Prospective**, both PRs open | `13971.diff:77-95`; `impl.py:1424-1440` @ `ee1fa01e6`; `mengxu_review.md`, review 5074513231 |
-| **L3** | Retention is released only by ack or removal, with no age bound. Upstream deliberately rejected automatic expiry: "automatic expiration is still the wrong default because it silently violates the retention contract." | Cluster-level disk exhaustion, not a consumer-local problem. An abandoned bridge can "eventually exhaust the TLog capacity allocated to its CDC tags." Recovery is explicit: repair and ack forward, or remove and rebuild downstream from a full scan. `fdbcli cdc status` and `cdc remove <NAME> <ID> CONFIRM-DATA-LOSS` exist on `main` (post-pin, #13926). | Pin | `design/cdc.md:266-269`, `:893-899`; safe-pop rule `:587-594` |
+| **L2** | #13925 and #13971 redefine the same exported symbols at the same API version, with no `_v2` and no version guard. `fdb_database_register_cdc_stream` goes 7 args to 5. `FDBCdcStreamInfo` goes 52 bytes to 40, so `CdcStreamInfo.begin_key`/`.end_key` (§2.2) cease to exist as fields. The value-type break is as bad as the signature break. | Silent memory corruption, both directions. `dlsym` resolves by name and succeeds, so nothing fails at load. See *ABI risk* below. | **Prospective**, both PRs open | #13971; `impl.py:1424-1440` @ `ee1fa01e6`; [mengxu-oai review](https://github.com/apple/foundationdb/pull/13971#pullrequestreview-5074513231) |
+| **L3** | Retention is released only by ack or removal, with no age bound. Upstream deliberately rejected automatic expiry: "automatic expiration is still the wrong default because it silently violates the retention contract." | **A cluster-wide write outage, not a consumer-local problem.** CDC tags spill by reference, so one stalled stream pins its TLogs' whole disk queue from its oldest unacked version, including every tag's bytes, not just its own. At 5 % TLog free space Ratekeeper stops every client's commits. It also holds recovery at `ALL_LOGS_RECRUITED`. The way out is always explicit: repair and ack forward, or remove and rebuild downstream ([§1.6](#16-baseline-snapshot-and-handoff-)). Signals in [*Retention*](#retention-what-to-watch-l3-) below. | Pin | `design/cdc.md:252-269`, `:682-690`, `:893-899`; safe-pop rule `:587-594`; `TLogServer.cpp:809-821, 1030-1072`; `Ratekeeper.cpp:936-1066` |
 | **L4** | Two processes cannot share a stream, since the server rejects concurrent consumes. Sequential interleaving is *not* rejected, and both share one durable ack frontier. | Bridge instances need external fencing (a single-writer lease). Without it, a restarted instance racing its predecessor advances the shared watermark and each sees the other's versions as already released. No fan-out, no consumer group, no partitioning. | Pin | `CDCProxy.cpp:1511-1516` (`activeConsumes > 0` → `client_invalid_operation`, comment: "A stream has one durable acknowledgement frontier, so concurrent logical consumers cannot be isolated"); cursor-trust check `:1527-1535`; `design/cdc.md:571` |
-| **L5** | At-least-once only. The ack cannot be bundled into a transaction with the sink's state, and `acknowledge()` takes no version argument, so granularity is the delivered batch. | Sink writes must be idempotent under whole-batch replay, and replay is expected after commit-proxy replacement rather than exceptional. Key records on `(version, index)` and upsert. | Pin | `design/cdc.md:78-83` (exactly-once and transactional ack both listed non-goals) |
+| **L5** | At-least-once only. The ack cannot be bundled into a transaction with the sink's state, and `acknowledge()` takes no version argument, so granularity is the delivered batch. | Sink writes must be idempotent under whole-batch replay, and replay is expected after commit-proxy replacement rather than exceptional. Identify records by `(stream_id, version, index)` and upsert. That is a dedup identity, not the Kafka record key (§5.1). | Pin | `design/cdc.md:78-83` (exactly-once and transactional ack both listed non-goals) |
 | **L6** | CDC delivers committed effects, not application calls. See *Mutation fidelity* below. | No transaction id, timestamp, or application operation name. Nothing in the wire format supplies them. | Pin | `fdb_c.h:213-232` |
 | **L7** | No error mapping in the binding. Every native failure arrives as a raw `fdb.FDBError`. See *Errors we have to map* below. | We write the mapping. Three codes matter, and the standard retry predicate is wrong about two. | **Prospective**, #13925 | `NativeCdc.cpp:242-244`; `fdb_c.cpp:167-184` |
-| **L8** | A stream's key range is fixed at registration. Changing it means remove plus re-register, terminal for existing cursors. | A downstream rebuild, not a reconfiguration. #13971 would allow a union of up to 1,024 ranges, still with one cursor and one watermark for all of them. | Pin; union **prospective** (#13971) | `design/cdc.md:84-85`; `mengxu_review.md:26` ("does not add independent progress or retention for each range") |
+| **L8** | A stream's key range is fixed at registration. Changing it means remove plus re-register, terminal for existing cursors. | A downstream rebuild, not a reconfiguration. #13971 would allow a union of up to 1,024 ranges, still with one cursor and one watermark for all of them. | Pin; union **prospective** (#13971) | `design/cdc.md:84-85`; [mengxu-oai review](https://github.com/apple/foundationdb/pull/13971#pullrequestreview-5074513231) ("does not add independent progress or retention for each range") |
 
 ### Mutation fidelity ▽
 
@@ -470,7 +590,62 @@ Python raw as `fdb.FDBError`. The binding adds only `RuntimeError` (API < 800, m
 |---|---|---|---|
 | `transaction_too_old` (1007) | Requested data already popped, a retention-invariant violation, terminal | **`True`** (`fdb_c.cpp:176`) | Stop. A conventional retry loop spins forever on unrecoverable data loss. Alert, then rebuild. |
 | `server_overloaded` (1211) | Reply-budget or buffer-limit trip, including the L1 poison pill | **`False`**, absent from every predicate list (`fdb_c.cpp:167-184`) | Back off and retry with a bound. If it repeats at one version, it is L1: escalate, do not spin. |
-| `client_invalid_operation` (2000) | Concurrent consumer, unproven cursor, or a resume that skipped reconcile | `False` | Terminal for the request. Distinguish fencing loss from cursor-proof failure before retrying. |
+| `client_invalid_operation` (2000) | Concurrent consumer, unproven cursor, or a resume that skipped reconcile, or a predecessor's cancelled or abandoned poll still holding the proxy lease (≤ 5 s) | `False` | Terminal for the request. Distinguish fencing loss from cursor-proof failure before retrying. Within 5 s of a cancel or crash, back off past the lease and retry once. |
+
+### Retention: what to watch (L3) ▲
+
+> In one line: watch `read_version − min_version` per stream **and** TLog free disk. Neither is enough
+> alone, and `CDCStreamLag` does not exist.
+
+**Mechanism.** An ack commits `minVersion = V+1` (`NativeCdc.cpp:686`). The CDC proxy pops each tag to
+`safePop(T)` (`design/cdc.md:587-594`). A TLog truncates its single DiskQueue only up to the minimum
+popped location across by-reference tags, and CDC tags (locality `-10`) are by-reference under the
+default `log_spill` (`TLogServer.cpp:809-821, 1030-1072`; `FDBTypes.h:68, 1099-1101`). So a stalled
+stream pins the whole queue file, and it grows at the TLog's input rate (inferred from
+`TLogServer.cpp:1030-1072`, not measured). Memory stays bounded because
+spilling keeps it under `TLOG_SPILL_THRESHOLD` (1.5 GB). Disk is what fills. No per-tag quota exists
+in `fdbserver/tlog/`.
+
+**When disk fills, the whole cluster stops writing.** `MIN_AVAILABLE_SPACE_RATIO` and
+`TLOG_THROTTLE_START_AVAILABLE_SPACE_RATIO` are both 0.05 (`ServerKnobs.cpp:1093, 1103`), so on any
+disk over 2 GB the ramp at `Ratekeeper.cpp:941-950` is a step. Below 5 % free the TLog's target and
+spring bytes collapse to 1 (`:953-958`), and the MVCC-bandwidth limit computes a rate of zero
+(`:1038-1066`): `tpsLimit = 0` at the step itself, reported as `log_server_mvcc_write_bandwidth`. Once
+the queue exceeds `free − minFree/2` the reason becomes `log_server_min_free_space` and
+`RkTLogMinFreeSpaceZero` fires (`:986-993`). Inferred from source, not observed.
+
+**Reading the watermark.**
+
+- Supported: `CdcStreamInfo.min_version` from `list_cdc_streams()` (**prospective**, #13925). It reads
+  the same rows with `READ_SYSTEM_KEYS` in its own transaction (`NativeCdc.cpp:540-581`) and returns
+  no read version, so take one separately: `lag = tr.get_read_version().wait() − info.min_version`.
+- Raw: `\xff\x02/cdc/minVersion/` followed by the stream id as 8 bytes little-endian. Needs
+  `read_system_keys`. It has two value encodings (§1.2). Don't build on it.
+- Units: about 1,000,000 versions/s (`VERSIONS_PER_SECOND`, `ServerKnobs.cpp:151`;
+  `masterserver.cpp:50-60`), so lag/1e6 ≈ seconds, **in steady state only**. Every recovery jumps
+  1e8 versions (`ClusterRecovery.cpp:1387`). Lag is not bytes either: an unacked stream over an idle
+  range pins no disk (`TLogServer.cpp:1044`).
+
+**Signals that exist.** None of them reports per-stream TLog bytes. Upstream says that is deliberate
+(main `design/cdc.md:904-909`). Status JSON has no CDC section at the pin or on main.
+
+| Signal | Where | Tells you | Ref |
+|---|---|---|---|
+| `min_version` vs read version | client, `list_cdc_streams()` | per-stream ack lag | #13925, prospective |
+| `CDCProxyMetrics` | trace, per CDC proxy, every 5 s | `AcknowledgementLagVersions`, `OldestStreamId` / `OldestRequiredVersion` (the proxy's single worst stream), `SafePopDistanceVersions`, `BufferedBytes` / `ActivePermits` / `BufferLimit` / `BufferWaiters`, `Pop*` counters | `CDCProxy.cpp:1771-1812`; `ServerKnobs.cpp:1297` |
+| `CDCProxyConsumeVersionExceedsReplyLimit` (SevWarn) | trace | the L1 poison pill, which leads into L3 | `CDCProxy.cpp:1586` |
+| `CDCProxyVersionExceedsBufferLimit`, `CDCProxyRawPeekExceedsBufferLimit` (SevWarn) | trace | proxy budget trips (`server_overloaded`) | `CDCProxy.cpp:958`, `:626` |
+| `CDCProxyReRecruitmentFailed` (SevWarnAlways) | trace, cluster controller | streams with no owner | `ClusterController.cpp:718` |
+| `TLogMetrics` `MinSysPopTagLocality` / `Id` / `Version` | trace, per TLog | lowest-popped system tag still holding data. Locality `-10` means a CDC tag is holding the TLog | `TLogServer.cpp:747-749, 3686` |
+| `queue_disk_available_bytes` / `queue_disk_total_bytes` (log role) | `status json` | TLog disk headroom | `Schemas.cpp:121-124` |
+| `qos.performance_limited_by.name` | `status json` | `log_server_mvcc_write_bandwidth` with low TLog free space, or `log_server_min_free_space*`, means TLog disk has already stopped commits. `mvcc_write_bandwidth` alone also fires under ordinary TLog overload | `Schemas.cpp:563-577` |
+| `recovery_state.name` | `status json` | stuck at `all_logs_recruited` with live streams means CDC may be holding recovery | `Schemas.cpp:743-764`; `design/cdc.md:682-690` |
+| `cdc status [json]` | fdbcli, **post-pin** (main, #13926) | per stream: `min_version`, `acknowledgement_lag_versions`, owner. Per tag: `safe_pop_version`, `blocking_stream_ids`, retired cleanup. Plus proxy samples | main `fdbcli/CdcCommand.cpp:50-148` |
+
+Upstream gives no alert thresholds. It says to derive them "from the deployment's measured write
+rate, disk budget, and consumer repair time" (main `design/cdc.md:925-930`). The outage horizon is
+`(TLog free − max(100 MB, 5 % of total)) / TLog input bytes per second`. Size TLog disks so that it
+exceeds the bridge's worst-case repair time.
 
 ### ABI risk (L2, P1, prospective) ▲
 
@@ -549,7 +724,7 @@ commit whose subject calls it a draft (Appendix B). Best evidence available, not
 | Removed at 800 | What it means here |
 |---|---|
 | Multitenancy and metaclusters | No tenant-scoped keyspaces or cross-cluster routing, and the retained tenant C symbols are stubs that abort the process when called, so an older binding calling them kills the process rather than degrading. Isolation moves into our key layout (directory prefixes). |
-| Blob granules | No bulk historical backfill from blob storage. An initial snapshot must use ordinary range reads. |
+| Blob granules | No bulk historical backfill from blob storage, deleted from the binary in the pin itself (#12435; ChangeFeed #12470). The baseline is chunked range reads plus a version-filtered CDC handoff, [§1.6](#16-baseline-snapshot-and-handoff-). |
 | ChangeFeed (7.1-7.3 experimental storage-server change feeds) | No fallback change-capture path at 800: "Native CDC is a separate interface, not a compatible replacement for the removed ChangeFeed API." Migrating a ChangeFeed pipeline is a rewrite. |
 | Configuration database and dynamic knobs (incl. `use_config_database`) | No runtime knob changes, so toggling `ENABLE_NATIVE_CDC` is a rolling restart of the server processes (§4.3). |
 | Encryption at rest, and its key-management roles | A deployment that mandates at-rest encryption cannot run an 800 cluster, and so cannot use native CDC. File-level *backup* encryption is unaffected. |
@@ -579,7 +754,7 @@ Upstream sets it per process as `FDB_KNOB_enable_native_cdc=true` (`bindings/c/C
 
 ### 4.4 What is actually released ▽
 
-CDC is absent from 7.4.7 (§0, correction 1) and exists only on unreleased `main` / 8.0.0, where it
+CDC is absent from 7.4.7 (receipt in Appendix B) and exists only on unreleased `main` / 8.0.0, where it
 landed via #13287 (feature) and #13674 (C bindings). 8.0.0 is itself unreleased: no `release-8.0`
 branch, no `8.0.0` tag, newest upstream tag `7.4.7`. 7.4.8 is in flight on `release-7.4`, still API
 740, still zero CDC. Any 8.0 ship date is UNVERIFIED.
@@ -605,10 +780,102 @@ what `consume()` returns. CDC groups mutations by commit version and stops there
 | `sequence_no` | **Absent.** Intra-version order is tuple index only | Assign it in the bridge as the index inside `CdcVersionedMutations.mutations`. Dedup key: `(stream_id, version, sequence_no)`. |
 | `VersionEnd` | **Absent.** No end-of-version or heartbeat record | Emit one after a complete version group. An **empty** `consume()` that still advances `last_consumed_version` is the native idle/gap signal; translate that into `VersionEnd` so downstream can move "current" without stalling. |
 | Mutation payload | `type` + `param1` + `param2` bytes | Forward as-is. Do not collapse atomics to SET ([replay table](#replay-under-at-least-once-)). |
-| Checkpoint | In-memory `CdcCursor` plus cluster `minVersion` | Persist `CdcCursor` (or equivalent) **before** `acknowledge()`. Empty replies still move the cursor; checkpoint them. |
+| Snapshot row | **Absent.** CDC returns no state | New `oneof` arm `FDBSnapshotRow { key, value, read_version }`. Not an `FDBMutation` at `fdb_version = R_i`: `R_i` is a read version, the value's commit version is unknown, and a real commit at `R_i` would collide on `(stream_id, version, sequence_no)`. |
+| Snapshot chunk end | **Absent** | `SnapshotChunkEnd { begin_key, end_key, read_version }`. A rebuilding sink clears keys it holds in `[begin, end)` that the chunk did not send, and can re-apply the §1.6 filter itself. |
+| Snapshot end | **Absent** | `SnapshotEnd { max_read_version }`. Downstream is a real FDB state only at the first `VersionEnd ≥ max_read_version`. With the filter, per-key offset order equals version order, so a compacted topic keeps the right value (SET/single-key-clear directories only, §5.1 *Compaction*). Without it, compaction can keep the stale snapshot row ([Kafka log compaction](https://kafka.apache.org/documentation/#compaction)). |
+| Checkpoint | In-memory `CdcCursor` plus cluster `minVersion` | Persist `CdcCursor` (or equivalent) **before** `acknowledge()`. Empty replies still move the cursor, so this includes them. |
 
-Required order stays [§1.3](#13-acknowledgement-semantics-): consume → durably publish + checkpoint
-→ acknowledge. Ack is not atomic with Kafka. Expect rewind after CDC proxy replacement.
+Required order stays register → snapshot ([§1.6](#16-baseline-snapshot-and-handoff-)), then
+[§1.3](#13-acknowledgement-semantics-): consume → durably publish + checkpoint → acknowledge. Ack is
+not atomic with Kafka. Expect rewind after CDC proxy replacement.
+
+### 5.1 Kafka record key, partitioning, and atomicity ▲
+
+> In one line: the record key picks a partition, not the partition count, and no key choice buys
+> atomicity. Default: one partition per stream, FDB key as record key, `VersionEnd` per group.
+> Upgrade: Kafka transactions, then key-hash partitions if a reader needs them.
+
+**Key is not partition.** Unless the producer names a partition, it is `hash(key) mod N`.
+confluent-kafka inherits librdkafka's `partitioner=consistent_random` (CRC32 of the key, null keys
+random) ([librdkafka CONFIGURATION.md][rdk-conf]). The Java client uses `murmur2(key) mod N`
+([`BuiltInPartitioner.partitionForKey`][java-part]). Keying by commit version therefore spreads
+successive versions across all N partitions. Each group stays together, but the order between groups
+is lost. Kafka orders only within a partition ([librdkafka INTRODUCTION.md][rdk-intro]). Total order
+needs one partition, either `partitions=1` or `produce(..., partition=0)` ([`Producer.c`][ck-produce]),
+whatever the key.
+
+**No key buys atomicity.** Several transactions share one commit version with nothing separating them
+(§2.3), so the finest atomic unit CDC exposes is one stream's version group. Callers "should preserve
+this grouping" (`api-c.rst:597-599` @ `ee1fa01e6`). Without transactions Kafka gives no multi-record
+visibility guarantee, even in one partition. A reader can see part of a group while the rest is in
+flight, and a bridge crash leaves the partial group in the log ahead of the replay. `VersionEnd` tells
+a reader a group is complete. A Kafka transaction hides an incomplete one ([KIP-98][kip98]).
+
+**The ingest ceiling is the stream, not the partition.** One stream has one consumer and one serial
+consume loop (L4, `CDCProxy.cpp:1511-1516`), with replies up to 10 MB (`ServerKnobs.cpp:179`). Extra
+partitions let downstream readers run in parallel. They never speed up the bridge. To scale ingest,
+add streams (directories, or key-range shards of one directory), each with its own ordered partition.
+
+| Option | Order kept | Group atomicity | Scales with | Breaks on |
+|---|---|---|---|---|
+| **(a) 1 partition per stream**, key = FDB key | Total, per stream | `VersionEnd` + reader buffering; fully hidden with (d) | Stream count | Reader parallelism is 1 per stream |
+| (b) N partitions, key = FDB key | Per key only | Needs `VersionEnd` on **every** partition and a reader holding all N | Readers, up to N | Wide `CLEAR_RANGE` has no key, so it must go to all N. Python (CRC32) and Java (murmur2) route one key differently unless `partitioner=murmur2_random`. Growing N remaps keys mid-stream |
+| (c) Shared topic, key = `stream_id` | Total, per stream | As (a) | Streams over N | Hash collisions co-locate streams (harmless). Growing N remaps streams mid-stream |
+| (d) Kafka transactions over (a), (b) or (c) | Unchanged | **Atomic across partitions** for `read_committed` readers ([KIP-98][kip98]) | Unchanged | An open transaction stalls `read_committed` readers at the last stable offset. Commit latency per transaction. Commit markers occupy offsets |
+| Key = commit version | Within a group only | None across partitions | N | *V+1* can be read before *V*; per-key last-writer-wins breaks |
+
+**Compaction.** Sound only for directories that emit `SET_VALUE` and single-key clears. A single-key
+clear arrives as `CLEAR_RANGE(k, k‖\x00)` (§3, *Mutation fidelity*) and becomes a tombstone on `k`.
+Wider clears cannot be compacted safely. Compaction keeps each cleared key's last value, so a replay
+from offset 0 brings the key back, and a reader lagging more than `delete.retention.ms` can miss
+tombstones anyway ([Confluent, log compaction][compaction]). Compaction also keeps only the last
+`ADD`/`XOR` operand, which destroys atomic-op state. Compacted topics reject null keys
+([KIP-135][kip135]), so `VersionEnd` needs a key there.
+
+**Message size.** One record per mutation fits, since FDB caps keys at 10,000 bytes and values at
+100,000 (`known-limitations.rst:41`). One record per version group does not. A group can reach
+`CDC_PROXY_CONSUME_REPLY_BYTES` (10 MB) against Kafka's ~1 MB defaults: broker `message.max.bytes`
+is 1 MiB + 12 B ([`ServerLogConfigs`][srvlog]) and librdkafka's is 1,000,000 ([rdk-conf]).
+
+**Dedup under redelivery (L5).** The idempotent producer drops only its own retries, within one
+producer session, per partition ([KIP-98][kip98]). A group re-read from CDC after a crash or a proxy
+replacement looks like new records to Kafka. librdkafka defaults `enable.idempotence=false` (Java:
+`true`), and without it retries with `max.in.flight` > 1 can reorder inside a partition
+([rdk-conf], [rdk-intro]), so set it explicitly. The reader identity is
+`(stream_id, version, sequence_no)`, using `stream_id` rather than the name (§1.5). On one totally
+ordered partition this reduces to a watermark: drop anything at or below the last applied
+`VersionEnd`, and throw away a partial buffer when `(V, sequence_no = 0)` reappears. Because that rule
+treats the group as the unit, it doesn't need the order inside a version to match across redelivery.
+The proxy emits in peek-cursor order without sorting (`CDCProxy.cpp:830-871`), but upstream checks
+intra-version order only order-insensitively (§2.3). Whether indexes stay the same across proxy
+replacement is UNVERIFIED.
+
+**Transactions give L4 fencing.** Give each stream a fixed `transactional.id`
+(`fdb-cdc-<stream_id>`). Then `init_transactions()` bumps the producer epoch, and a zombie's next
+produce or commit fails fatally with `_FENCED` ([KIP-98][kip98], [rdk-intro]). Write the `CdcCursor`
+to a compacted checkpoint topic in the same transaction as the reply's records. That is the
+exactly-once source-connector pattern from [KIP-618][kip618], which Kafka Connect provides with
+`exactly.once.source.support=enabled` (default `transaction.boundary=poll`: one transaction per poll
+batch). Ack CDC only after `commit_transaction()` returns. A zombie can then ack only data it
+committed, acks only advance (`design/cdc.md:751-752`), and a restart resumes from the committed
+cursor using §1.4. That holds after a proxy owner change too: the re-ack is accepted once the read
+version reaches the cursor (`NativeCdc.cpp:680-683`), and the new owner's `bufferedThrough` follows
+the durable ack, so it then trusts the cursor (`CDCProxy.cpp:677-686, 1526-1536`; inferred, not
+observed). The bridge drops groups at or below that cursor that CDC redelivers
+after a proxy replacement, before producing them. `read_committed` readers see each group once and
+never a partial one. This is reasoning from the cited contracts, not observed behaviour. CDC itself
+stays at-least-once (L5); the bridge absorbs it. Keep each transaction to one reply, not spread
+across consume long polls, because librdkafka's `transaction.timeout.ms` defaults to 60 s.
+
+[rdk-conf]: https://github.com/confluentinc/librdkafka/blob/master/CONFIGURATION.md
+[rdk-intro]: https://github.com/confluentinc/librdkafka/blob/master/INTRODUCTION.md
+[java-part]: https://github.com/apache/kafka/blob/trunk/clients/src/main/java/org/apache/kafka/clients/producer/internals/BuiltInPartitioner.java
+[ck-produce]: https://github.com/confluentinc/confluent-kafka-python/blob/master/src/confluent_kafka/src/Producer.c
+[kip98]: https://cwiki.apache.org/confluence/display/KAFKA/KIP-98+-+Exactly+Once+Delivery+and+Transactional+Messaging
+[kip618]: https://cwiki.apache.org/confluence/display/KAFKA/KIP-618%3A+Exactly-Once+Support+for+Source+Connectors
+[kip135]: https://cwiki.apache.org/confluence/display/KAFKA/KIP-135+:+Send+of+null+key+to+a+compacted+topic+should+throw+non-retriable+error+back+to+user
+[compaction]: https://docs.confluent.io/kafka/design/log_compaction.html
+[srvlog]: https://github.com/apache/kafka/blob/trunk/server-common/src/main/java/org/apache/kafka/server/config/ServerLogConfigs.java
 
 ---
 
@@ -627,8 +894,8 @@ Two consequences reach a caller. Symbol binding is lazy, happening at first CDC 
 import. And `errcheck` is attached only to the `c_int`-returning functions, which raise `FDBError`
 synchronously, while the future-returning ones report through the future.
 
-Sizes and offsets match a prior pass that compiled `sizeof`/`offsetof` against `fdb_c.h` at this pin
-(`../fdb-kafka-connect/struct_sizes.c`). Nothing was compiled or run in this pass. #13925 mirrors the
+Sizes and offsets match a prior pass that compiled `sizeof`/`offsetof` against `fdb_c.h` at this pin.
+Nothing was compiled or run in this pass. #13925 mirrors the
 check as a layout regression test (`native_cdc_tests.py:46-60`). Under #13971 `FDBCdcStreamInfo`
 becomes 40. See L2.
 
@@ -638,21 +905,23 @@ becomes 40. See L2.
 and `impl.py:N` means the post-PR file at `ee1fa01e6`, not the pin, whose `impl.py` contains no CDC
 code at all (`grep -ci cdc` → 0). Two non-CDC helpers are cited against the pin and marked **pin**
 inline. `subspace_impl.py` and `tuple.py` are the pin's, same directory. `CommitTransaction.h` is
-`fdbclient/include/fdbclient/`. `native_cdc_tests.py` is `bindings/python/tests/`. `api-*.rst` is
+`fdbclient/include/fdbclient/`. `native_cdc_tests.py` is `bindings/python/tests/` at `ee1fa01e6`. `api-*.rst` is
 `documentation/sphinx/source/`, the #13925 files at `ee1fa01e6` unless noted. `CDCProxy.cpp` is
 `fdbserver/cdcproxy/`. The tree has two `commitproxy` directories, so `CommitProxyServer.cpp` is
 `fdbserver/commitproxy/`. `WriteMap.cpp`, `ReadYourWrites.cpp`, `NativeAPI.cpp`, `NativeCdc.cpp` and
-`MultiVersionTransaction.cpp` are `fdbclient/`.
-
-**`13925.diff:N` / `13971.diff:N`** are lines in `research-cdc-2026-09-09/13925.diff` (1201 lines) and
-`13971.diff` (1950 lines), not post-PR file lines. Hunk headers map them: `impl.py`
-`@@ -1342,10 +1421,201 @@`, `native_cdc_tests.py` `@@ -0,0 +1,408 @@`, `api-python.rst`
-`@@ -455,7 +455,218 @@`.
+`MultiVersionTransaction.cpp` are `fdbclient/`. `known-limitations.rst`, `backups.rst` and
+`bulkdump.rst` are `documentation/sphinx/source/`, the pin unless marked `upstream/main`.
+`developer-guide.rst` is there too. `ThreadSafeTransaction.cpp`, `SystemData.cpp` and `Schemas.cpp`
+are `fdbclient/`, `FDBTypes.h` is `fdbclient/include/fdbclient/`, `ThreadHelper.h` is
+`flow/include/flow/`, `fdb_c.cpp` is `bindings/c/`, `TLogServer.cpp` is `fdbserver/tlog/`,
+`Ratekeeper.cpp` is `fdbserver/ratekeeper/`, `masterserver.cpp` is `fdbserver/sequencer/`,
+`ClusterRecovery.cpp` and `ClusterController.cpp` are `fdbserver/clustercontroller/`, and
+`fdb.options` is `fdbclient/vexillographer/`.
 
 **Receipts.** MVC symbol gate (§4.1): `MultiVersionTransaction.cpp:784-824`, `:922` pass
 `headerVersion >= ApiVersion::withNativeCdcApi().version()` as `requireFunction` to
 `loadClientFunction` (`:704-711`), which throws `api_function_missing` only when the header is at
-least 800. Correction 1: at `7.4.7`, `grep -ci cdc` → 0 for both `fdb_c.h` and `impl.py`, and
+least 800. §4.4: at `7.4.7`, `grep -ci cdc` → 0 for both `fdb_c.h` and `impl.py`, and
 `flow/ApiVersions.cmake` has no `NATIVE_CDC` line; at the pin `api-c.rst` has 41 CDC matches and
 `api-python.rst` none. Release notes: `release-notes-800.rst` was added by `a7887284c`;
 `git merge-base --is-ancestor a7887284c c50931feb` exits 1, `… b870261ee` exits 0, and
