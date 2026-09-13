@@ -1,11 +1,12 @@
 version: v2
 modules:
-  - path: proto
+  - path: protobuf/proto
 lint:
   use:
     - STANDARD
   except:
     - PACKAGE_VERSION_SUFFIX
+    - ENUM_ZERO_VALUE_SUFFIX
 breaking:
   use:
     - FILE

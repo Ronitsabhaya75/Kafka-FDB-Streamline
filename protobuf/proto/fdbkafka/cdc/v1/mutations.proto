@@ -1,12 +1,12 @@
 syntax = "proto3";
 
-package fdb.kafka.cdc.v1;
+package fdbkafka.cdc.v1;
 
 import "google/protobuf/timestamp.proto";
 
-option go_package = "github.com/Ronitsabhaya75/Kafka-FDB-Streamline/gen/go/fdb/kafka/cdc/v1;cdcv1";
+option go_package = "github.com/Ronitsabhaya75/Kafka-FDB-Streamline/gen/go/fdbkafka/cdc/v1;cdcv1";
 option java_multiple_files = true;
-option java_package = "com.fdb.kafka.cdc.v1";
+option java_package = "com.fdbkafka.cdc.v1";
 
 // Tracks an FDB commit version and mutation sequence number within that version.
 message FDBVersionIndex {
@@ -25,28 +25,30 @@ message VersionEnd {
     // Optional total count of mutations emitted in this version (for stream auditing)
     uint32 total_mutations = 2;
 
-    // Wall-clock timestamp when the version was processed/committed
-    google.protobuf.Timestamp commit_timestamp = 3;
+    // Bridge wall-clock timestamp when the version boundary was processed
+    google.protobuf.Timestamp bridge_timestamp = 3;
 }
 
 // Represents single key mutations, including standard writes and atomic operations.
 message FDBSingleKeyMutation {
-    // Maps 1:1 with FoundationDB native atomic mutation types in fdb_c.h
+    // Maps directly to FoundationDB native CDC mutation types (fdb_c.h: FDBCdcMutationType / CdcMutationType)
     enum MutationType {
-        MUTATION_TYPE_UNSPECIFIED = 0;
-        MUTATION_TYPE_SET_VALUE = 1;
-        MUTATION_TYPE_ADD_VALUE = 2;
-        MUTATION_TYPE_AND = 3;
-        MUTATION_TYPE_OR = 4;
-        MUTATION_TYPE_XOR = 5;
-        MUTATION_TYPE_MAX = 6;
-        MUTATION_TYPE_MIN = 7;
-        MUTATION_TYPE_BYTE_MIN = 8;
-        MUTATION_TYPE_BYTE_MAX = 9;
-        MUTATION_TYPE_SET_VERSIONSTAMPED_KEY = 10;
-        MUTATION_TYPE_SET_VERSIONSTAMPED_VALUE = 11;
-        MUTATION_TYPE_COMPARE_AND_CLEAR = 12;
-        MUTATION_TYPE_APPEND_IF_FITS = 13;
+        MUTATION_TYPE_SET_VALUE = 0;
+        MUTATION_TYPE_CLEAR_RANGE = 1;
+        MUTATION_TYPE_ADD = 2;
+        MUTATION_TYPE_AND = 6;
+        MUTATION_TYPE_OR = 7;
+        MUTATION_TYPE_XOR = 8;
+        MUTATION_TYPE_APPEND_IF_FITS = 9;
+        MUTATION_TYPE_MAX = 12;
+        MUTATION_TYPE_MIN = 13;
+        MUTATION_TYPE_SET_VERSIONSTAMPED_KEY = 14;
+        MUTATION_TYPE_SET_VERSIONSTAMPED_VALUE = 15;
+        MUTATION_TYPE_BYTE_MIN = 16;
+        MUTATION_TYPE_BYTE_MAX = 17;
+        MUTATION_TYPE_MIN_V2 = 18;
+        MUTATION_TYPE_AND_V2 = 19;
+        MUTATION_TYPE_COMPARE_AND_CLEAR = 20;
     }
 
     // Target key in FoundationDB
@@ -84,9 +86,6 @@ message FDBMutation {
 message FDBMutationBatch {
     // Monotonically ordered mutations within this batch
     repeated FDBMutation mutations = 1;
-
-    // Optional stream identifier
-    string stream_name = 2;
 }
 
 // Top-level Kafka record envelope.
@@ -94,8 +93,8 @@ message FDBMutationRecord {
     // Directory or CDC stream identifier
     string stream_name = 1;
 
-    // Ingestion or transaction commit timestamp
-    google.protobuf.Timestamp timestamp = 2;
+    // Bridge wall-clock timestamp when the record was constructed
+    google.protobuf.Timestamp bridge_timestamp = 2;
 
     // Record payload
     oneof record {

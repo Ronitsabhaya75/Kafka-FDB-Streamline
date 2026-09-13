@@ -1,6 +1,6 @@
 version: v2
 plugins:
-  - remote: buf.build/protocolbuffers/python
-    out: src/gen
-  - remote: buf.build/protocolbuffers/pyi
-    out: src/gen
+  - remote: buf.build/protocolbuffers/python:v30.2
+    out: protobuf/gen
+  - remote: buf.build/protocolbuffers/pyi:v30.2
+    out: protobuf/gen
