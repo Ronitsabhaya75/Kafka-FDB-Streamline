@@ -21,6 +21,7 @@ import unittest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "..", "src", "gen"))
 
 from google.protobuf.timestamp_pb2 import Timestamp
+from google.protobuf.message import DecodeError
 from fdb.kafka.cdc.v1 import mutations_pb2
 
 
@@ -378,7 +379,7 @@ class TestCorruptedInput(unittest.TestCase):
         try:
             parsed = mutations_pb2.FDBMutationRecord.FromString(garbage)
             self.assertIsNone(parsed.WhichOneof("record"))
-        except Exception:
+        except DecodeError:
             pass
 
     def test_truncated_bytes_raises(self):
@@ -395,7 +396,7 @@ class TestCorruptedInput(unittest.TestCase):
                 parsed.mutation.single_key_mutation.key,
                 b"important_key",
             )
-        except Exception:
+        except DecodeError:
             pass
 
     def test_completely_empty_bytes(self):
@@ -411,7 +412,7 @@ class TestCorruptedInput(unittest.TestCase):
             noise = bytes(random.randint(0, 255) for _ in range(random.randint(1, 500)))
             try:
                 mutations_pb2.FDBMutationRecord.FromString(noise)
-            except Exception:
+            except DecodeError:
                 pass
 
 class TestForwardCompatibility(unittest.TestCase):

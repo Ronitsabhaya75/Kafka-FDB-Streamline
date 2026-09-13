@@ -44,3 +44,11 @@ jobs:
 
       - name: Buf Build
         run: buf build
+
+      - name: Buf Generate and Check Drift
+        run: |
+          buf generate
+          git diff --exit-code -- src/gen || {
+            echo "::error::Generated code in src/gen is out of sync with proto definitions. Run 'buf generate' and commit the changes."
+            exit 1
+          }
