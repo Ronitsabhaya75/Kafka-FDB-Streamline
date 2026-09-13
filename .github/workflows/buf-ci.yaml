@@ -27,7 +27,20 @@ jobs:
       - name: Buf Breaking
         if: github.event_name == 'pull_request'
         run: |
-          buf breaking --against '${{ github.event.repository.clone_url }}#branch=${{ github.event.pull_request.base.ref }}'
+          set +e
+          OUTPUT=$(buf breaking --against "${{ github.event.repository.clone_url }}#branch=${{ github.event.pull_request.base.ref }}" 2>&1)
+          EXIT_CODE=$?
+          set -e
+          if [ $EXIT_CODE -ne 0 ]; then
+            if echo "$OUTPUT" | grep -q "had no .proto files"; then
+              echo "::notice::Base branch '${{ github.event.pull_request.base.ref }}' has no .proto files yet (initial PR). Skipping breaking check."
+            else
+              echo "$OUTPUT"
+              exit $EXIT_CODE
+            fi
+          else
+            echo "$OUTPUT"
+          fi
 
       - name: Buf Build
         run: buf build
