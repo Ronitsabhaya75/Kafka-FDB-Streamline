@@ -1,0 +1,41 @@
+[project]
+name = "kafka-fdb-streamline"
+version = "0.1.0"
+description = "FoundationDB native CDC to Kafka bridge (UNT capstone)."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = []
+
+[tool.black]
+line-length = 88
+target-version = ["py312"]
+# Generated protobuf code (buf generate → src/gen) is never hand-formatted.
+force-exclude = "^/src/gen/"
+
+[tool.ruff]
+line-length = 88
+target-version = "py312"
+src = ["src", "tests"]
+extend-exclude = ["src/gen"]
+# Honour excludes even when pre-commit passes files explicitly.
+force-exclude = true
+
+[tool.ruff.lint]
+select = [
+  "E", "W",  # pycodestyle
+  "F",       # pyflakes
+  "I",       # isort
+  "N",       # pep8-naming
+  "UP",      # pyupgrade
+  "B",       # flake8-bugbear
+  "ANN",     # type hints required
+  "D",       # docstrings
+]
+# FDB bindings are untyped; allow Any where no better type exists.
+ignore = ["ANN401"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["D"]

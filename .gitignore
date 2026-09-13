@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# Secrets / local config
+.env
+.env.*
+.mcp.json
+.cursor/mcp.json
+.claude/settings.local.json
+CLAUDE.local.md
+
+# IDE
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# FDB build artifacts (external drive binaries — not for version control)
+fdb-dist/
+
+# Buf lock file (auto-generated, reproducible from buf.yaml)
+buf.lock

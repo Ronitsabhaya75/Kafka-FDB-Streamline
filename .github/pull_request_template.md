@@ -3,11 +3,16 @@
 >
 > For all but trivial fixes, make sure to first create a GitHub issue that concisely describes the bug or desired enhancement as justification for the change. Large PRs with no justifying issue will be closed.
 
+## Trello card
+
+<!-- Required. e.g. https://trello.com/c/CIExbKL7 -->
+
 ## Type of Change
 - [ ] Bug fix
-- [ ] New feature  
+- [ ] New feature
 - [ ] Breaking change
 - [ ] Documentation update
+- [ ] Tooling / infra
 
 ## Motivation and Context
 [Why is this change needed?]
@@ -16,3 +21,9 @@
 - [ ] Tested locally
 - [ ] Added/updated tests
 - [ ] Added/updated docs
+
+## Checklist
+- [ ] Branch follows `<type>/<name>` ([conventions](../docs/conventions.md#branching))
+- [ ] `pre-commit run --all-files` passes (ruff + black)
+- [ ] New functions have type hints and Google-style docstrings
+- [ ] Commits are signed
