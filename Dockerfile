@@ -66,8 +66,7 @@ echo "Starting fdbserver in auto-restart loop..."
 
 sleep 2
 
-echo "Configuring new database..."
-fdbcli --exec "configure new single memory ; configure native_cdc_enabled ; status" 2>/dev/null || true
+fdbcli --exec "configure new single memory ; status" 2>/dev/null || true
 
 echo ""
 echo "============================================"
