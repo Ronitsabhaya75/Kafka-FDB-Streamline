@@ -1,0 +1,106 @@
+syntax = "proto3";
+
+package fdb.kafka.cdc.v1;
+
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/Ronitsabhaya75/Kafka-FDB-Streamline/gen/go/fdb/kafka/cdc/v1;cdcv1";
+option java_multiple_files = true;
+option java_package = "com.fdb.kafka.cdc.v1";
+
+// Tracks an FDB commit version and mutation sequence number within that version.
+message FDBVersionIndex {
+    // 64-bit monotonically increasing FDB commit version
+    uint64 fdb_version = 1;
+
+    // Sequence number within the commit version (differentiates ordered mutations)
+    uint32 sequence_no = 2;
+}
+
+// Emitted at version boundaries to signal that all mutations for an FDB version are complete.
+message VersionEnd {
+    // The FDB commit version that has concluded
+    uint64 fdb_version = 1;
+
+    // Optional total count of mutations emitted in this version (for stream auditing)
+    uint32 total_mutations = 2;
+
+    // Wall-clock timestamp when the version was processed/committed
+    google.protobuf.Timestamp commit_timestamp = 3;
+}
+
+// Represents single key mutations, including standard writes and atomic operations.
+message FDBSingleKeyMutation {
+    // Maps 1:1 with FoundationDB native atomic mutation types in fdb_c.h
+    enum MutationType {
+        MUTATION_TYPE_UNSPECIFIED = 0;
+        MUTATION_TYPE_SET_VALUE = 1;
+        MUTATION_TYPE_ADD_VALUE = 2;
+        MUTATION_TYPE_AND = 3;
+        MUTATION_TYPE_OR = 4;
+        MUTATION_TYPE_XOR = 5;
+        MUTATION_TYPE_MAX = 6;
+        MUTATION_TYPE_MIN = 7;
+        MUTATION_TYPE_BYTE_MIN = 8;
+        MUTATION_TYPE_BYTE_MAX = 9;
+        MUTATION_TYPE_SET_VERSIONSTAMPED_KEY = 10;
+        MUTATION_TYPE_SET_VERSIONSTAMPED_VALUE = 11;
+        MUTATION_TYPE_COMPARE_AND_CLEAR = 12;
+        MUTATION_TYPE_APPEND_IF_FITS = 13;
+    }
+
+    // Target key in FoundationDB
+    bytes key = 1;
+
+    // Target value or operand for atomic mutations
+    bytes value = 2;
+
+    // Operation type
+    MutationType mutation_type = 3;
+}
+
+// Represents a range clear operation over [begin_key, end_key).
+message FDBClearRange {
+    // Inclusive start key of the range
+    bytes begin_key = 1;
+
+    // Exclusive end key of the range
+    bytes end_key = 2;
+}
+
+// Union of individual mutation operations tagged with a version index.
+message FDBMutation {
+    // Monotonic ordering coordinates
+    FDBVersionIndex version_index = 1;
+
+    // Mutation operation payload
+    oneof mutation {
+        FDBSingleKeyMutation single_key_mutation = 2;
+        FDBClearRange clear_range = 3;
+    }
+}
+
+// High-throughput container for batching multiple mutations into a single Kafka payload.
+message FDBMutationBatch {
+    // Monotonically ordered mutations within this batch
+    repeated FDBMutation mutations = 1;
+
+    // Optional stream identifier
+    string stream_name = 2;
+}
+
+// Top-level Kafka record envelope.
+message FDBMutationRecord {
+    // Directory or CDC stream identifier
+    string stream_name = 1;
+
+    // Ingestion or transaction commit timestamp
+    google.protobuf.Timestamp timestamp = 2;
+
+    // Record payload
+    oneof record {
+        FDBMutation mutation = 3;
+        VersionEnd version_end = 4;
+        FDBMutationBatch batch = 5;
+    }
+}

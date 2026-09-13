@@ -1,0 +1,31 @@
+name: Buf CI
+on:
+  push:
+  pull_request:
+    types: [opened, synchronize]
+
+permissions:
+  contents: read
+
+
+jobs:
+  buf:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: bufbuild/buf-action@v1
+        with:
+          setup_only: true
+          version: "1.73.0"
+
+      - name: Buf Lint
+        run: buf lint
+
+      - name: Buf Breaking
+        if: github.event_name == 'pull_request'
+        run: |
+          buf breaking --against '${{ github.event.repository.clone_url }}#branch=${{ github.event.pull_request.base.ref }}'
+
+      - name: Buf Build
+        run: buf build
