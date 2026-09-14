@@ -18,10 +18,13 @@ ENV/
 .mcp.json
 .cursor/mcp.json
 .claude/settings.local.json
+.claude/skills/
+.cursor/skills/
 CLAUDE.local.md
 
 # IDE
 .idea/
+.obsidian/
 *.swp
 *.swo
 

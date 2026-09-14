@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "trello": {
+      "command": "bunx",
+      "args": ["@delorenj/mcp-server-trello"],
+      "env": {
+        "TRELLO_API_KEY": "${env:TRELLO_API_KEY}",
+        "TRELLO_TOKEN": "${env:TRELLO_TOKEN}",
+        "TRELLO_BOARD_ID": "PsScijLy"
+      }
+    }
+  }
+}
