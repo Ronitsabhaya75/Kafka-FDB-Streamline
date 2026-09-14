@@ -11,21 +11,27 @@ How the team lays out the repo, branches, writes Python, and merges. Tooling enf
 │   ├── cdc/              # FDB CDC consumer wrapper
 │   ├── kafka/            # Kafka producer module
 │   └── serialization/    # Protobuf serialization
-├── proto/                # .proto schema definitions
+├── protobuf/
+│   ├── proto/            # .proto schema definitions
+│   ├── gen/              # buf generate output (committed)
+│   └── tests/            # Schema and serialization tests
 ├── tests/                # Unit and integration tests
 ├── config/               # Configuration files
-├── docs/                 # Documentation (this file, research write-ups)
+├── docs/                 # Documentation: INDEX.md (doc map), this file, research write-ups
 ├── scripts/              # Helper scripts
+├── .devcontainer/        # devcontainer.json + docker-compose.yml (FDB + Kafka stack)
 ├── .github/              # PR template, CI workflows
-├── docker-compose.yml    # FDB + Kafka local stack
+├── Dockerfile            # FDB + CDC runtime image
+├── buf.yaml              # buf module, lint and breaking-change config
+├── buf.gen.yaml          # buf codegen → protobuf/gen
 ├── Makefile              # setup / lint / format
 ├── pyproject.toml        # Project metadata + black/ruff config
 └── README.md
 ```
 
 - Empty directories hold a `.gitkeep` until real files land.
-- `docker-compose.yml` (and its `Dockerfile`) land with the local dev environment work.
-- Generated code (e.g. `buf generate` → `src/gen/`) is committed but excluded from ruff and black.
+- `.devcontainer/` and `Dockerfile` land with PR #2; `protobuf/` and `buf*.yaml` with PR #6.
+- Generated code (`buf generate` → `protobuf/gen/`) is committed but excluded from ruff and black.
 
 ## Branching
 
@@ -55,7 +61,7 @@ Python 3.12. All rules are configured in [`pyproject.toml`](../pyproject.toml).
 | Google-style docstrings on public modules, classes and functions | `ruff` (`D`, convention `google`) |
 
 - `Any` is allowed (the FDB bindings are untyped), but prefer a real type when one exists.
-- `tests/` is exempt from docstring rules; type hints still apply.
+- `tests/` and `protobuf/tests/` are exempt from docstring rules; type hints still apply.
 - `mypy` is optional and not enforced in CI.
 
 Docstring shape:
@@ -114,6 +120,13 @@ vim.api.nvim_create_autocmd("BufWritePost", {
   callback = function() require("lint").try_lint() end,
 })
 ```
+
+### Trello MCP
+
+Optional: lets Claude Code or Cursor read and update the team Trello board. Both run `bunx @delorenj/mcp-server-trello` (needs [Bun](https://bun.sh)) with `TRELLO_API_KEY` and `TRELLO_TOKEN` exported. Copy the template to its gitignored local file:
+
+- Claude Code: `.mcp.json.example` → `.mcp.json`
+- Cursor: `.cursor/mcp.json.example` → `.cursor/mcp.json`
 
 ### Signed commits
 

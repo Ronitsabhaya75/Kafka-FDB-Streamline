@@ -25,6 +25,7 @@ CLAUDE.local.md
 # IDE
 .idea/
 .obsidian/
+.vscode/
 *.swp
 *.swo
 

@@ -9,14 +9,14 @@ dependencies = []
 [tool.black]
 line-length = 88
 target-version = ["py312"]
-# Generated protobuf code (buf generate → src/gen) is never hand-formatted.
-force-exclude = "^/src/gen/"
+# Generated protobuf code (buf generate → protobuf/gen) is never hand-formatted.
+force-exclude = "^/protobuf/gen/"
 
 [tool.ruff]
 line-length = 88
 target-version = "py312"
-src = ["src", "tests"]
-extend-exclude = ["src/gen"]
+src = ["src", "tests", "protobuf/gen"]
+extend-exclude = ["protobuf/gen"]
 # Honour excludes even when pre-commit passes files explicitly.
 force-exclude = true
 
@@ -39,3 +39,4 @@ convention = "google"
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["D"]
+"protobuf/tests/**" = ["D"]
