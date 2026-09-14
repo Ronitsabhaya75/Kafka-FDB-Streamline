@@ -1,11 +1,12 @@
 # AGENTS.md
 
-Guidance for coding agents in this repo. Layout, branching, code style and PR rules live in [`docs/conventions.md`](docs/conventions.md) — follow them; this file only adds agent-specific guidance. Project context: [`Proposal.md`](Proposal.md).
+Guidance for coding agents in this repo. Layout, branching, code style and PR rules live in [`docs/conventions.md`](docs/conventions.md) — follow them; this file only adds agent-specific guidance. Project context: [`Proposal.md`](Proposal.md). Doc map: [`docs/INDEX.md`](docs/INDEX.md) — check it before reading docs wholesale.
 
 ## Before You Finish
 
 - Run `pre-commit run --all-files` (ruff + black). Fix lint rather than adding `# noqa`; if a suppression is truly needed, scope it to one rule on one line and say why.
 - Every function signature carries type hints; every public module, class and function carries a Google-style docstring. Ruff enforces both.
+- Adding or substantially changing a doc means updating its row in `docs/INDEX.md`.
 - Do not commit `.env`, `.mcp.json`, `.cursor/mcp.json`, or anything holding tokens.
 
 ## Code Comments
