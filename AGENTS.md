@@ -14,7 +14,7 @@ General guidance: comments should maximize clarity. They should be clear without
 
 Scope: the guidance here mainly governs inline and implementation comments. Docstrings on public APIs are contract statements and must be clear, precise, and complete.
 
-Audience: assume readers are senior engineers fluent in Python, asyncio, distributed systems, Kafka, and FoundationDB's transaction and CDC model. Calibrate "non-obvious" to that reader — do not explain the language, the standard library, asyncio idioms, or established patterns they already know. Reserve comments for what such a reader could not quickly infer from the code itself.
+Audience: assume readers are senior engineers fluent in Python, asyncio, distributed systems, Kafka, and FoundationDB's transaction and CDC model (see [`docs/CDC-DEEP-DIVE.md`](docs/CDC-DEEP-DIVE.md)). Calibrate "non-obvious" to that reader — do not explain the language, the standard library, asyncio idioms, or established patterns they already know. Reserve comments for what such a reader could not quickly infer from the code itself.
 
 Implementation comments should focus on important, non-obvious fundamental rationale, motivation, and explanation of extremely subtle phenomena. Writing down important invariants — and the preconditions a piece of code requires of its caller (e.g. a CDC version that must already be acknowledged, or a Kafka produce that must be flushed before the ack) — is also a good idea.
 
