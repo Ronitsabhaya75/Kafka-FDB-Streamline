@@ -1,7 +1,11 @@
+"""Manual CDC end-to-end smoke script against a live FDB cluster."""
+
 import time
+
 import fdb
 
-def main():
+
+def main() -> None:
     print("Initializing FDB API version 800...")
     fdb.api_version(800)
     db = fdb.open()
@@ -43,6 +47,7 @@ def main():
 
     if not found:
         print("⚠️ No mutations received within timeout.")
+
 
 if __name__ == "__main__":
     main()
