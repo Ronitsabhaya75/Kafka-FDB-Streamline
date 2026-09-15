@@ -1,0 +1,55 @@
+name: Buf CI
+on:
+  push:
+    branches: ['main']
+
+  pull_request:
+    types: [opened, synchronize]
+
+permissions:
+  contents: read
+
+
+jobs:
+  buf:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: bufbuild/buf-action@v1
+        with:
+          setup_only: true
+          version: "1.73.0"
+
+      - name: Buf Lint
+        run: buf lint
+
+      - name: Buf Breaking
+        if: github.event_name == 'pull_request'
+        run: |
+          set +e
+          OUTPUT=$(buf breaking --against "${{ github.event.repository.clone_url }}#branch=${{ github.event.pull_request.base.ref }}" 2>&1)
+          EXIT_CODE=$?
+          set -e
+          if [ $EXIT_CODE -ne 0 ]; then
+            if echo "$OUTPUT" | grep -q "had no .proto files"; then
+              echo "::notice::Base branch '${{ github.event.pull_request.base.ref }}' has no .proto files yet (initial PR). Skipping breaking check."
+            else
+              echo "$OUTPUT"
+              exit $EXIT_CODE
+            fi
+          else
+            echo "$OUTPUT"
+          fi
+
+      - name: Buf Build
+        run: buf build
+
+      - name: Buf Generate and Check Drift
+        run: |
+          buf generate
+          if [ -n "$(git status --porcelain protobuf/gen)" ]; then
+            echo "::error::Generated code in protobuf/gen is out of sync with proto definitions. Run 'buf generate' and commit the changes."
+            git status --porcelain protobuf/gen
+            exit 1
+          fi

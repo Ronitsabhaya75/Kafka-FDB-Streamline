@@ -1,0 +1,17 @@
+{
+  "name": "Kafka-FDB-Streamline Dev",
+  "dockerComposeFile": "docker-compose.yml",
+  "service": "app",
+  "workspaceFolder": "/workspace",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-python.python",
+        "ms-python.vscode-pylance",
+        "charliermarsh.ruff",
+        "zxh404.vscode-proto3"
+      ]
+    }
+  },
+  "forwardPorts": [4500, 9092]
+}
