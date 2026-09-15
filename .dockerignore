@@ -1,0 +1,15 @@
+.git
+.obsidian
+.github
+.devcontainer
+.cursor
+.claude
+.mcp.json*
+docs
+*.md
+*.pdf
+*.png
+__pycache__
+.venv
+venv
+*.pyc

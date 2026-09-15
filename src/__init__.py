@@ -1,1 +1,1 @@
-# FoundationDB CDC Streamline - src package
+"""Application package for the FoundationDB CDC to Kafka bridge."""

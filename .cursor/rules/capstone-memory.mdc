@@ -1,0 +1,13 @@
+---
+description: Project memory — agent guidance and repo conventions
+alwaysApply: true
+---
+
+# Kafka-FDB-Streamline
+
+Cursor twin of `CLAUDE.md`; keep the two identical apart from how they load files.
+
+Read and follow first:
+
+1. [`AGENTS.md`](AGENTS.md)
+2. [`docs/conventions.md`](docs/conventions.md)

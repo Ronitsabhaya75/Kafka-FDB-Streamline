@@ -12,8 +12,20 @@ build/
 venv/
 ENV/
 
+# Secrets / local config
+.env
+.env.*
+.mcp.json
+.cursor/mcp.json
+.claude/settings.local.json
+.claude/skills/
+.cursor/skills/
+CLAUDE.local.md
+
 # IDE
 .idea/
+.obsidian/
+.vscode/
 *.swp
 *.swo
 
