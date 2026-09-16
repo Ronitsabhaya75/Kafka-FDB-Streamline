@@ -1,10 +1,7 @@
 name: Protobuf Unit Tests
 on:
-  push:
-    branches: ['main']
-
-  pull_request:
-    types: [opened, synchronize]
+  workflow_call:
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -22,10 +19,6 @@ jobs:
       - name: Install dependencies
         run: pip install "protobuf>=7.36.1" pytest
 
-      - name: Run unit tests
+      - name: Run all tests
         run: |
           PYTHONPATH=protobuf/gen python3 -m pytest protobuf/tests/ -v
-      
-      - name: Run Conftest Tests
-        run: |
-          PYTHONPATH=protobuf/gen python3 -m pytest protobuf/tests/conftest.py

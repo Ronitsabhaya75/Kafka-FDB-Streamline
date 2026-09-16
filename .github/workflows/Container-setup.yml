@@ -1,0 +1,55 @@
+name: Container Setup
+
+on:
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free runner disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          df -h /
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build FDB+CDC Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          load: true
+          tags: fdb-cdc:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Verify FDB cluster and CDC bindings
+        run: |
+          docker run --rm fdb-cdc:ci bash -c '
+            set -e
+            echo "=== Checking binaries ==="
+            which fdbserver && which fdbcli
+
+            echo "=== Checking libfdb_c ==="
+            ls -la /usr/local/lib/libfdb_c.so
+
+            echo "=== Testing Python CDC bindings ==="
+            python3 -c "import fdb; fdb.api_version(800); print(\"FDB CDC bindings OK\")"
+
+            echo "=== Verifying FDB cluster status ==="
+            fdbcli --exec "status"
+
+            echo "=== Container setup verified ==="
+          '
