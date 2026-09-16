@@ -25,3 +25,7 @@ jobs:
       - name: Run unit tests
         run: |
           PYTHONPATH=protobuf/gen python3 -m pytest protobuf/tests/ -v
+      
+      - name: Run Conftest Tests
+        run: |
+          PYTHONPATH=protobuf/gen python3 -m pytest protobuf/tests/conftest.py
