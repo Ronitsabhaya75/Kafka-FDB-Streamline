@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: ['main', 'develop']
+  pull_request:
+    types: [opened, synchronize]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  signed-commits:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify all commits are signed
+        if: github.event_name == 'pull_request'
+        run: |
+          BASE=${{ github.event.pull_request.base.sha }}
+          HEAD=${{ github.event.pull_request.head.sha }}
+          UNSIGNED=$(git log --format='%H %G?' "$BASE".."$HEAD" | grep -v ' G$' | grep -v ' U$' || true)
+          if [ -n "$UNSIGNED" ]; then
+            echo "::error::The following commits are NOT signed:"
+            echo "$UNSIGNED"
+            exit 1
+          fi
+          echo "All commits are signed ✓"
+
+  container-setup:
+    needs: signed-commits
+    uses: ./.github/workflows/Container-setup.yml
+
+  lint:
+    needs: container-setup
+    uses: ./.github/workflows/lint.yml
+
+  buf:
+    needs: lint
+    uses: ./.github/workflows/buf-ci.yaml
+
+  protobuf-tests:
+    needs: buf
+    uses: ./.github/workflows/testing-protobuf.yaml

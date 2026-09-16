@@ -1,10 +1,7 @@
 name: Buf CI
 on:
-  push:
-    branches: ['main']
-
-  pull_request:
-    types: [opened, synchronize]
+  workflow_call:
+  workflow_dispatch:
 
 permissions:
   contents: read
