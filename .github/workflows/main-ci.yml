@@ -21,16 +21,27 @@ jobs:
 
       - name: Verify all commits are signed
         if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
+          REPO="${{ github.repository }}"
           BASE=${{ github.event.pull_request.base.sha }}
           HEAD=${{ github.event.pull_request.head.sha }}
-          UNSIGNED=$(git log --format='%H %G?' "$BASE".."$HEAD" | grep -v ' G$' | grep -v ' U$' || true)
-          if [ -n "$UNSIGNED" ]; then
-            echo "::error::The following commits are NOT signed:"
-            echo "$UNSIGNED"
+          FAILED=0
+          for SHA in $(git rev-list "$BASE".."$HEAD"); do
+            VERIFIED=$(gh api "repos/$REPO/commits/$SHA" --jq '.commit.verification.verified')
+            SHORT=$(echo "$SHA" | cut -c1-7)
+            if [ "$VERIFIED" != "true" ]; then
+              echo "::error::Commit $SHORT is NOT verified"
+              FAILED=1
+            else
+              echo "✓ $SHORT verified"
+            fi
+          done
+          if [ "$FAILED" -eq 1 ]; then
             exit 1
           fi
-          echo "All commits are signed ✓"
+          echo "All commits are signed and verified ✓"
 
   container-setup:
     needs: signed-commits
