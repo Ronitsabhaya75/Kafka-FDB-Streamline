@@ -54,7 +54,7 @@ Imported as `src.serialization`; product code imports generated code as
 
 Everything below is exported from the package root and listed in `__all__`. Only these names are
 contract; the file split is a suggestion (`model.py` — Protocol, enum, constants, output values;
-`errors.py`; `serializer.py`; `deserializer.py`; `__init__.py` re-exports).
+`errors.py`; `serializer.py`; `version_group.py`; `deserializer.py`; `__init__.py` re-exports).
 
 ```python
 __all__ = [
@@ -660,6 +660,7 @@ tests/
     ├── strategies.py           # Hypothesis strategies shared by P1–P4
     ├── test_environment.py     # upb backend, runtime version range
     ├── test_serialize.py       # native → bytes, type matrix, serializer-side errors
+    ├── test_version_group.py   # serialize_version_group: slicing, budget, its errors
     ├── test_deserialize.py     # bytes → values, adversarial input
     ├── test_roundtrip.py       # example round trips, feed-back, large inputs, P1–P4
     └── test_golden_bytes.py    # four change detectors

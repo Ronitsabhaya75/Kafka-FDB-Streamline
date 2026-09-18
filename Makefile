@@ -1,4 +1,4 @@
-.PHONY: setup lint format
+.PHONY: setup lint format test
 
 PYTHON ?= python3.12
 VENV := .venv
@@ -15,3 +15,6 @@ lint:
 format:
 	$(VENV)/bin/ruff check --fix .
 	$(VENV)/bin/black .
+
+test:
+	$(VENV)/bin/pytest
