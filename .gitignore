@@ -17,9 +17,9 @@ ENV/
 .env.*
 .mcp.json
 .cursor/mcp.json
-.claude/settings.local.json
-.claude/skills/
+.claude/*
 .cursor/skills/
+CONTEXT.md
 CLAUDE.local.md
 
 # IDE

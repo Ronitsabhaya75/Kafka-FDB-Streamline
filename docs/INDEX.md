@@ -7,3 +7,4 @@ Map of the project's docs. Check here before reading docs wholesale, then open o
 | [`../Proposal.md`](../Proposal.md) | Project scope, goals, architecture, sponsor requirements |
 | [`conventions.md`](conventions.md) | Repo layout, branching, code style, local setup (incl. Trello MCP), PR rules |
 | [`CDC-DEEP-DIVE.md`](CDC-DEEP-DIVE.md) | FDB native CDC: stream lifecycle, ack/resume semantics, Python API (#13925), limitations, API version 800 gate, Kafka key/partitioning, #13925/#13971 ABI risk. Its TL;DR table links each section. |
+| [`SERIALIZATION-SPEC.md`](SERIALIZATION-SPEC.md) | `src/serialization/` contract: API surface, type-code matrix, validation and error taxonomy, deserializer checks, version-group wire contract, edge-case catalogue, ordered TDD test list (tracer bullet first, golden bytes), schema follow-ups for `mutations.proto` |
