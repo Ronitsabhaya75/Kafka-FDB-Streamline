@@ -42,34 +42,32 @@ def serialize_version_group(
     stream_name: str,
     bridge_timestamp_ns: int,
 ) -> list[bytes]:
-    """Serialize a whole version group as batch records closed by its version end.
+    """Serialize a whole version group as batch records plus its version end.
 
-    Slicing is greedy in native order: a slice is closed only when appending the
-    next mutation would push its record over `max_record_bytes`. The caller
-    guarantees what cannot be verified here: `mutations` is the whole group,
-    unfiltered and in native order. A slice of a group belongs in `serialize_batch`;
-    passed here it yields a wrong `total_mutations`.
+    Slicing is greedy in native order. A slice closes only when the next mutation
+    would push its record over `max_record_bytes`. The caller must pass the whole
+    group, unfiltered and in native order. A slice of a group belongs in
+    `serialize_batch`. Passed here, it gets a wrong `total_mutations`.
 
     Args:
-        mutations: Every native mutation of the group; consumed exactly once, in order.
+        mutations: Every native mutation of the group. Consumed once, in order.
         fdb_version: Commit version of the version group.
         max_record_bytes: Upper bound on `len()` of each returned record.
-        stream_name: The CDC stream's registered name.
-        bridge_timestamp_ns: Wall-clock build time, integer ns since the Unix epoch.
+        stream_name: The stream's registered name.
+        bridge_timestamp_ns: Build time, integer ns since the Unix epoch.
 
     Returns:
-        Zero or more batch records covering positions `0 .. n-1` in order, then
-        exactly one version-end record with `total_mutations == n`.
+        Batch records covering positions `0 .. n-1` in order, then one version-end
+        record with `total_mutations == n`. An empty group returns the version end
+        alone.
 
     Raises:
-        InputTypeError: If a keyword or a native-mutation attribute has the wrong
-            Python type, `mutations` is not iterable, or an element lacks one of
-            `type`, `param1`, `param2`. `index` is the element's position.
-        InputValueError: If a keyword or a type code is outside its accepted domain.
-        RecordTooLargeError: If one mutation's one-element batch record, or the
-            version-end record, exceeds `max_record_bytes`. `index` is the
-            mutation's position, `None` for the version end; `record_bytes` is the
-            size of the record that did not fit. Nothing is returned.
+        InputTypeError: A keyword or attribute has the wrong Python type, `mutations`
+            is not iterable, or an element lacks `type`, `param1` or `param2`.
+            `index` is the element's position.
+        InputValueError: A keyword or a type code is out of range.
+        RecordTooLargeError: One mutation alone, or the version end, does not fit
+            `max_record_bytes`. A mutation is never split.
     """
     _checks.fdb_version(fdb_version)
     _checks.max_record_bytes(max_record_bytes)
@@ -77,8 +75,8 @@ def serialize_version_group(
     _checks.bridge_timestamp_ns(bridge_timestamp_ns)
     natives: list[tuple[int, bytes, bytes]] = []
     for i, mutation in enumerate(_checks.mutations(mutations)):
-        # Checked per element, before the read, so a group past uint32 positions
-        # fails here rather than inside protobuf after the whole group is held.
+        # Check before the read. Past 2**32 mutations protobuf would raise its own
+        # ValueError, and only once the whole group is in memory.
         _checks.assigned_sequence_no(i, index=i)
         natives.append(_read_native(mutation, index=i))
     messages = [
@@ -89,8 +87,8 @@ def serialize_version_group(
         stream_name=stream_name, bridge_timestamp=timestamp
     ).ByteSize()
 
-    # Record sizes are computed, never measured by serializing: a batch record is the
-    # envelope plus one framed batch whose payload is the sum of its framed mutations.
+    # Sizes are computed, not measured by serializing. A batch record is the envelope
+    # plus one framed batch, whose payload is the sum of its framed mutations.
     slices: list[tuple[int, int]] = []
     start = 0
     batch_bytes = 0

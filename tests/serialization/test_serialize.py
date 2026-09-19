@@ -585,8 +585,8 @@ def test_type_code_that_is_not_an_int_is_a_type_error(code: Any) -> None:
     assert excinfo.value.index is None
 
 
-# CPython refuses to render ints past ~4300 digits; an error message must not be
-# where that surfaces.
+# CPython raises ValueError when asked to print an int past ~4300 digits. Building
+# the error message must not trip it.
 UNRENDERABLE = 10**5000
 
 

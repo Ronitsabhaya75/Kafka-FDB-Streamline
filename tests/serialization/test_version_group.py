@@ -179,7 +179,7 @@ def test_ten_megabyte_group_is_sliced_within_budget() -> None:
         assert isinstance(body, MutationBatch)
         seen.extend(body.mutations)
     assert len(seen) == 100_000
-    # Plain bools: a pytest-diffed 100k-element comparison is unreadable and slow.
+    # Compare to plain bools. A pytest diff of 100k elements is slow and unreadable.
     params_match = [(m.type, m.param1, m.param2) for m in seen] == [
         (m.type, m.param1, m.param2) for m in ms
     ]
@@ -329,7 +329,8 @@ def test_invalid_mutation_late_in_the_group_raises_and_returns_nothing() -> None
     records = None
 
     with pytest.raises(InputTypeError) as excinfo:
-        # A budget that slices: the bad mutation must surface before any slice does.
+        # This budget forces slicing. The bad mutation must raise before any slice
+        # comes back.
         records = serialize_version_group(
             group, fdb_version=V, max_record_bytes=150, **ENV
         )

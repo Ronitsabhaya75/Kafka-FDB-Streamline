@@ -23,8 +23,8 @@ def _at(index: int | None) -> str:
 
 
 def _check_version(fdb_version: int, index: int | None) -> None:
-    # The wire field is uint64; a native commit version is int64_t, and anything
-    # larger could not be re-serialized.
+    # The wire field is uint64 but a native commit version is int64_t. Anything
+    # larger cannot be serialized again.
     if fdb_version > MAX_VERSION:
         raise RecordDecodeError(
             f"fdb_version {fdb_version}{_at(index)} exceeds {MAX_VERSION}",
@@ -34,7 +34,7 @@ def _check_version(fdb_version: int, index: int | None) -> None:
 
 
 def _mutation(message: mutations_pb2.FDBMutation, index: int | None) -> Mutation:
-    # Presence, not content: an absent version index must never read as (0, 0).
+    # Check presence. An absent version index would otherwise read as (0, 0).
     if not message.HasField("version_index"):
         raise RecordDecodeError(
             f"mutation{_at(index)} has no version index",
@@ -53,12 +53,11 @@ def _mutation(message: mutations_pb2.FDBMutation, index: int | None) -> Mutation
             index=index,
         )
     if arm == "clear_range":
-        # The clear_range arm has no type field; the type code is synthesised.
+        # The clear_range arm has no type field, so the type code is synthesised.
         clear = message.clear_range
         return Mutation(_CLEAR_RANGE, clear.begin_key, clear.end_key, version_index)
     single = message.single_key_mutation
-    # mutation_type is an open enum: any int32 parses, only a native uint8_t is a
-    # type code.
+    # mutation_type is an open enum, so any int32 parses. Only 0..255 is a type code.
     type_code = single.mutation_type
     if not 0 <= type_code <= MAX_TYPE_CODE:
         raise RecordDecodeError(
@@ -91,8 +90,8 @@ def _batch(message: mutations_pb2.FDBMutationBatch) -> MutationBatch:
 def _body(message: mutations_pb2.FDBMutationRecord) -> RecordBody:
     arm = message.WhichOneof("record")
     if arm is None:
-        # Also what an arm added by a newer schema looks like: to this reader it
-        # is an unknown field.
+        # A record body added by a newer schema lands here too. This reader sees
+        # it as an unknown field.
         raise RecordDecodeError(
             "record has no record body", reason=DecodeFailure.NO_RECORD_ARM
         )
@@ -108,7 +107,7 @@ def _body(message: mutations_pb2.FDBMutationRecord) -> RecordBody:
 def _bridge_timestamp_ns(message: mutations_pb2.FDBMutationRecord) -> int | None:
     if not message.HasField("bridge_timestamp"):
         return None
-    # Straight from the two fields: the Timestamp helpers range-check, and the
+    # Read the two fields directly. The Timestamp helpers range-check, and the
     # envelope must never fail a read.
     timestamp = message.bridge_timestamp
     return timestamp.seconds * 10**9 + timestamp.nanos
@@ -117,11 +116,10 @@ def _bridge_timestamp_ns(message: mutations_pb2.FDBMutationRecord) -> int | None
 def deserialize_record(data: bytes) -> Record:
     """Parse one Kafka record value.
 
-    Strict for identity, tolerant for metadata: the record body, version indexes,
-    type codes and batch shape are checked, so every returned record body is
-    re-serializable. The envelope is returned as found and never fails the call:
-    `stream_name` may be `""` and `bridge_timestamp_ns` may be `None` or outside
-    the serializer's accepted range.
+    The record body, version indexes, type codes and batch shape are checked, so
+    every returned record body can be serialized again. The envelope is returned as
+    found and never fails the call. `stream_name` may be `""`, and
+    `bridge_timestamp_ns` may be `None` or outside the serializer's range.
 
     Args:
         data: The bytes of one record.
@@ -130,10 +128,10 @@ def deserialize_record(data: bytes) -> Record:
         The complete `Record`.
 
     Raises:
-        InputTypeError: If `data` is not `bytes`; `field` is `"data"`.
-        RecordDecodeError: If the bytes are an undecodable record. `reason` names
-            the failed check and `index` the batch position, where there is one.
-            For `MALFORMED_WIRE` the protobuf exception is the `__cause__`.
+        InputTypeError: `data` is not `bytes`.
+        RecordDecodeError: The bytes are an undecodable record. `reason` names the
+            failed check and `index` the batch position, if any. For
+            `MALFORMED_WIRE` the protobuf exception is the `__cause__`.
     """
     if not isinstance(data, bytes):
         raise InputTypeError(
@@ -143,8 +141,8 @@ def deserialize_record(data: bytes) -> Record:
     try:
         message.ParseFromString(data)
     except (DecodeError, ValueError) as exc:
-        # upb raises DecodeError for invalid UTF-8; the pure-python backend raises
-        # UnicodeDecodeError, a ValueError.
+        # On invalid UTF-8, upb raises DecodeError and the pure-python backend
+        # raises UnicodeDecodeError, a ValueError.
         raise RecordDecodeError(
             f"{len(data)} bytes are not a parseable FDBMutationRecord",
             reason=DecodeFailure.MALFORMED_WIRE,

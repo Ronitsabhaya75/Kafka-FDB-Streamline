@@ -8,8 +8,8 @@ from typing import Final, NamedTuple, Protocol
 class MutationType(enum.IntEnum):
     """The 16 declared type codes, mirroring upstream `CdcMutationType`.
 
-    An input, test and display convenience only: the read path never looks a type
-    code up in it and output values never carry it.
+    A convenience for callers, tests and display. The read path never looks a type
+    code up in it, and output values never carry it.
     """
 
     SET_VALUE = 0
@@ -40,7 +40,7 @@ MAX_BRIDGE_TIMESTAMP_NS: Final = 253_402_300_799_999_999_999  # 9999-12-31T23:59
 
 
 class NativeMutation(Protocol):
-    """One native mutation as FDB CDC delivers it; upstream `CdcMutation` conforms."""
+    """One native mutation as FDB CDC delivers it. Upstream `CdcMutation` conforms."""
 
     @property
     def type(self) -> int:
@@ -59,7 +59,7 @@ class NativeMutation(Protocol):
 
 
 class VersionIndex(NamedTuple):
-    """Identity of a mutation on the wire; orders lexicographically in stream order."""
+    """Identity of a mutation on the wire. Tuple order is stream order."""
 
     fdb_version: int
     sequence_no: int
@@ -95,7 +95,7 @@ type RecordBody = Mutation | MutationBatch | VersionEnd
 
 @dataclass(frozen=True, slots=True)
 class Record:
-    """One deserialized record: envelope fields plus exactly one record body."""
+    """One deserialized record, the envelope fields plus exactly one record body."""
 
     stream_name: str
     bridge_timestamp_ns: int | None

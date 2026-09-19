@@ -1,9 +1,9 @@
-"""Change detectors, not contract.
+"""Change detectors for the wire bytes.
 
-These assert byte stability upstream does not guarantee. A failure after a
-protobuf or gencode upgrade means: review the diff, then re-bless. A failure at
-any other time is a real regression. The literals are the bytes of the equivalent
-hand-built `mutations_pb2` messages.
+Upstream does not guarantee byte stability. If one fails after a protobuf or
+gencode upgrade, review the diff and re-bless. If one fails at any other time, it
+is a real regression. Each literal is the bytes of the equivalent hand-built
+`mutations_pb2` message.
 """
 
 from src.serialization import serialize_batch, serialize_mutation, serialize_version_end

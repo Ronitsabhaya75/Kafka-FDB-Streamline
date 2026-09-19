@@ -11,27 +11,27 @@ class InputTypeError(SerializationError, TypeError):
     """An argument or native-mutation attribute has the wrong Python type.
 
     Attributes:
-        field: Offending parameter or attribute name, as spelled in the public API.
-        index: Zero-based position in `mutations`; `None` outside a batch.
+        field: The offending parameter or attribute, as the public API spells it.
+        index: Position in `mutations`, or `None` outside a batch.
     """
 
     def __init__(self, message: str, *, field: str, index: int | None = None) -> None:
-        """Initialise with a message and the offending field and position."""
+        """Store the offending field and position."""
         super().__init__(message)
         self.field = field
         self.index = index
 
 
 class InputValueError(SerializationError, ValueError):
-    """An argument or native-mutation attribute is outside its accepted domain.
+    """An argument or native-mutation attribute is out of range.
 
     Attributes:
-        field: Offending parameter or attribute name, as spelled in the public API.
-        index: Zero-based position in `mutations`; `None` outside a batch.
+        field: The offending parameter or attribute, as the public API spells it.
+        index: Position in `mutations`, or `None` outside a batch.
     """
 
     def __init__(self, message: str, *, field: str, index: int | None = None) -> None:
-        """Initialise with a message and the offending field and position."""
+        """Store the offending field and position."""
         super().__init__(message)
         self.field = field
         self.index = index
@@ -40,9 +40,11 @@ class InputValueError(SerializationError, ValueError):
 class RecordTooLargeError(InputValueError):
     """One mutation, or the version end, cannot fit `max_record_bytes`.
 
+    `index` is the mutation's position, or `None` when the version end is too big.
+
     Attributes:
         record_bytes: Size of the record that did not fit.
-        max_record_bytes: The budget it was checked against.
+        max_record_bytes: The budget it exceeded.
     """
 
     def __init__(
@@ -53,14 +55,14 @@ class RecordTooLargeError(InputValueError):
         record_bytes: int,
         max_record_bytes: int,
     ) -> None:
-        """Initialise with the unsplittable position and the two sizes."""
+        """Store the position and the two sizes."""
         super().__init__(message, field="max_record_bytes", index=index)
         self.record_bytes = record_bytes
         self.max_record_bytes = max_record_bytes
 
 
 class DecodeFailure(enum.Enum):
-    """Why bytes could not be interpreted as a record; doubles as a metric label."""
+    """Why bytes are not a decodable record. The value is the metric label."""
 
     MALFORMED_WIRE = "malformed_wire"
     NO_RECORD_ARM = "no_record_arm"
@@ -73,17 +75,17 @@ class DecodeFailure(enum.Enum):
 
 
 class RecordDecodeError(SerializationError, ValueError):
-    """Bytes are not a record this package can interpret.
+    """The bytes are an undecodable record.
 
     Attributes:
         reason: The check that failed.
-        index: Zero-based position in the wire batch; `None` outside a batch.
+        index: Position in the wire batch, or `None` outside a batch.
     """
 
     def __init__(
         self, message: str, *, reason: DecodeFailure, index: int | None = None
     ) -> None:
-        """Initialise with a message, the failed check and the batch position."""
+        """Store the failed check and the batch position."""
         super().__init__(message)
         self.reason = reason
         self.index = index
