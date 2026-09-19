@@ -8,28 +8,9 @@ from google.protobuf.timestamp_pb2 import Timestamp
 from fdbkafka.cdc.v1 import mutations_pb2
 from src.serialization import _checks
 from src.serialization.errors import InputTypeError, InputValueError
-from src.serialization.model import DECLARED_TYPE_CODES, MutationType, NativeMutation
+from src.serialization.model import NativeMutation
 
 _CLEAR_RANGE = 1
-
-
-def mutation_type_name(code: int) -> str:
-    """Name a type code for display.
-
-    Args:
-        code: A type code, 0..255.
-
-    Returns:
-        The `MutationType` name of a declared type code, else `"UNDECLARED_<code>"`.
-
-    Raises:
-        InputTypeError: `code` is a `bool` or not an `int`.
-        InputValueError: `code` is outside 0..255.
-    """
-    code = _checks.type_code(code, field="code")
-    if code in DECLARED_TYPE_CODES:
-        return MutationType(code).name
-    return f"UNDECLARED_{code}"
 
 
 def _attribute(mutation: NativeMutation, field: str, index: int | None) -> Any:

@@ -127,21 +127,21 @@ def param(value: bytes, *, field: str, index: int | None = None) -> None:
         )
 
 
-def type_code(value: int, *, field: str = "type", index: int | None = None) -> int:
+def type_code(value: int, *, index: int | None = None) -> int:
     """Require an `int` in 0..255 that is not a `bool`. Returns it as a plain `int`."""
     # Reject `bool` here. Older protobuf runtimes accept `True` as 1, which would
     # be a silent CLEAR_RANGE.
     if not isinstance(value, int) or isinstance(value, bool):
         raise InputTypeError(
-            f"{field}{at(index)} must be int, got {type(value).__name__}",
-            field=field,
+            f"type{at(index)} must be int, got {type(value).__name__}",
+            field="type",
             index=index,
         )
     code = int(value)
     if not 0 <= code <= MAX_TYPE_CODE:
         raise InputValueError(
-            f"{field}{at(index)} must be in 0..{MAX_TYPE_CODE}, got {_rendered(code)}",
-            field=field,
+            f"type{at(index)} must be in 0..{MAX_TYPE_CODE}, got {_rendered(code)}",
+            field="type",
             index=index,
         )
     return code

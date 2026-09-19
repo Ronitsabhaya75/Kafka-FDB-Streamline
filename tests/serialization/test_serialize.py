@@ -11,12 +11,6 @@ from google.protobuf.timestamp_pb2 import Timestamp
 
 from fdbkafka.cdc.v1 import mutations_pb2
 from src.serialization import (
-    DECLARED_TYPE_CODES,
-    MAX_BRIDGE_TIMESTAMP_NS,
-    MAX_SEQUENCE_NO,
-    MAX_TOTAL_MUTATIONS,
-    MAX_TYPE_CODE,
-    MAX_VERSION,
     InputTypeError,
     InputValueError,
     Mutation,
@@ -27,7 +21,6 @@ from src.serialization import (
     SerializationError,
     VersionIndex,
     deserialize_record,
-    mutation_type_name,
     serialize_batch,
     serialize_mutation,
     serialize_version_end,
@@ -159,28 +152,6 @@ def test_mutation_type_mirrors_the_declared_type_codes() -> None:
     assert {f"MUTATION_TYPE_{m.name}": m.value for m in MutationType} == dict(
         proto_enum.items()
     )
-    assert DECLARED_TYPE_CODES == frozenset(MutationType)
-
-
-def test_limits_have_the_native_and_proto_bounds() -> None:
-    assert MAX_TYPE_CODE == 255
-    assert MAX_VERSION == 9_223_372_036_854_775_807
-    assert MAX_SEQUENCE_NO == 4_294_967_295
-    assert MAX_TOTAL_MUTATIONS == 4_294_967_295
-    assert MAX_BRIDGE_TIMESTAMP_NS == 253_402_300_799_999_999_999
-
-
-@pytest.mark.parametrize(
-    ("code", "name"),
-    [
-        (0, "SET_VALUE"),
-        (20, "COMPARE_AND_CLEAR"),
-        (3, "UNDECLARED_3"),
-        (255, "UNDECLARED_255"),
-    ],
-)
-def test_mutation_type_name_names_every_type_code(code: int, name: str) -> None:
-    assert mutation_type_name(code) == name
 
 
 def test_error_hierarchy() -> None:
@@ -202,30 +173,6 @@ def test_type_code_outside_uint8_is_a_value_error(code: int) -> None:
         serialize_mutation(native, fdb_version=V, sequence_no=0, **ENV)
 
     assert excinfo.value.field == "type"
-    assert excinfo.value.index is None
-
-
-@pytest.mark.parametrize(
-    ("code", "error"),
-    [
-        (-1, InputValueError),
-        (256, InputValueError),
-        (2**31, InputValueError),
-        (2**64, InputValueError),
-        (True, InputTypeError),
-        (False, InputTypeError),
-        (1.0, InputTypeError),
-        ("1", InputTypeError),
-        (None, InputTypeError),
-    ],
-)
-def test_mutation_type_name_checks_its_code_like_a_type_code(
-    code: Any, error: type[InputTypeError | InputValueError]
-) -> None:
-    with pytest.raises(error) as excinfo:
-        mutation_type_name(code)
-
-    assert excinfo.value.field == "code"
     assert excinfo.value.index is None
 
 
@@ -604,10 +551,3 @@ def test_unrenderable_type_code_is_still_a_value_error() -> None:
         serialize_mutation(native, fdb_version=V, sequence_no=0, **ENV)
 
     assert excinfo.value.field == "type"
-
-
-def test_unrenderable_code_is_still_a_value_error_for_mutation_type_name() -> None:
-    with pytest.raises(InputValueError) as excinfo:
-        mutation_type_name(UNRENDERABLE)
-
-    assert excinfo.value.field == "code"

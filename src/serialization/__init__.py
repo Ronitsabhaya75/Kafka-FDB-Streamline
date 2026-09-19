@@ -10,12 +10,6 @@ from src.serialization.errors import (
     SerializationError,
 )
 from src.serialization.model import (
-    DECLARED_TYPE_CODES,
-    MAX_BRIDGE_TIMESTAMP_NS,
-    MAX_SEQUENCE_NO,
-    MAX_TOTAL_MUTATIONS,
-    MAX_TYPE_CODE,
-    MAX_VERSION,
     Mutation,
     MutationBatch,
     MutationType,
@@ -26,7 +20,6 @@ from src.serialization.model import (
     VersionIndex,
 )
 from src.serialization.serializer import (
-    mutation_type_name,
     serialize_batch,
     serialize_mutation,
     serialize_version_end,
@@ -40,12 +33,6 @@ __all__ = [
     "RecordDecodeError",
     "RecordTooLargeError",
     "SerializationError",
-    "DECLARED_TYPE_CODES",
-    "MAX_BRIDGE_TIMESTAMP_NS",
-    "MAX_SEQUENCE_NO",
-    "MAX_TOTAL_MUTATIONS",
-    "MAX_TYPE_CODE",
-    "MAX_VERSION",
     "Mutation",
     "MutationBatch",
     "MutationType",
@@ -55,7 +42,6 @@ __all__ = [
     "VersionEnd",
     "VersionIndex",
     "deserialize_record",
-    "mutation_type_name",
     "serialize_batch",
     "serialize_mutation",
     "serialize_version_end",
