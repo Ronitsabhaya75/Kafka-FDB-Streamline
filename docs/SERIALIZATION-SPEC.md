@@ -5,7 +5,7 @@ Contract for the `src/serialization/` package: native CDC mutations → Protobuf
 [§12](#12-ordered-test-list). Trello:
 [Implement Binary Serializer & Deserializer Module](https://trello.com/c/amcMAYnn).
 
-- Vocabulary is [`CONTEXT.md`](../CONTEXT.md)'s and is used exactly: native mutation, type code,
+- These terms are used exactly: native mutation, type code,
   declared / undeclared type code, version group, batch, consume reply, version index, mutation,
   record, record body, round trip, version end, bridge timestamp, stream name, undecodable record.
   "Arm" names a proto `oneof` case only; the domain word is record body.
