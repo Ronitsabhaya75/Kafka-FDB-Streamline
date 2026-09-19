@@ -9,13 +9,12 @@ from src.serialization.model import (
     MAX_VERSION,
     Mutation,
     MutationBatch,
+    MutationType,
     Record,
     RecordBody,
     VersionEnd,
     VersionIndex,
 )
-
-_CLEAR_RANGE = 1
 
 
 def _at(index: int | None) -> str:
@@ -54,8 +53,10 @@ def _mutation(message: mutations_pb2.FDBMutation, index: int | None) -> Mutation
         )
     if arm == "clear_range":
         # The clear_range arm has no type field, so the type code is synthesised.
+        # `.value` because output values carry a plain int, never the enum.
         clear = message.clear_range
-        return Mutation(_CLEAR_RANGE, clear.begin_key, clear.end_key, version_index)
+        code = MutationType.CLEAR_RANGE.value
+        return Mutation(code, clear.begin_key, clear.end_key, version_index)
     single = message.single_key_mutation
     # mutation_type is an open enum, so any int32 parses. Only 0..255 is a type code.
     type_code = single.mutation_type

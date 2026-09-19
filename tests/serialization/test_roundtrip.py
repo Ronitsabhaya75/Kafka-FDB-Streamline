@@ -31,11 +31,13 @@ def test_set_value_mutation_round_trips() -> None:
 
 
 def test_clear_range_round_trips_with_synthesised_type_code() -> None:
-    data = serialize_mutation(CLEAR, fdb_version=V, sequence_no=0, **ENV)
-
-    assert deserialize_record(data) == Record(
-        STREAM, TS, Mutation(1, b"a", b"b\xff", VersionIndex(V, 0))
+    record = deserialize_record(
+        serialize_mutation(CLEAR, fdb_version=V, sequence_no=0, **ENV)
     )
+
+    assert record == Record(STREAM, TS, Mutation(1, b"a", b"b\xff", VersionIndex(V, 0)))
+    assert isinstance(record.body, Mutation)
+    assert type(record.body.type) is int
 
 
 @pytest.mark.parametrize("code", [3, 4, 5, 10, 11, 21, 22, 23, 24, 255])

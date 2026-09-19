@@ -6,6 +6,7 @@ never their content.
 """
 
 from collections.abc import Iterable, Iterator
+from typing import Any
 
 from src.serialization.errors import InputTypeError, InputValueError
 from src.serialization.model import (
@@ -103,6 +104,12 @@ def bridge_timestamp_ns(value: int) -> None:
     _integer(value, field="bridge_timestamp_ns", maximum=MAX_BRIDGE_TIMESTAMP_NS)
 
 
+def envelope(name: str, timestamp_ns: int) -> None:
+    """Check `stream_name`, then `bridge_timestamp_ns`."""
+    stream_name(name)
+    bridge_timestamp_ns(timestamp_ns)
+
+
 def mutations(value: Iterable[NativeMutation]) -> Iterator[NativeMutation]:
     """Require an iterable and return its iterator, unread."""
     # Guard `iter()` only. A TypeError raised mid-iteration is the caller's
@@ -145,3 +152,42 @@ def type_code(value: int, *, index: int | None = None) -> int:
             index=index,
         )
     return code
+
+
+def _attribute(mutation: NativeMutation, field: str, index: int | None) -> Any:
+    try:
+        return getattr(mutation, field)
+    except AttributeError as error:
+        raise InputTypeError(
+            f"{type(mutation).__name__}{at(index)} is not a native mutation: "
+            f"no {field!r} attribute",
+            field=field,
+            index=index,
+        ) from error
+
+
+def native(
+    mutation: NativeMutation, *, index: int | None = None
+) -> tuple[int, bytes, bytes]:
+    """Require a native mutation. Returns its checked `(type, param1, param2)`."""
+    # Read each attribute once, by name, in this order. The reads are the
+    # conformance check.
+    code = type_code(_attribute(mutation, "type", index), index=index)
+    param1 = _attribute(mutation, "param1", index)
+    param(param1, field="param1", index=index)
+    param2 = _attribute(mutation, "param2", index)
+    param(param2, field="param2", index=index)
+    return code, param1, param2
+
+
+def natives(
+    value: Iterable[NativeMutation], *, first_sequence_no: int = 0
+) -> list[tuple[int, bytes, bytes]]:
+    """Require every mutation, and the position each is assigned, to be valid."""
+    checked: list[tuple[int, bytes, bytes]] = []
+    for index, mutation in enumerate(mutations(value)):
+        # Check before the read. Past 2**32 mutations protobuf would raise its own
+        # ValueError, and only once the whole group is in memory.
+        assigned_sequence_no(first_sequence_no + index, index=index)
+        checked.append(native(mutation, index=index))
+    return checked

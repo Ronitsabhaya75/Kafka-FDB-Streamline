@@ -1,71 +1,11 @@
 """Native CDC mutations to `FDBMutationRecord` bytes."""
 
 from collections.abc import Iterable
-from typing import Any
-
-from google.protobuf.timestamp_pb2 import Timestamp
 
 from fdbkafka.cdc.v1 import mutations_pb2
-from src.serialization import _checks
-from src.serialization.errors import InputTypeError, InputValueError
+from src.serialization import _checks, _wire
+from src.serialization.errors import InputValueError
 from src.serialization.model import NativeMutation
-
-_CLEAR_RANGE = 1
-
-
-def _attribute(mutation: NativeMutation, field: str, index: int | None) -> Any:
-    try:
-        return getattr(mutation, field)
-    except AttributeError as error:
-        raise InputTypeError(
-            f"{type(mutation).__name__}{_checks.at(index)} is not a native mutation: "
-            f"no {field!r} attribute",
-            field=field,
-            index=index,
-        ) from error
-
-
-def _read_native(
-    mutation: NativeMutation, *, index: int | None = None
-) -> tuple[int, bytes, bytes]:
-    # Read each attribute once, by name, in this order. The reads are the
-    # conformance check.
-    type_code = _checks.type_code(_attribute(mutation, "type", index), index=index)
-    param1 = _attribute(mutation, "param1", index)
-    _checks.param(param1, field="param1", index=index)
-    param2 = _attribute(mutation, "param2", index)
-    _checks.param(param2, field="param2", index=index)
-    return type_code, param1, param2
-
-
-def _mutation_message(
-    type_code: int, param1: bytes, param2: bytes, fdb_version: int, sequence_no: int
-) -> mutations_pb2.FDBMutation:
-    # Arguments must already be validated. Protobuf swallows a `None` kwarg instead
-    # of raising.
-    version_index = mutations_pb2.FDBVersionIndex(
-        fdb_version=fdb_version, sequence_no=sequence_no
-    )
-    if type_code == _CLEAR_RANGE:
-        return mutations_pb2.FDBMutation(
-            version_index=version_index,
-            clear_range=mutations_pb2.FDBClearRange(begin_key=param1, end_key=param2),
-        )
-    return mutations_pb2.FDBMutation(
-        version_index=version_index,
-        # The stubs type this open proto3 enum as closed. Undeclared type codes pass
-        # through as raw ints.
-        single_key_mutation=mutations_pb2.FDBSingleKeyMutation(
-            key=param1,
-            value=param2,
-            mutation_type=type_code,  # type: ignore[arg-type]
-        ),
-    )
-
-
-def _timestamp(bridge_timestamp_ns: int) -> Timestamp:
-    seconds, nanos = divmod(bridge_timestamp_ns, 10**9)
-    return Timestamp(seconds=seconds, nanos=nanos)
 
 
 def serialize_mutation(
@@ -95,15 +35,13 @@ def serialize_mutation(
     """
     _checks.fdb_version(fdb_version)
     _checks.sequence_no(sequence_no)
-    _checks.stream_name(stream_name)
-    _checks.bridge_timestamp_ns(bridge_timestamp_ns)
-    type_code, param1, param2 = _read_native(mutation)
-    # The constructor kwarg keeps a zero Timestamp present on the wire.
-    return mutations_pb2.FDBMutationRecord(
-        stream_name=stream_name,
-        bridge_timestamp=_timestamp(bridge_timestamp_ns),
-        mutation=_mutation_message(type_code, param1, param2, fdb_version, sequence_no),
-    ).SerializeToString()
+    _checks.envelope(stream_name, bridge_timestamp_ns)
+    native = _checks.native(mutation)
+    return _wire.record(
+        stream_name,
+        bridge_timestamp_ns,
+        mutation=_wire.mutation_message(*native, fdb_version, sequence_no),
+    )
 
 
 def serialize_batch(
@@ -141,28 +79,23 @@ def serialize_batch(
     """
     _checks.fdb_version(fdb_version)
     _checks.sequence_no(first_sequence_no, field="first_sequence_no")
-    _checks.stream_name(stream_name)
-    _checks.bridge_timestamp_ns(bridge_timestamp_ns)
-    natives: list[tuple[int, bytes, bytes]] = []
-    for index, mutation in enumerate(_checks.mutations(mutations)):
-        _checks.assigned_sequence_no(first_sequence_no + index, index=index)
-        natives.append(_read_native(mutation, index=index))
+    _checks.envelope(stream_name, bridge_timestamp_ns)
+    natives = _checks.natives(mutations, first_sequence_no=first_sequence_no)
     if not natives:
         # An empty batch carries no version, so a reader cannot tell which group
         # it belongs to.
         raise InputValueError(
             "mutations must yield at least one native mutation", field="mutations"
         )
-    return mutations_pb2.FDBMutationRecord(
-        stream_name=stream_name,
-        bridge_timestamp=_timestamp(bridge_timestamp_ns),
+    return _wire.record(
+        stream_name,
+        bridge_timestamp_ns,
         batch=mutations_pb2.FDBMutationBatch(
-            mutations=[
-                _mutation_message(*native, fdb_version, first_sequence_no + i)
-                for i, native in enumerate(natives)
-            ]
+            mutations=_wire.mutation_messages(
+                natives, fdb_version=fdb_version, first_sequence_no=first_sequence_no
+            )
         ),
-    ).SerializeToString()
+    )
 
 
 def serialize_version_end(
@@ -190,14 +123,13 @@ def serialize_version_end(
     """
     _checks.fdb_version(fdb_version)
     _checks.total_mutations(total_mutations)
-    _checks.stream_name(stream_name)
-    _checks.bridge_timestamp_ns(bridge_timestamp_ns)
-    return mutations_pb2.FDBMutationRecord(
-        stream_name=stream_name,
-        bridge_timestamp=_timestamp(bridge_timestamp_ns),
+    _checks.envelope(stream_name, bridge_timestamp_ns)
+    return _wire.record(
+        stream_name,
+        bridge_timestamp_ns,
         version_end=mutations_pb2.VersionEnd(
             fdb_version=fdb_version,
             total_mutations=total_mutations,
-            bridge_timestamp=_timestamp(bridge_timestamp_ns),
+            bridge_timestamp=_wire.timestamp(bridge_timestamp_ns),
         ),
-    ).SerializeToString()
+    )

@@ -5,15 +5,10 @@ from collections.abc import Iterable
 from google.protobuf.message import Message
 
 from fdbkafka.cdc.v1 import mutations_pb2
-from src.serialization import _checks
+from src.serialization import _checks, _wire
 from src.serialization.errors import RecordTooLargeError
 from src.serialization.model import NativeMutation
-from src.serialization.serializer import (
-    _mutation_message,
-    _read_native,
-    _timestamp,
-    serialize_version_end,
-)
+from src.serialization.serializer import serialize_version_end
 
 
 def _varint_bytes(value: int) -> int:
@@ -71,21 +66,11 @@ def serialize_version_group(
     """
     _checks.fdb_version(fdb_version)
     _checks.max_record_bytes(max_record_bytes)
-    _checks.stream_name(stream_name)
-    _checks.bridge_timestamp_ns(bridge_timestamp_ns)
-    natives: list[tuple[int, bytes, bytes]] = []
-    for i, mutation in enumerate(_checks.mutations(mutations)):
-        # Check before the read. Past 2**32 mutations protobuf would raise its own
-        # ValueError, and only once the whole group is in memory.
-        _checks.assigned_sequence_no(i, index=i)
-        natives.append(_read_native(mutation, index=i))
-    messages = [
-        _mutation_message(*native, fdb_version, i) for i, native in enumerate(natives)
-    ]
-    timestamp = _timestamp(bridge_timestamp_ns)
-    envelope_bytes = mutations_pb2.FDBMutationRecord(
-        stream_name=stream_name, bridge_timestamp=timestamp
-    ).ByteSize()
+    _checks.envelope(stream_name, bridge_timestamp_ns)
+    messages = _wire.mutation_messages(
+        _checks.natives(mutations), fdb_version=fdb_version
+    )
+    envelope_bytes = len(_wire.record(stream_name, bridge_timestamp_ns))
 
     # Sizes are computed, not measured by serializing. A batch record is the envelope
     # plus one framed batch, whose payload is the sum of its framed mutations.
@@ -131,11 +116,11 @@ def serialize_version_group(
         )
 
     records = [
-        mutations_pb2.FDBMutationRecord(
-            stream_name=stream_name,
-            bridge_timestamp=timestamp,
+        _wire.record(
+            stream_name,
+            bridge_timestamp_ns,
             batch=mutations_pb2.FDBMutationBatch(mutations=messages[a:b]),
-        ).SerializeToString()
+        )
         for a, b in slices
     ]
     records.append(version_end)
