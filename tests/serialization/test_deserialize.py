@@ -272,7 +272,7 @@ def test_batch_may_start_at_any_position() -> None:
         ),
         pytest.param(
             mutations_pb2.FDBMutationRecord(version_end=mutations_pb2.VersionEnd()),
-            VersionEnd(0, 0),
+            VersionEnd(0, 0, None),
             id="version-end",
         ),
     ],
@@ -346,7 +346,7 @@ def test_envelope_is_returned_as_found_and_never_raises(
     )
 
 
-def test_version_end_inner_timestamp_is_ignored() -> None:
+def test_version_end_inner_timestamp_is_read_independently() -> None:
     data = mutations_pb2.FDBMutationRecord(
         stream_name=STREAM,
         bridge_timestamp=Timestamp(seconds=7, nanos=9),
@@ -355,7 +355,39 @@ def test_version_end_inner_timestamp_is_ignored() -> None:
         ),
     ).SerializeToString()
 
-    assert deserialize_record(data) == Record(STREAM, 7_000_000_009, VersionEnd(V, 2))
+    assert deserialize_record(data) == Record(
+        STREAM, 7_000_000_009, VersionEnd(V, 2, 99_000_000_000)
+    )
+
+
+@pytest.mark.parametrize(
+    ("inner", "bridge_timestamp_ns"),
+    [
+        pytest.param({}, None, id="no-timestamp"),
+        pytest.param(
+            {"bridge_timestamp": Timestamp(seconds=253_402_300_800)},
+            253_402_300_800_000_000_000,
+            id="timestamp-past-year-9999",
+        ),
+        pytest.param(
+            {"bridge_timestamp": Timestamp(seconds=-5)},
+            -5_000_000_000,
+            id="negative-timestamp",
+        ),
+    ],
+)
+def test_version_end_inner_timestamp_is_returned_as_found_and_never_raises(
+    inner: dict[str, Any], bridge_timestamp_ns: int | None
+) -> None:
+    data = mutations_pb2.FDBMutationRecord(
+        stream_name=STREAM,
+        bridge_timestamp=Timestamp(seconds=7, nanos=9),
+        version_end=mutations_pb2.VersionEnd(fdb_version=V, total_mutations=2, **inner),
+    ).SerializeToString()
+
+    assert deserialize_record(data) == Record(
+        STREAM, 7_000_000_009, VersionEnd(V, 2, bridge_timestamp_ns)
+    )
 
 
 UNKNOWN_FIELD = b"\x98\x06\x01"  # field 99, varint 1

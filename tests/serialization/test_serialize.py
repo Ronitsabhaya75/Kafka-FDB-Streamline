@@ -415,7 +415,7 @@ def test_batch_of_bytes_fails_on_its_first_element_with_no_special_case() -> Non
             doubles.NativeMutation(256, b"k", b"v"), InputValueError, "type", id="type"
         ),
         pytest.param(
-            doubles.AttrOnlyMutation(0, b"k", bytearray(b"v")),  # type: ignore[arg-type]
+            doubles.AttrOnlyMutation(0, b"k", bytearray(b"v")),  # type: ignore[arg-type]  # bad type on purpose
             InputTypeError,
             "param2",
             id="param2",
@@ -503,7 +503,7 @@ def test_error_message_never_contains_key_content(
         pytest.param(lambda: _mutation_call(stream_name=b"hunter2"), id="bytes-name"),
         pytest.param(
             lambda: serialize_mutation(
-                doubles.NativeMutation(0, "hunter2", b"v"),  # type: ignore[arg-type]
+                doubles.NativeMutation(0, "hunter2", b"v"),  # type: ignore[arg-type]  # bad type on purpose
                 fdb_version=V,
                 sequence_no=0,
                 **ENV,

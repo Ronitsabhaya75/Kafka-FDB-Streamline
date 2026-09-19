@@ -327,10 +327,12 @@ def test_deserialized_version_end_feeds_back_into_serialize_version_end() -> Non
             "mutations",
             id="batch",
         ),
-        pytest.param(VersionEnd(V, 5), VersionEnd(V, 5), "fdb_version", id="end"),
         pytest.param(
-            Record(STREAM, TS, VersionEnd(V, 5)),
-            Record(STREAM, TS, VersionEnd(V, 5)),
+            VersionEnd(V, 5, TS), VersionEnd(V, 5, TS), "fdb_version", id="end"
+        ),
+        pytest.param(
+            Record(STREAM, TS, VersionEnd(V, 5, TS)),
+            Record(STREAM, TS, VersionEnd(V, 5, TS)),
             "stream_name",
             id="record",
         ),
@@ -450,4 +452,20 @@ def test_type_code_outside_uint8_is_never_emitted(
 def test_version_end_round_trips(total: int) -> None:
     data = serialize_version_end(fdb_version=V, total_mutations=total, **ENV)
 
-    assert deserialize_record(data) == Record(STREAM, TS, VersionEnd(V, total))
+    assert deserialize_record(data) == Record(STREAM, TS, VersionEnd(V, total, TS))
+
+
+@pytest.mark.parametrize("bridge_timestamp_ns", [0, 1, TS, 253_402_300_799_999_999_999])
+def test_version_end_surfaces_its_own_timestamp(bridge_timestamp_ns: int) -> None:
+    data = serialize_version_end(
+        fdb_version=V,
+        total_mutations=5,
+        stream_name=STREAM,
+        bridge_timestamp_ns=bridge_timestamp_ns,
+    )
+
+    record = deserialize_record(data)
+
+    assert isinstance(record.body, VersionEnd)
+    assert record.body.bridge_timestamp_ns == bridge_timestamp_ns
+    assert record.bridge_timestamp_ns == bridge_timestamp_ns

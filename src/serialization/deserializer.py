@@ -101,15 +101,19 @@ def _body(message: mutations_pb2.FDBMutationRecord) -> RecordBody:
     if arm == "version_end":
         end = message.version_end
         _check_version(end.fdb_version, None)
-        return VersionEnd(end.fdb_version, end.total_mutations)
+        return VersionEnd(
+            end.fdb_version, end.total_mutations, _bridge_timestamp_ns(end)
+        )
     return _mutation(message.mutation, None)
 
 
-def _bridge_timestamp_ns(message: mutations_pb2.FDBMutationRecord) -> int | None:
+def _bridge_timestamp_ns(
+    message: mutations_pb2.FDBMutationRecord | mutations_pb2.VersionEnd,
+) -> int | None:
     if not message.HasField("bridge_timestamp"):
         return None
-    # Read the two fields directly. The Timestamp helpers range-check, and the
-    # envelope must never fail a read.
+    # Read the two fields directly. The Timestamp helpers range-check, and a
+    # timestamp must never fail a read.
     timestamp = message.bridge_timestamp
     return timestamp.seconds * 10**9 + timestamp.nanos
 
@@ -118,9 +122,10 @@ def deserialize_record(data: bytes) -> Record:
     """Parse one Kafka record value.
 
     The record body, version indexes, type codes and batch shape are checked, so
-    every returned record body can be serialized again. The envelope is returned as
-    found and never fails the call. `stream_name` may be `""`, and
-    `bridge_timestamp_ns` may be `None` or outside the serializer's range.
+    every returned record body can be serialized again. The envelope and a version
+    end's own timestamp are returned as found and never fail the call.
+    `stream_name` may be `""`, and either `bridge_timestamp_ns` may be `None` or
+    outside the serializer's range.
 
     Args:
         data: The bytes of one record.

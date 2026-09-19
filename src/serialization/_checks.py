@@ -1,8 +1,8 @@
 """Input checks for the serialize functions.
 
 Each raises `InputTypeError` or `InputValueError` with the offending `field`. Nothing
-is coerced. Messages give the Python type and length of `bytes` and `str` inputs,
-never their content.
+is coerced. Messages about `bytes` and `str` inputs give their Python type, never
+their content.
 """
 
 from collections.abc import Iterable, Iterator

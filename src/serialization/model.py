@@ -82,10 +82,15 @@ class MutationBatch:
 
 @dataclass(frozen=True, slots=True)
 class VersionEnd:
-    """The group at `fdb_version` is complete and held `total_mutations`."""
+    """The group at `fdb_version` is complete and held `total_mutations`.
+
+    `bridge_timestamp_ns` is the version end's own timestamp, read like
+    `Record.bridge_timestamp_ns` and independently of it.
+    """
 
     fdb_version: int
     total_mutations: int
+    bridge_timestamp_ns: int | None
 
 
 type RecordBody = Mutation | MutationBatch | VersionEnd

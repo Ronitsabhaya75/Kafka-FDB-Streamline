@@ -19,7 +19,8 @@ def serialize_mutation(
     """Serialize one native mutation as one record.
 
     Args:
-        mutation: Forwarded as-is.
+        mutation: One native mutation, read through its `type`, `param1` and
+            `param2` attributes (`NativeMutation`; upstream `CdcMutation` conforms).
         fdb_version: Commit version of its version group.
         sequence_no: Its zero-based native position in the group.
         stream_name: The stream's registered name.
@@ -74,7 +75,7 @@ def serialize_batch(
             is not iterable, or an element lacks `type`, `param1` or `param2`.
             `index` is the element's position.
         InputValueError: A value is out of range, `mutations` is empty, or an assigned
-            position passes `MAX_SEQUENCE_NO`. The last reports
+            position falls outside `0..2**32-1`. The last reports
             `field == "sequence_no"` with that position as `index`.
     """
     _checks.fdb_version(fdb_version)
@@ -124,12 +125,13 @@ def serialize_version_end(
     _checks.fdb_version(fdb_version)
     _checks.total_mutations(total_mutations)
     _checks.envelope(stream_name, bridge_timestamp_ns)
-    return _wire.record(
-        stream_name,
-        bridge_timestamp_ns,
+    timestamp = _wire.timestamp(bridge_timestamp_ns)
+    return mutations_pb2.FDBMutationRecord(
+        stream_name=stream_name,
+        bridge_timestamp=timestamp,
         version_end=mutations_pb2.VersionEnd(
             fdb_version=fdb_version,
             total_mutations=total_mutations,
-            bridge_timestamp=_wire.timestamp(bridge_timestamp_ns),
+            bridge_timestamp=timestamp,
         ),
-    )
+    ).SerializeToString()

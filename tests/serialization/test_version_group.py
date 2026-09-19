@@ -42,7 +42,7 @@ def test_group_within_budget_is_one_batch_then_the_version_end() -> None:
                 )
             ),
         ),
-        Record(STREAM, TS, VersionEnd(V, 3)),
+        Record(STREAM, TS, VersionEnd(V, 3, TS)),
     ]
 
 
@@ -50,7 +50,7 @@ def test_empty_group_is_exactly_the_version_end() -> None:
     records = serialize_version_group([], fdb_version=V, max_record_bytes=1_000, **ENV)
 
     assert [deserialize_record(r) for r in records] == [
-        Record(STREAM, TS, VersionEnd(V, 0))
+        Record(STREAM, TS, VersionEnd(V, 0, TS))
     ]
 
 
@@ -72,7 +72,7 @@ def test_small_budget_slices_the_group_into_several_batch_records() -> None:
         Mutation(m.type, m.param1, m.param2, VersionIndex(V, i))
         for i, m in enumerate(TEN)
     ]
-    assert deserialize_record(records[-1]) == Record(STREAM, TS, VersionEnd(V, 10))
+    assert deserialize_record(records[-1]) == Record(STREAM, TS, VersionEnd(V, 10, TS))
 
 
 def slice_bounds(records: list[bytes]) -> list[tuple[int, int]]:
@@ -190,7 +190,9 @@ def test_ten_megabyte_group_is_sliced_within_budget() -> None:
     assert positions_match
     assert seen[0].version_index == (V, 0)
     assert seen[-1].version_index == (V, 99_999)
-    assert deserialize_record(records[-1]) == Record(STREAM, TS, VersionEnd(V, 100_000))
+    assert deserialize_record(records[-1]) == Record(
+        STREAM, TS, VersionEnd(V, 100_000, TS)
+    )
 
 
 def test_unsplittable_mutation_raises_record_too_large() -> None:
@@ -325,7 +327,7 @@ def test_non_iterable_mutations_is_a_type_error(mutations: Any) -> None:
 
 def test_invalid_mutation_late_in_the_group_raises_and_returns_nothing() -> None:
     group: list[Any] = [SET] * 100
-    group[90] = doubles.NativeMutation(0, b"k", None)  # type: ignore[arg-type]
+    group[90] = doubles.NativeMutation(0, b"k", None)  # type: ignore[arg-type]  # bad type on purpose
     records = None
 
     with pytest.raises(InputTypeError) as excinfo:
@@ -412,7 +414,9 @@ def test_any_group_survives_slicing_under_any_sufficient_budget(
         for i, m in enumerate(group)
     ]
     assert deserialize_record(records[-1]) == Record(
-        stream_name, bridge_timestamp_ns, VersionEnd(fdb_version, len(group))
+        stream_name,
+        bridge_timestamp_ns,
+        VersionEnd(fdb_version, len(group), bridge_timestamp_ns),
     )
 
 
