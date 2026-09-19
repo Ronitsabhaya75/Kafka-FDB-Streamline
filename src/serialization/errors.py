@@ -7,7 +7,17 @@ class SerializationError(Exception):
     """Base of every error this package raises deliberately."""
 
 
-class InputTypeError(SerializationError, TypeError):
+class _InputError(SerializationError):
+    """An input error located by `field` and `index`."""
+
+    def __init__(self, message: str, *, field: str, index: int | None = None) -> None:
+        """Store the offending field and position."""
+        super().__init__(message)
+        self.field = field
+        self.index = index
+
+
+class InputTypeError(_InputError, TypeError):
     """An argument or native-mutation attribute has the wrong Python type.
 
     Attributes:
@@ -15,26 +25,14 @@ class InputTypeError(SerializationError, TypeError):
         index: Position in `mutations`, or `None` outside a batch.
     """
 
-    def __init__(self, message: str, *, field: str, index: int | None = None) -> None:
-        """Store the offending field and position."""
-        super().__init__(message)
-        self.field = field
-        self.index = index
 
-
-class InputValueError(SerializationError, ValueError):
+class InputValueError(_InputError, ValueError):
     """An argument or native-mutation attribute is out of range.
 
     Attributes:
         field: The offending parameter or attribute, as the public API spells it.
         index: Position in `mutations`, or `None` outside a batch.
     """
-
-    def __init__(self, message: str, *, field: str, index: int | None = None) -> None:
-        """Store the offending field and position."""
-        super().__init__(message)
-        self.field = field
-        self.index = index
 
 
 class RecordTooLargeError(InputValueError):
