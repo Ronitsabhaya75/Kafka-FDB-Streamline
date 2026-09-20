@@ -2,9 +2,7 @@ FROM --platform=linux/amd64 foundationdb/build:rockylinux9-latest AS builder
 
 WORKDIR /build
 
-RUN git clone https://github.com/tclinkenbeard-oai/foundationdb.git /fdb && \
-    cd /fdb && \
-    git checkout ee1fa01e67b5c509ea786233935f365204b14586
+RUN git clone https://github.com/apple/foundationdb.git /fdb
 
 RUN cd /fdb && \
     mkdir build && \
