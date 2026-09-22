@@ -3,10 +3,11 @@
 from google.protobuf.message import DecodeError
 
 from fdbkafka.cdc.v1 import mutations_pb2
+from src.serialization import _checks
 from src.serialization.errors import DecodeFailure, InputTypeError, RecordDecodeError
 from src.serialization.model import (
-    MAX_TYPE_CODE,
-    MAX_VERSION,
+    _MAX_TYPE_CODE,
+    _MAX_VERSION,
     Mutation,
     MutationBatch,
     MutationType,
@@ -17,16 +18,13 @@ from src.serialization.model import (
 )
 
 
-def _at(index: int | None) -> str:
-    return "" if index is None else f" at batch position {index}"
-
-
 def _check_version(fdb_version: int, index: int | None) -> None:
     # The wire field is uint64 but a native commit version is int64_t. Anything
     # larger cannot be serialized again.
-    if fdb_version > MAX_VERSION:
+    if fdb_version > _MAX_VERSION:
         raise RecordDecodeError(
-            f"fdb_version {fdb_version}{_at(index)} exceeds {MAX_VERSION}",
+            f"fdb_version {fdb_version}"
+            f"{_checks.at(index, label='batch position')} exceeds {_MAX_VERSION}",
             reason=DecodeFailure.VERSION_OUT_OF_RANGE,
             index=index,
         )
@@ -36,7 +34,7 @@ def _mutation(message: mutations_pb2.FDBMutation, index: int | None) -> Mutation
     # Check presence. An absent version index would otherwise read as (0, 0).
     if not message.HasField("version_index"):
         raise RecordDecodeError(
-            f"mutation{_at(index)} has no version index",
+            f"mutation{_checks.at(index, label='batch position')} has no version index",
             reason=DecodeFailure.MISSING_VERSION_INDEX,
             index=index,
         )
@@ -47,7 +45,8 @@ def _mutation(message: mutations_pb2.FDBMutation, index: int | None) -> Mutation
     arm = message.WhichOneof("mutation")
     if arm is None:
         raise RecordDecodeError(
-            f"mutation{_at(index)} {version_index} has no mutation arm",
+            f"mutation{_checks.at(index, label='batch position')} {version_index} "
+            f"has no mutation arm",
             reason=DecodeFailure.NO_MUTATION_ARM,
             index=index,
         )
@@ -60,10 +59,10 @@ def _mutation(message: mutations_pb2.FDBMutation, index: int | None) -> Mutation
     single = message.single_key_mutation
     # mutation_type is an open enum, so any int32 parses. Only 0..255 is a type code.
     type_code = single.mutation_type
-    if not 0 <= type_code <= MAX_TYPE_CODE:
+    if not 0 <= type_code <= _MAX_TYPE_CODE:
         raise RecordDecodeError(
-            f"mutation{_at(index)} {version_index} has type code {type_code}, "
-            f"outside 0..{MAX_TYPE_CODE}",
+            f"mutation{_checks.at(index, label='batch position')} {version_index} "
+            f"has type code {type_code}, outside 0..{_MAX_TYPE_CODE}",
             reason=DecodeFailure.TYPE_CODE_OUT_OF_RANGE,
             index=index,
         )
@@ -121,11 +120,12 @@ def _bridge_timestamp_ns(
 def deserialize_record(data: bytes) -> Record:
     """Parse one Kafka record value.
 
-    The record body, version indexes, type codes and batch shape are checked, so
-    every returned record body can be serialized again. The envelope and a version
-    end's own timestamp are returned as found and never fail the call.
-    `stream_name` may be `""`, and either `bridge_timestamp_ns` may be `None` or
-    outside the serializer's range.
+    The record body, version indexes, type codes and batch shape are checked.
+    Every returned `Mutation` / `MutationBatch` can be serialized again
+    (`Mutation` satisfies `NativeMutation`). A returned `VersionEnd` may have
+    `bridge_timestamp_ns` of `None` or outside the serializer's range, so it is
+    not always a valid input to `serialize_version_end`. The envelope timestamp
+    is returned as found and never fails the call. `stream_name` may be `""`.
 
     Args:
         data: The bytes of one record.

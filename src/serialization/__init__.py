@@ -1,4 +1,7 @@
-"""Native CDC mutations to Protobuf `FDBMutationRecord` bytes and back."""
+"""Native CDC mutations to Protobuf `FDBMutationRecord` bytes and back.
+
+Public contract: [`docs/SERIALIZATION-SPEC.md`](../../docs/SERIALIZATION-SPEC.md).
+"""
 
 from src.serialization.deserializer import deserialize_record
 from src.serialization.errors import (

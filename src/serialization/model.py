@@ -30,11 +30,12 @@ class MutationType(enum.IntEnum):
     COMPARE_AND_CLEAR = 20
 
 
-MAX_TYPE_CODE: Final = 255  # native uint8_t
-MAX_VERSION: Final = 2**63 - 1  # native int64_t commit version
-MAX_SEQUENCE_NO: Final = 2**32 - 1  # proto uint32
-MAX_TOTAL_MUTATIONS: Final = 2**32 - 1  # proto uint32
-MAX_BRIDGE_TIMESTAMP_NS: Final = 253_402_300_799_999_999_999  # 9999-12-31T23:59:59.9…Z
+# Package-private range limits (not part of the public ``src.serialization`` API).
+_MAX_TYPE_CODE: Final = 255  # native uint8_t
+_MAX_VERSION: Final = 2**63 - 1  # native int64_t commit version
+_MAX_SEQUENCE_NO: Final = 2**32 - 1  # proto uint32
+_MAX_TOTAL_MUTATIONS: Final = 2**32 - 1  # proto uint32
+_MAX_BRIDGE_TIMESTAMP_NS: Final = 253_402_300_799_999_999_999  # 9999-12-31T23:59:59.9…Z
 
 
 class NativeMutation(Protocol):

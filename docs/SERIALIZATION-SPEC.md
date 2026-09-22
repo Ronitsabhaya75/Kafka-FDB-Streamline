@@ -100,11 +100,13 @@ Output values are frozen, slotted dataclasses (compared field-wise, hashable):
 | `VersionIndex` | `NamedTuple(fdb_version, sequence_no)`; tuple order is stream order |
 
 Guarantees on every returned `Record`: `type` is a plain `int` in 0..255; versions are in
-0..2**63-1; a batch is non-empty, single-version, with contiguous ascending `sequence_no`. So
-every body can be re-serialized (`Mutation` satisfies `NativeMutation`).
-Metadata carries no guarantee: `stream_name` may be `""`, and `Record.bridge_timestamp_ns` and
-`VersionEnd.bridge_timestamp_ns` may each be `None` (absent) or outside the serializer's range.
-They are read independently of each other.
+0..2**63-1; a batch is non-empty, single-version, with contiguous ascending `sequence_no`.
+Every returned `Mutation` / `MutationBatch` can be re-serialized (`Mutation` satisfies
+`NativeMutation`). A returned `VersionEnd` is not always a valid
+`serialize_version_end` input: its `bridge_timestamp_ns` may be `None` or outside the
+serializer range. Metadata carries no guarantee: `stream_name` may be `""`, and
+`Record.bridge_timestamp_ns` and `VersionEnd.bridge_timestamp_ns` may each be `None`
+(absent) or outside the serializer's range. They are read independently of each other.
 
 ## 3. Wire format
 

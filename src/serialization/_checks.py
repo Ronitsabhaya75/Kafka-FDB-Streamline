@@ -10,18 +10,18 @@ from typing import Any
 
 from src.serialization.errors import InputTypeError, InputValueError
 from src.serialization.model import (
-    MAX_BRIDGE_TIMESTAMP_NS,
-    MAX_SEQUENCE_NO,
-    MAX_TOTAL_MUTATIONS,
-    MAX_TYPE_CODE,
-    MAX_VERSION,
+    _MAX_BRIDGE_TIMESTAMP_NS,
+    _MAX_SEQUENCE_NO,
+    _MAX_TOTAL_MUTATIONS,
+    _MAX_TYPE_CODE,
+    _MAX_VERSION,
     NativeMutation,
 )
 
 
-def at(index: int | None) -> str:
-    """`" at position <index>"` for an error message, or `""` outside a batch."""
-    return "" if index is None else f" at position {index}"
+def at(index: int | None, *, label: str = "position") -> str:
+    """`" at <label> <index>"` for an error message, or `""` when index is absent."""
+    return "" if index is None else f" at {label} {index}"
 
 
 def _rendered(value: int) -> str:
@@ -57,23 +57,23 @@ def _integer(
 
 
 def fdb_version(value: int) -> None:
-    """Require `0..MAX_VERSION`."""
-    _integer(value, field="fdb_version", maximum=MAX_VERSION)
+    """Require `0.._MAX_VERSION`."""
+    _integer(value, field="fdb_version", maximum=_MAX_VERSION)
 
 
 def sequence_no(value: int, *, field: str = "sequence_no") -> None:
-    """Require `0..MAX_SEQUENCE_NO`. `field` is the keyword name to report."""
-    _integer(value, field=field, maximum=MAX_SEQUENCE_NO)
+    """Require `0.._MAX_SEQUENCE_NO`. `field` is the keyword name to report."""
+    _integer(value, field=field, maximum=_MAX_SEQUENCE_NO)
 
 
 def assigned_sequence_no(value: int, *, index: int) -> None:
-    """Require a position assigned inside a batch to fit `0..MAX_SEQUENCE_NO`."""
-    _integer(value, field="sequence_no", maximum=MAX_SEQUENCE_NO, index=index)
+    """Require a position assigned inside a batch to fit `0.._MAX_SEQUENCE_NO`."""
+    _integer(value, field="sequence_no", maximum=_MAX_SEQUENCE_NO, index=index)
 
 
 def total_mutations(value: int) -> None:
-    """Require `0..MAX_TOTAL_MUTATIONS`."""
-    _integer(value, field="total_mutations", maximum=MAX_TOTAL_MUTATIONS)
+    """Require `0.._MAX_TOTAL_MUTATIONS`."""
+    _integer(value, field="total_mutations", maximum=_MAX_TOTAL_MUTATIONS)
 
 
 def max_record_bytes(value: int) -> None:
@@ -100,8 +100,8 @@ def stream_name(value: str) -> None:
 
 
 def bridge_timestamp_ns(value: int) -> None:
-    """Require `0..MAX_BRIDGE_TIMESTAMP_NS`."""
-    _integer(value, field="bridge_timestamp_ns", maximum=MAX_BRIDGE_TIMESTAMP_NS)
+    """Require `0.._MAX_BRIDGE_TIMESTAMP_NS`."""
+    _integer(value, field="bridge_timestamp_ns", maximum=_MAX_BRIDGE_TIMESTAMP_NS)
 
 
 def envelope(name: str, timestamp_ns: int) -> None:
@@ -145,9 +145,9 @@ def type_code(value: int, *, index: int | None = None) -> int:
             index=index,
         )
     code = int(value)
-    if not 0 <= code <= MAX_TYPE_CODE:
+    if not 0 <= code <= _MAX_TYPE_CODE:
         raise InputValueError(
-            f"type{at(index)} must be in 0..{MAX_TYPE_CODE}, got {_rendered(code)}",
+            f"type{at(index)} must be in 0..{_MAX_TYPE_CODE}, got {_rendered(code)}",
             field="type",
             index=index,
         )
