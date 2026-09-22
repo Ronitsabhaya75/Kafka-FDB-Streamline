@@ -4,7 +4,10 @@ version = "0.1.0"
 description = "FoundationDB native CDC to Kafka bridge (UNT capstone)."
 readme = "README.md"
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "confluent-kafka>=2.6,<3",
+    "protobuf>=6.30,<7",
+]
 
 [tool.black]
 line-length = 88
