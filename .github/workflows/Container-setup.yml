@@ -53,3 +53,20 @@ jobs:
 
             echo "=== Container setup verified ==="
           '
+
+      - name: Run Protobuf tests inside FDB container
+        run: |
+          docker run --rm \
+            -v "${{ github.workspace }}:/workspace" \
+            -w /workspace \
+            fdb-cdc:ci \
+            bash -c '
+              set -e
+              pip3 install --break-system-packages "protobuf>=7.36.1" pytest
+
+              echo "=== Running Protobuf Test Suite ==="
+              PYTHONPATH=/workspace/protobuf/gen python3 -m pytest protobuf/tests/ -v
+
+              echo "=== All Protobuf Tests Passed ==="
+            '
+

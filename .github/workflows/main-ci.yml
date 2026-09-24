@@ -54,7 +54,3 @@ jobs:
   buf:
     needs: lint
     uses: ./.github/workflows/buf-ci.yaml
-
-  protobuf-tests:
-    needs: buf
-    uses: ./.github/workflows/testing-protobuf.yaml
