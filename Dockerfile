@@ -8,7 +8,10 @@ RUN cd /fdb && \
     mkdir build && \
     cd build && \
     cmake -G Ninja \
-    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_BUILD_TYPE=Debug \
+    -DCMAKE_C_COMPILER=clang \
+    -DCMAKE_CXX_COMPILER=clang++ \
+    -DUSE_CCACHE=ON \
     -DUSE_JEMALLOC=OFF \
     -DCMAKE_POLICY_DEFAULT_CMP0028=OLD \
     .. && \
