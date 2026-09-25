@@ -54,3 +54,7 @@ jobs:
   buf:
     needs: lint
     uses: ./.github/workflows/buf-ci.yaml
+
+  live-cluster-tests:
+    needs: buf
+    uses: ./.github/workflows/live-cluster-tests.yml
