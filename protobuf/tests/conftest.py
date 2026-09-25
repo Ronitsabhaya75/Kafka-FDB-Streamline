@@ -4,12 +4,12 @@ import os
 import sys
 from typing import Any, NamedTuple
 
+sys.path.insert(
+    0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "gen"))
+)
+
 import pytest
 from google.protobuf.timestamp_pb2 import Timestamp
-
-_GEN_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "gen"))
-if _GEN_PATH not in sys.path:
-    sys.path.insert(0, _GEN_PATH)
 
 from fdbkafka.cdc.v1 import mutations_pb2
 
