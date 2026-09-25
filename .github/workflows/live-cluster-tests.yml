@@ -1,0 +1,138 @@
+name: Live Cluster Integration Tests
+
+on:
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  live-cluster-tests:
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        cluster_config:
+          - name: single
+            processes: 1
+            configure_cmd: "configure new single memory"
+          - name: double
+            processes: 3
+            configure_cmd: "configure new double memory"
+          - name: triple
+            processes: 5
+            configure_cmd: "configure new triple memory"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free runner disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          df -h /
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build FDB+CDC Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          load: true
+          tags: fdb-cdc:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Start FDB cluster (${{ matrix.cluster_config.name }})
+        run: |
+          PROCS=${{ matrix.cluster_config.processes }}
+          CONFIG_CMD="${{ matrix.cluster_config.configure_cmd }}"
+          CLUSTER_NAME="${{ matrix.cluster_config.name }}"
+
+          docker run -d --name fdb-${CLUSTER_NAME} \
+            -v "${{ github.workspace }}:/workspace" \
+            -w /workspace \
+            fdb-cdc:ci bash -c '
+              set -e
+
+              CLUSTER_STRING="docker:docker@127.0.0.1:4500"
+              echo "$CLUSTER_STRING" > /etc/foundationdb/fdb.cluster
+
+              BASE_PORT=4500
+              for i in $(seq 1 '"$PROCS"'); do
+                PORT=$((BASE_PORT + i - 1))
+                DATA_DIR="/var/lib/foundationdb/data-${i}"
+                LOG_DIR="/var/log/foundationdb/log-${i}"
+                mkdir -p "$DATA_DIR" "$LOG_DIR"
+                fdbserver \
+                  -p auto:${PORT} \
+                  -C /etc/foundationdb/fdb.cluster \
+                  -d "$DATA_DIR" \
+                  -L "$LOG_DIR" \
+                  --knob_enable_native_cdc=1 &
+                echo "Started fdbserver on port $PORT (PID $!)"
+              done
+
+              sleep 5
+
+              echo "Configuring cluster: '"$CONFIG_CMD"'"
+              fdbcli --exec "'"$CONFIG_CMD"'" || true
+              sleep 3
+
+              echo "=== Cluster status ==="
+              fdbcli --exec "status details"
+
+              sleep infinity
+            '
+
+          echo "Waiting for cluster to initialize..."
+          sleep 15
+
+          docker exec fdb-${CLUSTER_NAME} fdbcli --exec "status" || true
+
+      - name: Run Protobuf tests against ${{ matrix.cluster_config.name }} cluster
+        run: |
+          CLUSTER_NAME="${{ matrix.cluster_config.name }}"
+
+          docker exec fdb-${CLUSTER_NAME} bash -c '
+            set -e
+            pip3 install --break-system-packages "protobuf>=7.36.1" pytest
+
+            echo "=========================================="
+            echo "  Testing: ${{ matrix.cluster_config.name }} cluster"
+            echo "  Processes: ${{ matrix.cluster_config.processes }}"
+            echo "=========================================="
+
+            echo "=== Cluster status ==="
+            fdbcli --exec "status"
+
+            echo "=== Running Protobuf Tests ==="
+            PYTHONPATH=/workspace/protobuf/gen python3 -m pytest \
+              protobuf/tests/ -v \
+              --tb=short \
+              -x
+
+            echo "=== All tests passed on ${{ matrix.cluster_config.name }} cluster ==="
+          '
+
+      - name: Write test mutations and verify CDC feed (${{ matrix.cluster_config.name }})
+        run: |
+          CLUSTER_NAME="${{ matrix.cluster_config.name }}"
+
+          docker exec fdb-${CLUSTER_NAME} bash -c '
+            set -e
+            echo "=== Writing test mutations to FDB ==="
+            python3 /workspace/protobuf/tests/verify_fdb_cluster.py
+            echo "=== FDB mutations verified ==="
+          '
+
+      - name: Cleanup
+        if: always()
+        run: |
+          CLUSTER_NAME="${{ matrix.cluster_config.name }}"
+          docker rm -f fdb-${CLUSTER_NAME} || true

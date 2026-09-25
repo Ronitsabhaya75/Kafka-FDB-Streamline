@@ -7,12 +7,11 @@ from typing import Any, NamedTuple
 import pytest
 from google.protobuf.timestamp_pb2 import Timestamp
 
-# Ensure protobuf/gen is importable when tests are executed directly
 _GEN_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "gen"))
 if _GEN_PATH not in sys.path:
     sys.path.insert(0, _GEN_PATH)
 
-from fdbkafka.cdc.v1 import mutations_pb2  # noqa: E402
+from fdbkafka.cdc.v1 import mutations_pb2
 
 
 class MockCdcMutation(NamedTuple):
