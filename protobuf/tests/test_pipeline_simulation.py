@@ -1,6 +1,8 @@
-"""End-to-End (E2E) pipeline tests.
+"""Pipeline simulation tests.
 
-Simulates the full CDC -> Bridge -> Kafka -> Consumer lifecycle.
+Simulates the logical CDC -> Bridge -> Kafka -> Consumer serialization lifecycle
+using Protobuf envelopes. Live FDB CDC consumer integration is tested in
+tests/test_cdc_e2e.py.
 """
 
 import unittest
@@ -10,10 +12,10 @@ from google.protobuf.timestamp_pb2 import Timestamp
 from fdbkafka.cdc.v1 import mutations_pb2
 
 
-class TestEndToEndCDCPipeline(unittest.TestCase):
-    """Simulates realistic lifecycle from FDB CDC capture to downstream consumer."""
+class TestCDCPipelineSimulation(unittest.TestCase):
+    """Simulates the lifecycle from CDC mutation capture to downstream consumer."""
 
-    def _bridge_encode_cdc_mutation(
+    def _encode_cdc_mutation(
         self,
         fdb_version: int,
         seq_no: int,
@@ -44,8 +46,7 @@ class TestEndToEndCDCPipeline(unittest.TestCase):
         )
 
     def test_full_pipeline_mutation_batch_and_audit(self) -> None:
-        """
-        Simulate complete flow:
+        """Simulate complete flow:
         1. FDB commits multiple transactions under version 1050000.
         2. Bridge converts raw mutations into FDBMutationBatch envelope.
         3. Serializes to binary Kafka message.
@@ -63,12 +64,11 @@ class TestEndToEndCDCPipeline(unittest.TestCase):
         ]
 
         # 2. Bridge encodes mutations into an FDBMutationBatch
-        encoded_mutations: list[mutations_pb2.FDBMutation] = []
         commit_version = 1050000
-        for seq, (mtype, p1, p2) in enumerate(raw_fdb_mutations):
-            encoded_mutations.append(
-                self._bridge_encode_cdc_mutation(commit_version, seq, mtype, p1, p2)
-            )
+        encoded_mutations = [
+            self._encode_cdc_mutation(commit_version, seq, mtype, p1, p2)
+            for seq, (mtype, p1, p2) in enumerate(raw_fdb_mutations)
+        ]
 
         ts = Timestamp()
         ts.GetCurrentTime()
@@ -90,14 +90,17 @@ class TestEndToEndCDCPipeline(unittest.TestCase):
 
         self.assertEqual(consumed_record.stream_name, stream_name)
         self.assertEqual(consumed_record.WhichOneof("record"), "batch")
-        self.assertEqual(len(consumed_record.batch.mutations), len(raw_fdb_mutations))
 
-        # Validate each mutation payload preserved exactly
-        m0 = consumed_record.batch.mutations[0]
+        # Accumulate consumed mutations
+        received_mutations = list(consumed_record.batch.mutations)
+        self.assertEqual(len(received_mutations), 4)
+
+        # Validate mutation payloads
+        m0 = received_mutations[0]
         self.assertEqual(m0.single_key_mutation.key, b"acc:1001:balance")
         self.assertEqual(m0.single_key_mutation.mutation_type, 0)
 
-        m2 = consumed_record.batch.mutations[2]
+        m2 = received_mutations[2]
         self.assertEqual(m2.WhichOneof("mutation"), "clear_range")
         self.assertEqual(m2.clear_range.begin_key, b"acc:temporary:0000")
         self.assertEqual(m2.clear_range.end_key, b"acc:temporary:\xff")
@@ -108,7 +111,7 @@ class TestEndToEndCDCPipeline(unittest.TestCase):
             bridge_timestamp=ts,
             version_end=mutations_pb2.VersionEnd(
                 fdb_version=commit_version,
-                total_mutations=len(raw_fdb_mutations),
+                total_mutations=len(encoded_mutations),
                 bridge_timestamp=ts,
             ),
         )
@@ -118,35 +121,42 @@ class TestEndToEndCDCPipeline(unittest.TestCase):
 
         self.assertEqual(consumed_ve_record.WhichOneof("record"), "version_end")
         self.assertEqual(consumed_ve_record.version_end.fdb_version, commit_version)
-        self.assertEqual(consumed_ve_record.version_end.total_mutations, 4)
 
-        # Audit: count in VersionEnd matches received mutations
+        # Audit: count reported in VersionEnd matches actual received mutation count
         self.assertEqual(
             consumed_ve_record.version_end.total_mutations,
-            len(consumed_record.batch.mutations),
+            len(received_mutations),
         )
 
     def test_multi_version_watermark_stream(self) -> None:
-        """Test stream progression across multiple commit versions."""
+        """Test stream consumer tracks monotonically advancing commit watermarks."""
         stream_name = "fdb-cdc:stream-ordering"
         versions = [100_000, 100_050, 100_100, 100_250]
 
-        last_observed_version = 0
+        observed_watermarks: list[int] = []
 
         for ver in versions:
-            mut = self._bridge_encode_cdc_mutation(ver, 0, 0, b"key", b"val")
+            mut = self._encode_cdc_mutation(ver, 0, 0, b"key", b"val")
             rec = mutations_pb2.FDBMutationRecord(
                 stream_name=stream_name,
                 mutation=mut,
             )
 
-            # Transport
+            # Transport over wire
             wire = rec.SerializeToString()
             parsed = mutations_pb2.FDBMutationRecord.FromString(wire)
 
             current_version = parsed.mutation.version_index.fdb_version
-            self.assertGreater(current_version, last_observed_version)
-            last_observed_version = current_version
+            if observed_watermarks:
+                prev = observed_watermarks[-1]
+                self.assertGreater(
+                    current_version,
+                    prev,
+                    f"Version {current_version} must exceed watermark {prev}",
+                )
+            observed_watermarks.append(current_version)
+
+        self.assertEqual(observed_watermarks, versions)
 
 
 if __name__ == "__main__":

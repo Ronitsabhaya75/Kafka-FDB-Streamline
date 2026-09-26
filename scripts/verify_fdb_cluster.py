@@ -1,14 +1,10 @@
 """Verify FDB read/write correctness in a live cluster.
 
-Used by the live-cluster-tests workflow to write test mutations into
-a running FDB cluster, read them back, and confirm data integrity.
+Writes test key-value pairs into the 'test:' keyspace of a running FDB
+cluster, reads them back, and confirms data integrity.
 """
 
 import fdb
-
-fdb.api_version(800)
-
-db = fdb.open()
 
 
 @fdb.transactional
@@ -28,7 +24,10 @@ def read_test_data(tr: fdb.Transaction) -> int:
 
 
 def main() -> None:
-    """Write test data, read it back, and assert correctness."""
+    """Initialize FDB API, write test data, read it back, and assert correctness."""
+    fdb.api_version(800)
+    db = fdb.open()
+
     write_test_data(db)
     print("Wrote 20 test keys to FDB")
 
