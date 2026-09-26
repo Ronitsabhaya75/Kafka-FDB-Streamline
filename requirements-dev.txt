@@ -2,3 +2,7 @@
 black==26.5.1
 ruff==0.16.7
 pre-commit==4.6.2
+# Must satisfy the protobuf range in pyproject.toml.
+protobuf==7.36.2
+pytest==9.1.1
+hypothesis==6.168.0

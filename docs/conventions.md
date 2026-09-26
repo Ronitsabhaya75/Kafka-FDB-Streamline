@@ -24,8 +24,8 @@ How the team lays out the repo, branches, writes Python, and merges. Tooling enf
 ├── Dockerfile            # FDB + CDC runtime image
 ├── buf.yaml              # buf module, lint and breaking-change config
 ├── buf.gen.yaml          # buf codegen → protobuf/gen
-├── Makefile              # setup / lint / format
-├── pyproject.toml        # Project metadata + black/ruff config
+├── Makefile              # setup / lint / format / test
+├── pyproject.toml        # Project metadata + black/ruff/pytest config
 └── README.md
 ```
 
@@ -89,6 +89,7 @@ make setup                    # .venv + dev tools + pre-commit hook (needs pytho
 source .venv/bin/activate
 make lint                     # ruff + black, check-only
 make format                   # apply fixes
+make test                     # pytest: tests/ + protobuf/tests/ (no FDB or Kafka needed)
 ```
 
 `make setup` installs a pre-commit hook that runs ruff + black on every commit; `pre-commit run --all-files` runs it by hand. Tool versions are pinned in `requirements-dev.txt`; keep them in sync with the `rev`s in `.pre-commit-config.yaml`.
@@ -146,11 +147,13 @@ Then add the same public key on GitHub under Settings → SSH and GPG keys → N
 - Link the Trello card in the description.
 - At least 1 approval required.
 - CI must pass: the [`Lint`](../.github/workflows/lint.yml) workflow runs `ruff check` and `black --check` on every PR. It is check-only — it never edits files or pushes commits.
+- CI must pass: the [`Tests`](../.github/workflows/tests.yml) workflow runs `pytest` on every PR.
 
 ## Enforcement
 
 | Convention | Enforced by |
 |------------|-------------|
 | Formatting, lint, naming, type hints, docstrings | pre-commit locally; `Lint` workflow on PRs |
+| Tests pass | `make test` locally; `Tests` workflow on PRs |
 | `main`/`develop` protected, PR required, 1 approval, CI green, signed commits | GitHub branch protection — a repo admin enables it under Settings → Branches |
 | Branch naming, Trello link | PR template + review |
