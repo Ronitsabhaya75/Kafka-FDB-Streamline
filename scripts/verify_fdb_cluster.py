@@ -4,18 +4,22 @@ Writes test key-value pairs into the 'test:' keyspace of a running FDB
 cluster, reads them back, and confirms data integrity.
 """
 
+from typing import Any
+
 import fdb
+
+fdb.api_version(800)
 
 
 @fdb.transactional
-def write_test_data(tr: fdb.Transaction) -> None:
+def write_test_data(tr: Any) -> None:
     """Write 20 test key-value pairs into the 'test:' keyspace."""
     for i in range(20):
         tr[f"test:{i:04d}".encode()] = f"value_{i}".encode()
 
 
 @fdb.transactional
-def read_test_data(tr: fdb.Transaction) -> int:
+def read_test_data(tr: Any) -> int:
     """Read all keys in the 'test:' keyspace and return count."""
     count = 0
     for _k, _v in tr.get_range(b"test:\x00", b"test:\xff"):
@@ -24,8 +28,7 @@ def read_test_data(tr: fdb.Transaction) -> int:
 
 
 def main() -> None:
-    """Initialize FDB API, write test data, read it back, and assert correctness."""
-    fdb.api_version(800)
+    """Open FDB database, write test data, read it back, and assert correctness."""
     db = fdb.open()
 
     write_test_data(db)

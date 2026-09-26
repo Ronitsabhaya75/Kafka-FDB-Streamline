@@ -12,7 +12,6 @@ permissions:
 jobs:
   signed-commits:
     runs-on: ubuntu-latest
-    timeout-minutes: 2
     steps:
       - uses: actions/checkout@v4
         with:
