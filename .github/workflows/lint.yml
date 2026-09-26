@@ -4,8 +4,10 @@ name: Lint
 # Never edits files or pushes commits.
 
 on:
-  workflow_call:
-  workflow_dispatch:
+  push:
+    branches: ['main']
+  pull_request:
+    types: [opened]
 
 permissions:
   contents: read
