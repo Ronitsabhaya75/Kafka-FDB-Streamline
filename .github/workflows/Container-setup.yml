@@ -2,7 +2,7 @@ name: Container Setup
 
 on:
   pull_request:
-    branches: [ main ]
+    types: [opened, synchronize, reopened]
   push:
     branches: [ main ]
 
@@ -10,7 +10,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: container-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -56,8 +56,22 @@ jobs:
               echo "=== Testing Python CDC bindings ==="
               python3 -c "import fdb; fdb.api_version(800); print(\"FDB CDC bindings OK\")"
 
-              echo "=== Verifying FDB cluster status ==="
-              fdbcli --exec "status"
+              echo "=== Waiting for FDB cluster to report available ==="
+              AVAILABLE=0
+              for i in $(seq 1 30); do
+                if fdbcli --exec "status minimal" 2>&1 | grep -q "The database is available"; then
+                  echo "FDB cluster is available!"
+                  AVAILABLE=1
+                  break
+                fi
+                echo "Waiting for FDB cluster ($i/30)..."
+                sleep 1
+              done
+              if [ "$AVAILABLE" -ne 1 ]; then
+                echo "::error::FDB cluster failed to become available within 30 seconds"
+                fdbcli --exec "status"
+                exit 1
+              fi
 
               echo "=== Verifying FDB read/write ==="
               python3 /workspace/scripts/verify_fdb_cluster.py
