@@ -46,10 +46,10 @@ jobs:
     uses: ./.github/workflows/Container-setup.yml
 
   lint:
-    needs: container-setup
+    needs: signed-commits
     uses: ./.github/workflows/lint.yml
 
   buf:
-    needs: lint
+    needs: signed-commits
     uses: ./.github/workflows/buf-ci.yaml
 
