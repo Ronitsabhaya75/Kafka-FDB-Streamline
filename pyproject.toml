@@ -45,7 +45,10 @@ convention = "google"
 minversion = "9.0"
 testpaths = ["tests", "protobuf/tests"]
 pythonpath = [".", "protobuf/gen"]
-markers = ["slow: builds a ~10 MB version group; deselect with -m 'not slow'"]
+markers = [
+  "slow: builds a ~10 MB version group; deselect with -m 'not slow'",
+  "integration: tests requiring a live FoundationDB cluster",
+]
 addopts = [
   "-ra",
   "--strict-markers",
