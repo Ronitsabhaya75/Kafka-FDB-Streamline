@@ -37,7 +37,6 @@ def test_live_cdc_mutation_listener() -> None:
         client=client,
         stream_name=stream_name,
         key_range=key_range,
-        auto_register=True,
     ) as listener:
         # Commit a set mutation
         k1 = prefix + b"alpha"
@@ -47,9 +46,13 @@ def test_live_cdc_mutation_listener() -> None:
         # Poll for mutations with bounded retry
         found_mutations: list[mutations_pb2.FDBMutation] = []
         for _ in range(10):
-            batch = listener.poll()
-            if batch:
-                found_mutations.extend(batch)
+            records = listener.poll_records()
+            for record in records:
+                if record.HasField("batch"):
+                    found_mutations.extend(record.batch.mutations)
+            if records:
+                listener.acknowledge()
+            if found_mutations:
                 break
             time.sleep(0.3)
 
@@ -64,9 +67,6 @@ def test_live_cdc_mutation_listener() -> None:
         )
         assert first_m.version_index.fdb_version > 0
 
-        # Acknowledge first batch before polling for next batch
-        listener.acknowledge()
-
         # Commit a range clear
         k2 = prefix + b"beta"
         db[k2] = b"value_beta"
@@ -74,19 +74,22 @@ def test_live_cdc_mutation_listener() -> None:
 
         found_clear = False
         for _ in range(10):
-            batch = listener.poll()
-            for m in batch:
-                if m.WhichOneof("mutation") == "clear_range":
-                    found_clear = True
-                    break
+            records = listener.poll_records()
+            for record in records:
+                if record.HasField("batch"):
+                    for mutation in record.batch.mutations:
+                        if mutation.WhichOneof("mutation") == "clear_range":
+                            found_clear = True
+                            break
+            if records:
+                listener.acknowledge()
             if found_clear:
                 break
             time.sleep(0.3)
 
         assert found_clear
 
-        # Acknowledge and verify position
-        listener.acknowledge()
+        # Verify the acknowledged position
         pos = listener.get_position()
         assert pos is not None
         assert pos.last_consumed_version > 0

@@ -13,10 +13,6 @@ class CDCNotSupportedError(CDCError):
     """
 
 
-class CDCStreamNotFoundError(CDCError):
-    """Raised when an operation targets a CDC stream that does not exist."""
-
-
 class CDCConsumerClosedError(CDCError):
     """Raised when an operation is attempted on a closed CDC consumer."""
 

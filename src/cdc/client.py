@@ -1,16 +1,57 @@
 """FoundationDB client wrapper for API initialization and CDC stream operations."""
 
-from typing import Any, Final, Self
+from typing import Any, Final, NoReturn, Self
 
 try:
     import fdb
 except ImportError:  # pragma: no cover
     fdb = None  # type: ignore[assignment]
 
-from src.cdc.errors import CDCNotSupportedError
+from src.cdc.errors import (
+    CDCInvalidCursorError,
+    CDCInvalidRangeError,
+    CDCNotSupportedError,
+)
 
 DEFAULT_CDC_API_VERSION: Final[int] = 800
 MINIMUM_CDC_API_VERSION: Final[int] = 800
+
+
+def _to_bytes(name: bytes | str) -> bytes:
+    """Return a stream name as bytes.
+
+    Args:
+        name: UTF-8 string or bytes stream name.
+
+    Returns:
+        The byte representation expected by the FDB binding.
+
+    Raises:
+        TypeError: If name is neither bytes nor str.
+    """
+    if isinstance(name, bytes):
+        return name
+    if isinstance(name, str):
+        return name.encode("utf-8")
+    raise TypeError(f"name must be bytes or str, got {type(name).__name__}")
+
+
+def _translate_cdc_runtime_error(exc: RuntimeError) -> NoReturn:
+    """Raise the package error for an unavailable native CDC implementation.
+
+    Args:
+        exc: Runtime error raised by the FoundationDB binding.
+
+    Raises:
+        CDCNotSupportedError: If the binding reports missing CDC support.
+        RuntimeError: If the runtime error is unrelated to CDC availability.
+    """
+    message = str(exc).lower()
+    if "native cdc" in message and (
+        "does not support" in message or "requires api version" in message
+    ):
+        raise CDCNotSupportedError(str(exc)) from exc
+    raise exc
 
 
 def init_fdb(api_version: int = DEFAULT_CDC_API_VERSION) -> None:
@@ -130,9 +171,21 @@ class FDBClient:
 
         Returns:
             64-bit integer stream ID assigned by FoundationDB.
+
+        Raises:
+            CDCInvalidRangeError: If the range is empty, reversed, or not bytes.
+            CDCNotSupportedError: If the loaded binding lacks native CDC support.
         """
-        raw_name = name.encode("utf-8") if isinstance(name, str) else name
-        return int(self.db.register_cdc_stream(raw_name, begin_key, end_key).wait())
+        if not isinstance(begin_key, bytes) or not isinstance(end_key, bytes):
+            raise CDCInvalidRangeError("CDC range boundaries must be bytes")
+        if begin_key >= end_key:
+            raise CDCInvalidRangeError("CDC range must satisfy begin_key < end_key")
+        try:
+            return int(
+                self.db.register_cdc_stream(_to_bytes(name), begin_key, end_key).wait()
+            )
+        except RuntimeError as exc:
+            _translate_cdc_runtime_error(exc)
 
     def create_cdc_consumer(self, name: bytes | str) -> Any:
         """Create a new CDC consumer for a registered stream.
@@ -144,9 +197,14 @@ class FDBClient:
 
         Returns:
             CdcConsumer handle.
+
+        Raises:
+            CDCNotSupportedError: If the loaded binding lacks native CDC support.
         """
-        raw_name = name.encode("utf-8") if isinstance(name, str) else name
-        return self.db.create_cdc_consumer(raw_name).wait()
+        try:
+            return self.db.create_cdc_consumer(_to_bytes(name)).wait()
+        except RuntimeError as exc:
+            _translate_cdc_runtime_error(exc)
 
     def resume_cdc_consumer(self, cursor: Any) -> Any:
         """Resume an existing CDC consumer from a persisted cursor.
@@ -156,8 +214,31 @@ class FDBClient:
 
         Returns:
             Resumed CdcConsumer handle.
+
+        Raises:
+            CDCInvalidCursorError: If cursor coordinates are absent or out of range.
+            CDCNotSupportedError: If the loaded binding lacks native CDC support.
         """
-        return self.db.resume_cdc_consumer(cursor).wait()
+        try:
+            stream_id = cursor.stream_id
+            last_consumed_version = cursor.last_consumed_version
+        except AttributeError as exc:
+            raise CDCInvalidCursorError(
+                "cursor must expose stream_id and last_consumed_version"
+            ) from exc
+        if type(stream_id) is not int or not 0 <= stream_id < 2**64:
+            raise CDCInvalidCursorError("cursor.stream_id must be a uint64 integer")
+        if (
+            type(last_consumed_version) is not int
+            or not -(2**63) <= last_consumed_version < 2**63
+        ):
+            raise CDCInvalidCursorError(
+                "cursor.last_consumed_version must be an int64 integer"
+            )
+        try:
+            return self.db.resume_cdc_consumer(cursor).wait()
+        except RuntimeError as exc:
+            _translate_cdc_runtime_error(exc)
 
     def remove_cdc_stream(self, name: bytes | str) -> None:
         """Remove a registered CDC stream by name.
@@ -166,14 +247,39 @@ class FDBClient:
 
         Args:
             name: Identifier of the registered CDC stream to remove.
+
+        Raises:
+            CDCNotSupportedError: If the loaded binding lacks native CDC support.
         """
-        raw_name = name.encode("utf-8") if isinstance(name, str) else name
-        self.db.remove_cdc_stream(raw_name).wait()
+        try:
+            self.db.remove_cdc_stream(_to_bytes(name)).wait()
+        except RuntimeError as exc:
+            _translate_cdc_runtime_error(exc)
 
     def list_cdc_streams(self) -> list[Any]:
         """List all active CDC streams in the cluster.
 
         Returns:
             List of CdcStreamInfo objects.
+
+        Raises:
+            CDCNotSupportedError: If the loaded binding lacks native CDC support.
         """
-        return list(self.db.list_cdc_streams().wait())
+        try:
+            return list(self.db.list_cdc_streams().wait())
+        except RuntimeError as exc:
+            _translate_cdc_runtime_error(exc)
+
+    def get_read_version(self) -> int:
+        """Return a fresh database read version.
+
+        Returns:
+            Current cluster read version.
+        """
+        if hasattr(self.db, "get_read_version"):
+            rv = self.db.get_read_version()
+            if hasattr(rv, "wait"):
+                return int(rv.wait())
+            return int(rv)
+        tr = self.db.create_transaction()
+        return int(tr.get_read_version().wait())

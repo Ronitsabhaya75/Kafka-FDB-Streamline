@@ -1,7 +1,7 @@
 # CDC Consumer Module Spec
 
 Contract for `src/cdc/`: FoundationDB native CDC client initialization, stream
-lifecycle, continuous polling loop, and Protobuf message mapping.
+lifecycle, bounded record polling, and safe acknowledgement.
 
 Trello: [Basic FDB Client & Mutation Stream Listener](https://trello.com) (CDC Engine).
 Related architecture: [`CDC-DEEP-DIVE.md`](CDC-DEEP-DIVE.md).
@@ -18,14 +18,20 @@ Schema: [`mutations.proto`](../protobuf/proto/fdbkafka/cdc/v1/mutations.proto).
   `consume()` → durably process/checkpoint → `acknowledge()`.
   Acknowledgement is cumulative, takes no arguments, and advances the cluster retention
   watermark to `last_consumed_version + 1`. A listener rejects another consume until a
-  non-empty delivered reply is acknowledged. Stream limits retain undelivered items and
-  never acknowledge a partial native reply. Streaming helpers with `auto_ack=False`
-  return after one complete native reply, allowing the caller to checkpoint and
-  acknowledge before requesting the next reply.
+  non-empty delivered reply is acknowledged. There is no automatic acknowledgement:
+  the listener cannot know whether Kafka publication and checkpoint persistence have
+  completed. A serialization failure permanently blocks acknowledgement on that listener;
+  close it and resume from the last durable cursor.
 - **Protobuf Fidelity:** Raw FDB mutations are mapped directly into Protobuf types
   (`FDBSingleKeyMutation`, `FDBClearRange`, `FDBMutation`, `FDBMutationBatch`, `FDBMutationRecord`).
-  `poll_records()` emits a `VersionEnd` after every complete version group and represents
-  empty watermark advances as zero-mutation version boundaries.
+  `poll_records()` uses `src.serialization.serialize_version_group()` to split each
+  version group into records no larger than `max_record_bytes`, then emits its
+  `VersionEnd`. A reply watermark beyond the final version group is represented by an
+  additional zero-mutation `VersionEnd`. Every returned record, including an idle
+  watermark record, belongs to the native reply and must be durably processed before ack.
+- **Resume Safety:** Resume waits until a fresh database read version reaches the cursor's
+  `last_consumed_version`, then re-acknowledges the resumed cursor before polling. This
+  restores the native consumer's retention watermark after process restart.
 
 ## 2. Public API
 
@@ -49,6 +55,7 @@ class FDBClient:
     def resume_cdc_consumer(self, cursor: Any) -> Any: ...
     def remove_cdc_stream(self, name: bytes | str) -> None: ...
     def list_cdc_streams(self) -> list[Any]: ...
+    def get_read_version(self) -> int: ...
 ```
 
 ### 2.2 Mutation Stream Listener (`src/cdc/listener.py`)
@@ -63,46 +70,38 @@ class FDBMutationListener:
         key_range: tuple[bytes, bytes] | None = None,
         subspace: Any | None = None,
         cursor: Any | None = None,
-        auto_register: bool = True,
+        max_record_bytes: int = 1_000_000,
+        resume_timeout_seconds: float = 10.0,
+        resume_poll_interval_seconds: float = 0.05,
     ) -> None: ...
 
     def start(self) -> None: ...
     def close(self) -> None: ...
-    def consume_batch(self) -> Any: ...
-    def poll(self) -> list[mutations_pb2.FDBMutation]: ...
     def poll_records(self, bridge_timestamp_ns: int | None = None) -> list[mutations_pb2.FDBMutationRecord]: ...
     def acknowledge(self) -> None: ...
     def get_position(self) -> Any: ...
-
-    def stream_mutations(self, max_mutations: int | None = None, auto_ack: bool = False) -> Iterator[mutations_pb2.FDBMutation]: ...
-    def stream_records(self, max_records: int | None = None, auto_ack: bool = False) -> Iterator[mutations_pb2.FDBMutationRecord]: ...
 ```
+
+Supply exactly one of `key_range` or `subspace` to register a stream when the listener
+starts. Omit both to consume a stream registered elsewhere. Supplying both is invalid.
 
 ### 2.3 Prefix Utilities (`src/cdc/listener.py`)
 
 - `strinc(key: bytes) -> bytes`: Computes the lexicographically adjacent prefix upper bound.
 - `subspace_to_key_range(subspace: Any) -> tuple[bytes, bytes]`: Extracts `(prefix, strinc(prefix))`.
 
-### 2.4 Protobuf Mappers (`src/cdc/mapper.py`)
-
-```python
-to_single_key_mutation(key: bytes, value: bytes, mutation_type: int) -> FDBSingleKeyMutation
-to_clear_range(begin_key: bytes, end_key: bytes) -> FDBClearRange
-to_version_index(fdb_version: int, sequence_no: int) -> FDBVersionIndex
-to_fdb_mutation(raw_mutation: Any, fdb_version: int, sequence_no: int) -> FDBMutation
-to_fdb_mutation_batch(raw_mutations: Iterable[Any], fdb_version: int, first_sequence_no: int = 0) -> FDBMutationBatch
-to_version_end(fdb_version: int, total_mutations: int, bridge_timestamp_ns: int | None = None) -> VersionEnd
-to_mutation_record(stream_name: str, *, mutation=None, batch=None, version_end=None, bridge_timestamp_ns=None) -> FDBMutationRecord
-```
-
-### 2.5 Errors (`src/cdc/errors.py`)
+### 2.4 Errors (`src/cdc/errors.py`)
 
 - `CDCError`: Base class for CDC exceptions.
-- `CDCNotSupportedError`: FDB bindings missing or API version < 800.
-- `CDCStreamNotFoundError`: Stream missing or removed.
+- `CDCNotSupportedError`: FDB bindings missing, API version < 800, or native CDC
+  unavailable in the loaded binding.
 - `CDCConsumerClosedError`: Operation attempted on closed consumer handle.
 - `CDCInvalidCursorError`: Invalid resume cursor coordinates.
 - `CDCInvalidRangeError`: Invalid key range supplied.
+
+Native FoundationDB errors otherwise retain their original type and code so callers can
+apply normal FDB retry and diagnostics policy. Listener consume/ack failures are wrapped
+as `CDCError` with the native exception as their cause.
 
 ## 3. Testing
 
