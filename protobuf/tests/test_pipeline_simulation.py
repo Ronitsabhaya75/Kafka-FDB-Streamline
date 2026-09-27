@@ -129,34 +129,33 @@ class TestCDCPipelineSimulation(unittest.TestCase):
         )
 
     def test_multi_version_watermark_stream(self) -> None:
-        """Test stream consumer tracks monotonically advancing commit watermarks."""
+        """Test consumer tracks commit watermarks and rejects out-of-order versions."""
         stream_name = "fdb-cdc:stream-ordering"
-        versions = [100_000, 100_050, 100_100, 100_250]
 
-        observed_watermarks: list[int] = []
+        def consume_version(record_bytes: bytes, current_watermark: int) -> int:
+            parsed = mutations_pb2.FDBMutationRecord.FromString(record_bytes)
+            ver = parsed.mutation.version_index.fdb_version
+            if ver <= current_watermark:
+                msg = f"Out-of-order version {ver}; watermark is {current_watermark}"
+                raise ValueError(msg)
+            return ver
 
-        for ver in versions:
+        watermark = 0
+        for ver in [100_000, 100_050, 100_100, 100_250]:
             mut = self._encode_cdc_mutation(ver, 0, 0, b"key", b"val")
-            rec = mutations_pb2.FDBMutationRecord(
-                stream_name=stream_name,
-                mutation=mut,
-            )
+            rec = mutations_pb2.FDBMutationRecord(stream_name=stream_name, mutation=mut)
+            watermark = consume_version(rec.SerializeToString(), watermark)
 
-            # Transport over wire
-            wire = rec.SerializeToString()
-            parsed = mutations_pb2.FDBMutationRecord.FromString(wire)
+        self.assertEqual(watermark, 100_250)
 
-            current_version = parsed.mutation.version_index.fdb_version
-            if observed_watermarks:
-                prev = observed_watermarks[-1]
-                self.assertGreater(
-                    current_version,
-                    prev,
-                    f"Version {current_version} must exceed watermark {prev}",
-                )
-            observed_watermarks.append(current_version)
-
-        self.assertEqual(observed_watermarks, versions)
+        # Feed an out-of-order / regressive version and assert it is rejected
+        stale_mut = self._encode_cdc_mutation(100_050, 0, 0, b"key", b"val")
+        stale_rec = mutations_pb2.FDBMutationRecord(
+            stream_name=stream_name, mutation=stale_mut
+        )
+        with self.assertRaises(ValueError) as ctx:
+            consume_version(stale_rec.SerializeToString(), watermark)
+        self.assertIn("Out-of-order version 100050", str(ctx.exception))
 
 
 if __name__ == "__main__":

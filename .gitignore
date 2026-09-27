@@ -8,6 +8,9 @@ build/
 *.egg
 .pytest_cache/
 .hypothesis/
+.coverage*
+cov_*.json
+coverage_summary.md
 
 # Virtual environments
 .venv/
