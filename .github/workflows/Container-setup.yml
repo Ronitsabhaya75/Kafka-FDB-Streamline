@@ -115,14 +115,7 @@ jobs:
               python3 -m coverage combine .coverage.unit .coverage.integration
               python3 -m coverage json -o cov_comb.json
 
-              python3 -c "
-              import json
-              u = json.load(open(\"cov_unit.json\"))[\"totals\"][\"percent_covered\"]
-              i = json.load(open(\"cov_int.json\"))[\"totals\"][\"percent_covered\"]
-              c = json.load(open(\"cov_comb.json\"))[\"totals\"][\"percent_covered\"]
-              with open(\"coverage_summary.md\", \"w\") as f:
-                  f.write(f\"## Code Coverage\n\n| Tier | Line Coverage |\n| :--- | :--- |\n| Unit | {u:.2f}% |\n| Integration | {i:.2f}% |\n| Combined | {c:.2f}% |\n\")
-              "
+              python3 /workspace/scripts/format_coverage.py
               echo "=== Coverage Summary Generated ==="
               cat coverage_summary.md
             '
