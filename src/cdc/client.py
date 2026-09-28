@@ -15,6 +15,7 @@ from src.cdc.errors import (
     CDCRetryableError,
     CDCTerminalError,
 )
+from src.observability import set_fdb_ready
 
 DEFAULT_CDC_API_VERSION: Final[int] = 800
 MINIMUM_CDC_API_VERSION: Final[int] = 800
@@ -190,6 +191,7 @@ class FDBClient:
         if self._db is None:
             init_fdb(self.api_version)
             self._db = fdb.open(self.cluster_file)
+            set_fdb_ready(True)
         return self._db
 
     @property
@@ -200,6 +202,7 @@ class FDBClient:
     def close(self) -> None:
         """Close client resources and release database handle."""
         self._db = None
+        set_fdb_ready(False)
 
     def __enter__(self) -> Self:
         """Enter context manager, opening database connection."""
