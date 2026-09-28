@@ -8,13 +8,69 @@ except ImportError:  # pragma: no cover
     fdb = None  # type: ignore[assignment]
 
 from src.cdc.errors import (
+    CDCError,
     CDCInvalidCursorError,
     CDCInvalidRangeError,
     CDCNotSupportedError,
+    CDCRetryableError,
+    CDCTerminalError,
 )
 
 DEFAULT_CDC_API_VERSION: Final[int] = 800
 MINIMUM_CDC_API_VERSION: Final[int] = 800
+
+# Native FoundationDB error codes the consumer classifies explicitly.
+# See CDC-DEEP-DIVE.md §3 "Errors we have to map".
+FDB_TRANSACTION_TOO_OLD: Final[int] = 1007
+FDB_SERVER_OVERLOADED: Final[int] = 1211
+FDB_CLIENT_INVALID_OPERATION: Final[int] = 2000
+
+
+def _native_error_code(exc: BaseException) -> int | None:
+    """Return the FoundationDB error code carried by ``exc``, if any.
+
+    Args:
+        exc: An exception raised by a native consume or acknowledge call.
+
+    Returns:
+        The integer FDB error code, or ``None`` if ``exc`` is not a native
+        ``FDBError``.
+    """
+    if fdb is not None and isinstance(exc, fdb.FDBError):
+        return exc.code
+    # Offline (no bindings) and in tests, duck-type on FDBError's int ``code``.
+    code = getattr(exc, "code", None)
+    return code if type(code) is int else None
+
+
+def _raise_consume_failure(exc: BaseException, action: str) -> NoReturn:
+    """Re-raise a native consume/acknowledge failure with the right policy.
+
+    The three CDC error codes become terminal or retryable ``CDCConsumeError``
+    subclasses that keep ``.code`` on the surface, so a retry loop can act without
+    unwrapping ``__cause__``. Any other native ``FDBError`` propagates unwrapped so
+    callers keep normal FDB retry and diagnostics. A non-native failure is wrapped
+    as ``CDCError``.
+
+    Args:
+        exc: The exception raised by the native call.
+        action: Short description of the failed action for the message.
+
+    Raises:
+        CDCRetryableError: On ``server_overloaded`` (1211).
+        CDCTerminalError: On ``transaction_too_old`` (1007) or
+            ``client_invalid_operation`` (2000).
+        CDCError: If the failure did not originate from the native binding.
+        BaseException: The original ``exc`` for any other native FDB error.
+    """
+    code = _native_error_code(exc)
+    if code == FDB_SERVER_OVERLOADED:
+        raise CDCRetryableError(f"Failed to {action}: {exc}", code=code) from exc
+    if code in (FDB_TRANSACTION_TOO_OLD, FDB_CLIENT_INVALID_OPERATION):
+        raise CDCTerminalError(f"Failed to {action}: {exc}", code=code) from exc
+    if code is not None:
+        raise exc
+    raise CDCError(f"Failed to {action}: {exc}") from exc
 
 
 def _to_bytes(name: bytes | str) -> bytes:

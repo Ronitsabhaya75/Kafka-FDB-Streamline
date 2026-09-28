@@ -6,9 +6,24 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from src.cdc.client import FDBClient
-from src.cdc.errors import CDCConsumerClosedError, CDCError, CDCInvalidCursorError
+from src.cdc.errors import (
+    CDCConsumerClosedError,
+    CDCError,
+    CDCInvalidCursorError,
+    CDCRetryableError,
+    CDCTerminalError,
+)
 from src.cdc.listener import FDBMutationListener, strinc, subspace_to_key_range
 from src.serialization.errors import InputTypeError
+
+
+class _FakeFDBError(Exception):
+    """Stand-in for ``fdb.FDBError`` carrying a native error code."""
+
+    def __init__(self, code: int) -> None:
+        super().__init__(f"fdb error {code}")
+        self.code = code
+
 
 MockCdcMutation = namedtuple("MockCdcMutation", ["type", "param1", "param2"])
 MockVersionGroup = namedtuple("MockVersionGroup", ["version", "mutations"])
@@ -236,3 +251,62 @@ def test_closed_listener_rejects_poll_and_ack() -> None:
         listener.poll_records()
     with pytest.raises(CDCConsumerClosedError):
         listener.acknowledge()
+
+
+def _listener_whose_consume_raises(exc: BaseException) -> FDBMutationListener:
+    """Build a listener whose native consume raises ``exc``."""
+    client = MagicMock(spec=FDBClient)
+    consumer = MagicMock()
+    client.create_cdc_consumer.return_value = consumer
+    consumer.consume.return_value.wait.side_effect = exc
+    return FDBMutationListener(client, "test-stream")
+
+
+@pytest.mark.parametrize("code", [1007, 2000])
+def test_poll_records_maps_terminal_fdb_codes(code: int) -> None:
+    listener = _listener_whose_consume_raises(_FakeFDBError(code))
+
+    with pytest.raises(CDCTerminalError) as excinfo:
+        listener.poll_records()
+
+    assert excinfo.value.code == code
+
+
+def test_poll_records_maps_server_overloaded_to_retryable() -> None:
+    listener = _listener_whose_consume_raises(_FakeFDBError(1211))
+
+    with pytest.raises(CDCRetryableError) as excinfo:
+        listener.poll_records()
+
+    assert excinfo.value.code == 1211
+
+
+def test_poll_records_passes_through_unknown_fdb_error() -> None:
+    err = _FakeFDBError(1020)
+    listener = _listener_whose_consume_raises(err)
+
+    with pytest.raises(_FakeFDBError) as excinfo:
+        listener.poll_records()
+
+    assert excinfo.value is err
+
+
+def test_poll_records_wraps_non_native_failure_as_cdc_error() -> None:
+    listener = _listener_whose_consume_raises(ValueError("boom"))
+
+    with pytest.raises(CDCError, match="consume CDC reply"):
+        listener.poll_records()
+
+
+def test_acknowledge_maps_native_error_code() -> None:
+    batch = MockConsumeResult(
+        [MockVersionGroup(1000, [MockCdcMutation(0, b"k", b"v")])], 1000
+    )
+    listener, _, consumer = _listener_with_batch(batch)
+    listener.poll_records(bridge_timestamp_ns=1)
+    consumer.acknowledge.return_value.wait.side_effect = _FakeFDBError(1211)
+
+    with pytest.raises(CDCRetryableError) as excinfo:
+        listener.acknowledge()
+
+    assert excinfo.value.code == 1211

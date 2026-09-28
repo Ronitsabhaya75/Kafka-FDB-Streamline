@@ -3,7 +3,7 @@
 Contract for `src/cdc/`: FoundationDB native CDC client initialization, stream
 lifecycle, bounded record polling, and safe acknowledgement.
 
-Trello: [Basic FDB Client & Mutation Stream Listener](https://trello.com) (CDC Engine).
+Trello: [Basic FDB Client & Mutation Stream Listener](https://trello.com/c/0Wn8zbEk) (CDC Engine).
 Related architecture: [`CDC-DEEP-DIVE.md`](CDC-DEEP-DIVE.md).
 Schema: [`mutations.proto`](../protobuf/proto/fdbkafka/cdc/v1/mutations.proto).
 
@@ -98,10 +98,19 @@ starts. Omit both to consume a stream registered elsewhere. Supplying both is in
 - `CDCConsumerClosedError`: Operation attempted on closed consumer handle.
 - `CDCInvalidCursorError`: Invalid resume cursor coordinates.
 - `CDCInvalidRangeError`: Invalid key range supplied.
+- `CDCConsumeError`: Base for a failed native `consume`/`acknowledge`. Carries the
+  native FoundationDB `code` on the surface, not behind `__cause__`.
+  - `CDCRetryableError`: `server_overloaded` (1211). Retry with bounded backoff;
+    if it repeats at one commit version it is the L1 poison pill — escalate, do
+    not spin.
+  - `CDCTerminalError`: `transaction_too_old` (1007) or `client_invalid_operation`
+    (2000). Do not retry; 1007 means rebuild, and the narrow ≤5 s retry-once case
+    for 2000 is the caller's to implement from `code`.
 
-Native FoundationDB errors otherwise retain their original type and code so callers can
-apply normal FDB retry and diagnostics policy. Listener consume/ack failures are wrapped
-as `CDCError` with the native exception as their cause.
+Only these three CDC error codes are classified ([CDC deep dive §3](CDC-DEEP-DIVE.md#errors-we-have-to-map-),
+whose standard `is_retryable` predicate is wrong about two of them). Any other native
+`FDBError` propagates unwrapped so callers keep normal FDB retry and diagnostics. A
+non-native consume/ack failure is wrapped as `CDCError` with the original as its cause.
 
 ## 3. Testing
 

@@ -4,7 +4,7 @@ import time
 from typing import Any, Final, Self
 
 from fdbkafka.cdc.v1 import mutations_pb2
-from src.cdc.client import FDBClient, _to_bytes
+from src.cdc.client import FDBClient, _raise_consume_failure, _to_bytes
 from src.cdc.errors import CDCConsumerClosedError, CDCError, CDCInvalidCursorError
 from src.serialization import serialize_version_end, serialize_version_group
 from src.serialization.errors import RecordTooLargeError
@@ -169,7 +169,7 @@ class FDBMutationListener:
         try:
             self.consumer.acknowledge().wait()
         except Exception as exc:
-            raise CDCError(f"Failed to restore resumed CDC position: {exc}") from exc
+            _raise_consume_failure(exc, "restore resumed CDC position")
 
     @property
     def consumer(self) -> Any:
@@ -197,7 +197,7 @@ class FDBMutationListener:
         except Exception as exc:
             if self._is_closed:
                 raise CDCConsumerClosedError("CDC consumer is closed.") from exc
-            raise CDCError(f"Failed to consume CDC reply: {exc}") from exc
+            _raise_consume_failure(exc, "consume CDC reply")
 
     def poll_records(
         self, bridge_timestamp_ns: int | None = None
@@ -218,6 +218,8 @@ class FDBMutationListener:
         Raises:
             CDCError: If another reply is unacknowledged, or prior serialization
                 failed and the listener must be resumed.
+            CDCRetryableError: If the native consume failed with ``server_overloaded``.
+            CDCTerminalError: If the native consume failed with a terminal code.
             SerializationError: If a native mutation or record cannot be serialized.
         """
         batch = self._consume_batch()
@@ -272,6 +274,8 @@ class FDBMutationListener:
 
         Raises:
             CDCError: If no reply awaits acknowledgement or serialization failed.
+            CDCRetryableError: If the native ack failed with ``server_overloaded``.
+            CDCTerminalError: If the native ack failed with a terminal code.
             CDCConsumerClosedError: If the listener is closed.
         """
         if self._is_closed:
@@ -287,7 +291,7 @@ class FDBMutationListener:
         except Exception as exc:
             if self._is_closed:
                 raise CDCConsumerClosedError("CDC consumer is closed.") from exc
-            raise CDCError(f"Failed to acknowledge CDC position: {exc}") from exc
+            _raise_consume_failure(exc, "acknowledge CDC position")
         self._awaiting_ack = False
 
     def get_position(self) -> Any:

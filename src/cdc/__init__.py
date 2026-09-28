@@ -11,11 +11,14 @@ from src.cdc.client import (
     init_fdb,
 )
 from src.cdc.errors import (
+    CDCConsumeError,
     CDCConsumerClosedError,
     CDCError,
     CDCInvalidCursorError,
     CDCInvalidRangeError,
     CDCNotSupportedError,
+    CDCRetryableError,
+    CDCTerminalError,
 )
 from src.cdc.listener import (
     FDBMutationListener,
@@ -24,11 +27,14 @@ from src.cdc.listener import (
 )
 
 __all__ = [
+    "CDCConsumeError",
     "CDCConsumerClosedError",
     "CDCError",
     "CDCInvalidCursorError",
     "CDCInvalidRangeError",
     "CDCNotSupportedError",
+    "CDCRetryableError",
+    "CDCTerminalError",
     "DEFAULT_CDC_API_VERSION",
     "FDBClient",
     "FDBMutationListener",
