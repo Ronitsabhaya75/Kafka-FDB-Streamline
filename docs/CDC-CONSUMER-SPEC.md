@@ -29,6 +29,13 @@ Schema: [`mutations.proto`](../protobuf/proto/fdbkafka/cdc/v1/mutations.proto).
   `VersionEnd`. A reply watermark beyond the final version group is represented by an
   additional zero-mutation `VersionEnd`. Every returned record, including an idle
   watermark record, belongs to the native reply and must be durably processed before ack.
+- **Idle acknowledgement cadence:** ack-per-reply is deliberate. Any non-empty reply,
+  including one that carries only an idle watermark `VersionEnd`, requires an ack before
+  the next poll. At the ~5 s idle cadence this is one ack per idle reply, which keeps the
+  ordering rule uniform.   The cumulative-ack coalescing option in
+  [CDC deep dive §2.7](CDC-DEEP-DIVE.md#27-threads-blocking-and-the-network-thread-)
+  (consume again without acking, then checkpoint and ack once every N replies or T
+  seconds) is tracked as a follow-up, not implemented here.
 - **Resume Safety:** Resume waits until a fresh database read version reaches the cursor's
   `last_consumed_version`, then re-acknowledges the resumed cursor before polling. This
   restores the native consumer's retention watermark after process restart.
