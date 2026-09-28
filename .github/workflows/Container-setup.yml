@@ -1,0 +1,122 @@
+name: Container Setup
+
+on:
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-verify:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free runner disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          df -h /
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build FDB+CDC Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          load: true
+          tags: fdb-cdc:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Verify FDB cluster, CDC bindings, and read/write
+        run: |
+          docker run --rm \
+            -v "${{ github.workspace }}:/workspace" \
+            -w /workspace \
+            fdb-cdc:ci bash -c '
+              set -e
+              echo "=== Checking binaries ==="
+              which fdbserver && which fdbcli
+
+              echo "=== Checking libfdb_c ==="
+              ls -la /usr/local/lib/libfdb_c.so
+
+              echo "=== Testing Python CDC bindings ==="
+              python3 -c "import fdb; fdb.api_version(800); print(\"FDB CDC bindings OK\")"
+
+              echo "=== Waiting for FDB cluster to report available ==="
+              AVAILABLE=0
+              for i in $(seq 1 30); do
+                if fdbcli --exec "status minimal" 2>&1 | grep -q "The database is available"; then
+                  echo "FDB cluster is available!"
+                  AVAILABLE=1
+                  break
+                fi
+                echo "Waiting for FDB cluster ($i/30)..."
+                sleep 1
+              done
+              if [ "$AVAILABLE" -ne 1 ]; then
+                echo "::error::FDB cluster failed to become available within 30 seconds"
+                fdbcli --exec "status"
+                exit 1
+              fi
+
+              echo "=== Verifying FDB read/write ==="
+              python3 /workspace/scripts/verify_fdb_cluster.py
+
+              echo "=== Container setup verified ==="
+            '
+
+      - name: Run test suites and measure code coverage inside FDB container
+        run: |
+          docker run --rm \
+            -v "${{ github.workspace }}:/workspace" \
+            -w /workspace \
+            -e HYPOTHESIS_PROFILE=ci \
+            fdb-cdc:ci \
+            bash -c '
+              set -e
+              pip3 install --break-system-packages -r requirements-dev.txt
+
+              echo "=== Running Unit Tests with Coverage ==="
+              PYTHONPATH=/workspace/protobuf/gen \
+              COVERAGE_FILE=.coverage.unit \
+              python3 -m pytest \
+                --cov=src/serialization \
+                tests/serialization/ \
+                protobuf/tests/test_mutations_proto.py \
+                -v
+
+              python3 -m coverage json --data-file=.coverage.unit -o cov_unit.json
+
+              echo "=== Running Integration Simulation Tests with Coverage ==="
+              PYTHONPATH=/workspace/protobuf/gen \
+              COVERAGE_FILE=.coverage.integration \
+              python3 -m pytest \
+                --cov=src/serialization \
+                protobuf/tests/test_pipeline_simulation.py \
+                -v
+
+              python3 -m coverage json --data-file=.coverage.integration -o cov_int.json
+
+              echo "=== Combining Coverage ==="
+              python3 -m coverage combine .coverage.unit .coverage.integration
+              python3 -m coverage json -o cov_comb.json
+
+              python3 /workspace/scripts/format_coverage.py
+              echo "=== Coverage Summary Generated ==="
+              cat coverage_summary.md
+            '
+
+      - name: Publish Code Coverage to Summary
+        if: always()
+        run: |
+          if [ -f coverage_summary.md ]; then
+            cat coverage_summary.md >> $GITHUB_STEP_SUMMARY
+          fi

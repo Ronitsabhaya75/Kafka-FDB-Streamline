@@ -17,6 +17,7 @@ Run from the container:
 import os
 import sys
 import unittest
+from typing import Any
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "gen"))
 
@@ -430,10 +431,17 @@ class TestCorruptedInput(unittest.TestCase):
         self.assertEqual(parsed.stream_name, "")
         self.assertIsNone(parsed.WhichOneof("record"))
 
+    def test_truncated_varint_raises_decode_error(self) -> None:
+        """Varint with MSB continuation bit set indefinitely must raise DecodeError."""
+        corrupted_varint = b"\x08\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x01"
+        with self.assertRaises(DecodeError):
+            mutations_pb2.FDBVersionIndex.FromString(corrupted_varint)
+
     def test_random_bytes_do_not_crash(self) -> None:
         """Parser must never segfault or unhandled-crash on random input."""
         import random
 
+        random.seed(42)
         for _ in range(50):
             noise = bytes(random.randint(0, 255) for _ in range(random.randint(1, 500)))
             try:
@@ -457,7 +465,7 @@ class TestForwardCompatibility(unittest.TestCase):
 
 
 class TestEmptyStreamNameValidation(unittest.TestCase):
-    """Validate behavior when stream_name is empty."""
+    """Validate behavior when stream_name is empty or edge cases."""
 
     def test_empty_stream_name_is_valid_proto(self) -> None:
         record = mutations_pb2.FDBMutationRecord(stream_name="")
@@ -470,6 +478,12 @@ class TestEmptyStreamNameValidation(unittest.TestCase):
         record = mutations_pb2.FDBMutationRecord(stream_name="   ")
         parsed = mutations_pb2.FDBMutationRecord.FromString(record.SerializeToString())
         self.assertEqual(parsed.stream_name, "   ")
+
+    def test_long_stream_name(self) -> None:
+        long_name = "dir:" + "subpath/" * 100
+        rec = mutations_pb2.FDBMutationRecord(stream_name=long_name)
+        parsed = mutations_pb2.FDBMutationRecord.FromString(rec.SerializeToString())
+        self.assertEqual(parsed.stream_name, long_name)
 
 
 class TestVersionOrdering(unittest.TestCase):
@@ -492,12 +506,22 @@ class TestVersionOrdering(unittest.TestCase):
         self.assertLess(v1.sequence_no, v2.sequence_no)
         self.assertLess(v2.fdb_version, v3.fdb_version)
 
-    def test_version_index_tuple_comparison(self) -> None:
-        tuples = [(100, 2), (50, 0), (100, 0), (200, 1), (100, 1)]
-        sorted_tuples = sorted(tuples)
+    def test_version_index_sorting_key(self) -> None:
+        """Sort FDBVersionIndex messages by (fdb_version, sequence_no)."""
+        indexes = [
+            mutations_pb2.FDBVersionIndex(fdb_version=100, sequence_no=2),
+            mutations_pb2.FDBVersionIndex(fdb_version=50, sequence_no=0),
+            mutations_pb2.FDBVersionIndex(fdb_version=100, sequence_no=0),
+            mutations_pb2.FDBVersionIndex(fdb_version=200, sequence_no=1),
+            mutations_pb2.FDBVersionIndex(fdb_version=100, sequence_no=1),
+        ]
+        sorted_indexes = sorted(
+            indexes, key=lambda vi: (vi.fdb_version, vi.sequence_no)
+        )
+        expected = [(50, 0), (100, 0), (100, 1), (100, 2), (200, 1)]
         self.assertEqual(
-            sorted_tuples,
-            [(50, 0), (100, 0), (100, 1), (100, 2), (200, 1)],
+            [(vi.fdb_version, vi.sequence_no) for vi in sorted_indexes],
+            expected,
         )
 
 
@@ -553,6 +577,19 @@ class TestStressAndEdgeCases(unittest.TestCase):
         parsed = mutations_pb2.FDBSingleKeyMutation.FromString(m.SerializeToString())
         self.assertEqual(parsed.key, arbitrary_bytes)
         self.assertEqual(parsed.value, arbitrary_bytes)
+
+    def test_embedded_null_bytes(self) -> None:
+        """Embedded nulls are standard in FDB tuple encoding and must not truncate."""
+        key_with_nulls = b"\x01users\x00\x01\x00\x00\x02data"
+        val_with_nulls = b"\x00\x00\x00\x00binary\x00payload\x00"
+        m = mutations_pb2.FDBSingleKeyMutation(
+            key=key_with_nulls,
+            value=val_with_nulls,
+            mutation_type=mutations_pb2.FDBSingleKeyMutation.MutationType.MUTATION_TYPE_SET_VALUE,
+        )
+        parsed = mutations_pb2.FDBSingleKeyMutation.FromString(m.SerializeToString())
+        self.assertEqual(parsed.key, key_with_nulls)
+        self.assertEqual(parsed.value, val_with_nulls)
 
 
 class TestThreadSafety(unittest.TestCase):
@@ -632,6 +669,74 @@ class TestThreadSafety(unittest.TestCase):
             t.join()
 
         self.assertEqual(len(errors), 0, f"Concurrent record errors: {errors}")
+
+
+# Pytest-native tests utilizing shared fixtures from conftest.py
+
+
+def test_version_index_fixture(make_version_index: Any) -> None:
+    """Verify FDBVersionIndex creation via make_version_index fixture."""
+    vi = make_version_index(version=200_000, sequence_no=5)
+    assert vi.fdb_version == 200_000
+    assert vi.sequence_no == 5
+
+    data = vi.SerializeToString()
+    parsed = mutations_pb2.FDBVersionIndex.FromString(data)
+    assert parsed.fdb_version == 200_000
+    assert parsed.sequence_no == 5
+
+
+def test_cdc_batch_fixtures_and_timestamp(
+    sample_cdc_batch: tuple[Any, ...], sample_timestamp: Timestamp
+) -> None:
+    """Verify CDC batch mock structures serialize into Protobuf records cleanly."""
+    assert len(sample_cdc_batch) == 2
+    assert sample_timestamp.seconds > 0
+
+    records: list[mutations_pb2.FDBMutationRecord] = []
+    for version_group in sample_cdc_batch:
+        muts = []
+        for seq, mock_mut in enumerate(version_group.mutations):
+            ver_idx = mutations_pb2.FDBVersionIndex(
+                fdb_version=version_group.version, sequence_no=seq
+            )
+            if mock_mut.type == 1:
+                muts.append(
+                    mutations_pb2.FDBMutation(
+                        version_index=ver_idx,
+                        clear_range=mutations_pb2.FDBClearRange(
+                            begin_key=mock_mut.param1,
+                            end_key=mock_mut.param2,
+                        ),
+                    )
+                )
+            else:
+                muts.append(
+                    mutations_pb2.FDBMutation(
+                        version_index=ver_idx,
+                        single_key_mutation=mutations_pb2.FDBSingleKeyMutation(
+                            key=mock_mut.param1,
+                            value=mock_mut.param2,
+                            mutation_type=mock_mut.type,
+                        ),
+                    )
+                )
+
+        batch = mutations_pb2.FDBMutationBatch(mutations=muts)
+        rec = mutations_pb2.FDBMutationRecord(
+            stream_name="cdc-fixture-stream",
+            bridge_timestamp=sample_timestamp,
+            batch=batch,
+        )
+        records.append(rec)
+
+    assert len(records) == 2
+    for rec in records:
+        wire = rec.SerializeToString()
+        parsed = mutations_pb2.FDBMutationRecord.FromString(wire)
+        assert parsed.stream_name == "cdc-fixture-stream"
+        assert parsed.WhichOneof("record") == "batch"
+        assert parsed.bridge_timestamp.seconds == sample_timestamp.seconds
 
 
 if __name__ == "__main__":
