@@ -1,4 +1,8 @@
-"""Unit tests for observability metrics, health HTTP, and Kafka produce hooks."""
+"""Unit tests for observability metrics, health HTTP, and Kafka produce hooks.
+
+Contract tests lock the Prometheus names from ``docs/OBSERVABILITY-SPEC.md`` so
+a rename or deletion fails CI on every push/PR (see ``.github/workflows/tests.yml``).
+"""
 
 from __future__ import annotations
 
@@ -25,6 +29,20 @@ from src.observability import (
 )
 from src.observability.health import reset_for_tests
 from src.serialization.errors import InputTypeError
+
+# Locked against docs/OBSERVABILITY-SPEC.md — do not rename without updating both.
+REQUIRED_METRIC_NAMES = frozenset(
+    {
+        "fdb_mutations_polled_total",
+        "fdb_cdc_latest_read_version",
+        "fdb_cdc_lag_versions",
+        "fdb_serializer_bytes_out_total",
+        "fdb_serializer_errors_total",
+        "kafka_records_published_total",
+        "kafka_publish_latency_seconds",
+        "kafka_version_end_markers_total",
+    }
+)
 
 MockCdcMutation = namedtuple("MockCdcMutation", ["type", "param1", "param2"])
 MockVersionGroup = namedtuple("MockVersionGroup", ["version", "mutations"])
@@ -55,6 +73,15 @@ def _reset_health() -> None:
     yield
     stop_http_server()
     reset_for_tests()
+
+
+def test_required_prometheus_metric_names_registered() -> None:
+    """Fail CI if a Trello/spec metric is removed or renamed."""
+    from prometheus_client import generate_latest
+
+    body = generate_latest(REGISTRY).decode()
+    missing = [name for name in sorted(REQUIRED_METRIC_NAMES) if name not in body]
+    assert not missing, f"missing Prometheus metrics: {missing}"
 
 
 def test_healthz_and_readyz_and_metrics_endpoints() -> None:
