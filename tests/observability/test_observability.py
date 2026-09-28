@@ -6,6 +6,8 @@ a rename or deletion fails CI on every push/PR (see ``.github/workflows/tests.ym
 
 from __future__ import annotations
 
+import json
+import time
 import urllib.error
 import urllib.request
 from collections import namedtuple
@@ -18,6 +20,8 @@ from src.cdc.listener import FDBMutationListener
 from src.kafka import MutationProducer
 from src.observability import (
     REGISTRY,
+    audit_version_end,
+    configure_health,
     configure_logging,
     heartbeat,
     is_live,
@@ -106,6 +110,103 @@ def test_healthz_and_readyz_and_metrics_endpoints() -> None:
     with pytest.raises(urllib.error.HTTPError) as err:
         urllib.request.urlopen(f"{base}/readyz")
     assert err.value.code == 503
+
+
+def test_healthz_returns_503_when_liveness_heartbeat_expires() -> None:
+    configure_health(liveness_timeout_seconds=0.05)
+    heartbeat()
+    assert is_live() is True
+
+    server = start_http_server(host="127.0.0.1", port=0)
+    host, port = server.server_address[:2]
+    base = f"http://{host}:{port}"
+
+    with urllib.request.urlopen(f"{base}/healthz") as resp:
+        assert resp.status == 200
+
+    time.sleep(0.07)
+    assert is_live() is False
+    with pytest.raises(urllib.error.HTTPError) as err:
+        urllib.request.urlopen(f"{base}/healthz")
+    assert err.value.code == 503
+
+
+@pytest.mark.parametrize(
+    ("fdb_ready", "kafka_ready", "expect_ready"),
+    [
+        (False, False, False),
+        (True, False, False),
+        (False, True, False),
+        (True, True, True),
+    ],
+)
+def test_readyz_requires_both_fdb_and_kafka(
+    fdb_ready: bool, kafka_ready: bool, expect_ready: bool
+) -> None:
+    set_fdb_ready(fdb_ready)
+    set_kafka_ready(kafka_ready)
+    assert is_ready() is expect_ready
+
+    server = start_http_server(host="127.0.0.1", port=0)
+    host, port = server.server_address[:2]
+    url = f"http://{host}:{port}/readyz"
+
+    if expect_ready:
+        with urllib.request.urlopen(url) as resp:
+            assert resp.status == 200
+        return
+
+    with pytest.raises(urllib.error.HTTPError) as err:
+        urllib.request.urlopen(url)
+    assert err.value.code == 503
+
+
+def test_audit_version_end_emits_required_json_fields(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    configure_logging()
+    audit_version_end(
+        fdb_version=42,
+        mutation_count=3,
+        duration_seconds=0.0125,
+        topic="fdb-cdc",
+        partition=1,
+    )
+    lines = [line for line in capsys.readouterr().out.splitlines() if line.strip()]
+    assert lines, "expected a VersionEnd audit log line"
+    payload = json.loads(lines[-1])
+    assert payload["event"] == "version_end_audit"
+    assert payload["fdb_version"] == 42
+    assert payload["mutation_count"] == 3
+    assert payload["duration_seconds"] == pytest.approx(0.0125)
+    assert payload["topic"] == "fdb-cdc"
+    assert payload["partition"] == 1
+    assert "timestamp" in payload
+    assert payload.get("level") == "info"
+
+
+def test_poll_records_emits_version_end_audit(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    configure_logging()
+    client = MagicMock(spec=FDBClient)
+    consumer = MagicMock()
+    client.create_cdc_consumer.return_value = consumer
+    client.get_read_version.return_value = 1000
+    consumer.consume.return_value.wait.return_value = MockConsumeResult(
+        [MockVersionGroup(1000, [MockCdcMutation(0, b"k", b"v")])],
+        1000,
+    )
+    listener = FDBMutationListener(client, "audit-stream")
+    records = listener.poll_records(bridge_timestamp_ns=1)
+    assert any(r.WhichOneof("record") == "version_end" for r in records)
+
+    lines = [line for line in capsys.readouterr().out.splitlines() if line.strip()]
+    audits = [json.loads(line) for line in lines if '"version_end_audit"' in line]
+    assert len(audits) == 1
+    assert audits[0]["fdb_version"] == 1000
+    assert audits[0]["mutation_count"] == 1
+    assert isinstance(audits[0]["duration_seconds"], (int, float))
 
 
 def test_poll_records_increments_fdb_and_serializer_metrics() -> None:
