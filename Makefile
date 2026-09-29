@@ -5,7 +5,7 @@ VENV := .venv
 
 setup:
 	$(PYTHON) -m venv $(VENV)
-	$(VENV)/bin/pip install -r requirements-dev.txt
+	$(VENV)/bin/pip install -r requirements-dev.txt -e .
 	$(VENV)/bin/pre-commit install
 
 lint:

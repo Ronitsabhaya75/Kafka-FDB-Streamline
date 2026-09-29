@@ -3,29 +3,32 @@
 Produces Protobuf-serialised FDBMutationRecord messages to a local Kafka
 topic, then consumes and deserialises them to verify the full round-trip.
 
-Run inside the devcontainer:
-    PYTHONPATH=protobuf/gen pytest tests/test_kafka_producer.py -v -m integration
+Run explicitly inside the devcontainer:
+    KAFKA_INTEGRATION=1 pytest tests/test_kafka_producer.py -v -m integration
 """
 
 import os
-import sys
+import time
 import uuid
 
 import pytest
-
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "protobuf", "gen"))
-
 from confluent_kafka import Consumer, KafkaException
 from google.protobuf.timestamp_pb2 import Timestamp
-from src.kafka.producer import MutationProducer
 
 from fdbkafka.cdc.v1 import mutations_pb2
+from src.kafka.producer import MutationProducer
 
-BOOTSTRAP_SERVERS = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "kafka:19092")
+BOOTSTRAP_SERVERS = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
 # Unique topic per test run avoids cross-run interference.
 TEST_TOPIC = f"fdb-cdc-test-{uuid.uuid4().hex[:8]}"
 
-pytestmark = pytest.mark.integration
+pytestmark = [
+    pytest.mark.integration,
+    pytest.mark.skipif(
+        os.environ.get("KAFKA_INTEGRATION") != "1",
+        reason="set KAFKA_INTEGRATION=1 to run live Kafka tests",
+    ),
+]
 
 
 # -- helpers ---------------------------------------------------------------
@@ -106,8 +109,6 @@ def _build_batch_record(
 def _consume_n(consumer: Consumer, n: int, timeout: float = 15.0) -> list[bytes]:
     """Poll *n* messages from the consumer, raising on timeout."""
     messages: list[bytes] = []
-    import time
-
     deadline = time.monotonic() + timeout
     while len(messages) < n and time.monotonic() < deadline:
         msg = consumer.poll(timeout=1.0)

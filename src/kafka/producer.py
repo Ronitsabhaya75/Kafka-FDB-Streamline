@@ -1,21 +1,23 @@
-"""Kafka producer wrapper enforcing strict ordering and durable delivery.
+"""Kafka producer wrapper enforcing ordered, idempotent delivery.
 
-Wraps ``confluent_kafka.Producer`` with hardcoded configuration for
-exactly-once, ordered publishing of Protobuf-serialised CDC records.
-The critical durability knobs (``acks``, idempotence, in-flight limit)
-are set here and cannot be overridden by callers.
+The critical durability knobs (``acks``, idempotence, in-flight limit) are
+set here and cannot be overridden by callers. This producer does not create
+Kafka transactions, so it does not provide end-to-end exactly-once delivery.
 """
 
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from typing import Any
 
-from confluent_kafka import KafkaError, KafkaException, Producer
+from confluent_kafka import KafkaError, KafkaException, Message, Producer
 
 from fdbkafka.cdc.v1 import mutations_pb2
 
 logger = logging.getLogger(__name__)
+
+DeliveryCallback = Callable[[KafkaError | None, Message], None]
 
 # Durability / ordering settings that must not be weakened by callers.
 _MANDATORY_CONFIG: dict[str, Any] = {
@@ -32,10 +34,15 @@ _DEFAULT_PERFORMANCE_CONFIG: dict[str, Any] = {
 
 
 def _default_error_cb(err: KafkaError) -> None:
-    """Log fatal broker-level errors; non-fatal ones are debug noise."""
-    if err.fatal():
-        raise KafkaException(err)
-    logger.warning("Kafka producer error (non-fatal): %s", err)
+    """Log asynchronous client and broker errors.
+
+    Per-message delivery failures are surfaced by :meth:`MutationProducer.flush`.
+
+    Args:
+        err: Error reported by librdkafka.
+    """
+    level = logging.ERROR if err.fatal() else logging.WARNING
+    logger.log(level, "Kafka producer error: %s", err)
 
 
 class MutationProducer:
@@ -43,14 +50,13 @@ class MutationProducer:
 
     Constructor merges caller-supplied config under mandatory ordering and
     durability settings so the critical guarantees cannot be accidentally
-    weakened.  Performance knobs (``linger.ms``, ``compression.type``) can
+    weakened. Performance knobs (``linger.ms``, ``compression.type``) can
     be overridden via *extra_config*.
 
     Args:
         bootstrap_servers: Kafka bootstrap server(s), e.g. ``"kafka:19092"``.
-        extra_config: Optional librdkafka configuration overrides.  Keys that
-            collide with the mandatory durability settings are silently
-            ignored.
+        extra_config: Optional librdkafka configuration overrides. Keys that
+            collide with the mandatory durability settings are ignored.
     """
 
     def __init__(
@@ -62,8 +68,8 @@ class MutationProducer:
 
         Args:
             bootstrap_servers: Kafka bootstrap server(s).
-            extra_config: Optional librdkafka overrides.  Durability
-                keys are silently ignored.
+            extra_config: Optional librdkafka overrides. Durability keys are
+                ignored.
         """
         merged: dict[str, Any] = {
             "bootstrap.servers": bootstrap_servers,
@@ -72,15 +78,11 @@ class MutationProducer:
         if extra_config:
             merged.update(extra_config)
 
-        # Mandatory settings win — applied last.
         merged.update(_MANDATORY_CONFIG)
         merged.setdefault("error_cb", _default_error_cb)
 
         self._producer = Producer(merged)
-
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
+        self._delivery_errors: list[KafkaError] = []
 
     def produce(
         self,
@@ -88,32 +90,32 @@ class MutationProducer:
         record: mutations_pb2.FDBMutationRecord,
         *,
         key: bytes | None = None,
-        on_delivery: Any = None,
+        on_delivery: DeliveryCallback | None = None,
     ) -> None:
         """Enqueue one ``FDBMutationRecord`` for async delivery.
 
         The record is serialised to Protobuf wire format before being
-        handed to librdkafka's internal queue.  Call :meth:`flush` to
+        handed to librdkafka's internal queue. Call :meth:`flush` to
         block until all queued messages are broker-acknowledged.
 
         Args:
             topic: Destination Kafka topic.
             record: The CDC mutation record to publish.
-            key: Optional partition key (bytes).  In production this will
+            key: Optional partition key (bytes). In production this will
                 typically be the UTF-8-encoded ``stream_name`` so all
                 mutations for a directory land on the same partition.
-            on_delivery: Optional ``(err, msg)`` callback invoked once the
+            on_delivery: Optional ``(err, msg)`` callback invoked when the
                 broker acknowledges (or permanently fails) this message.
         """
         payload = record.SerializeToString()
-        kwargs: dict[str, Any] = {"value": payload}
+        kwargs: dict[str, Any] = {
+            "value": payload,
+            "on_delivery": self._delivery_callback(on_delivery),
+        }
         if key is not None:
             kwargs["key"] = key
-        if on_delivery is not None:
-            kwargs["on_delivery"] = on_delivery
 
         self._producer.produce(topic, **kwargs)
-        # Trigger delivery-report callbacks without blocking.
         self._producer.poll(0)
 
     def flush(self, timeout: float = 10.0) -> int:
@@ -124,9 +126,26 @@ class MutationProducer:
 
         Returns:
             Number of messages still in the queue (0 means all delivered).
+
+        Raises:
+            KafkaException: At least one queued message permanently failed.
         """
-        return self._producer.flush(timeout)
+        remaining = self._producer.flush(timeout)
+        if self._delivery_errors:
+            error = self._delivery_errors.pop(0)
+            self._delivery_errors.clear()
+            raise KafkaException(error)
+        return remaining
 
     def __len__(self) -> int:
         """Return the number of messages waiting in the producer queue."""
         return len(self._producer)
+
+    def _delivery_callback(self, callback: DeliveryCallback | None) -> DeliveryCallback:
+        def report(error: KafkaError | None, message: Message) -> None:
+            if error is not None:
+                self._delivery_errors.append(error)
+            if callback is not None:
+                callback(error, message)
+
+        return report
