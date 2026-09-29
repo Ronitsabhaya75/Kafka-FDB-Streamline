@@ -6,6 +6,14 @@ from typing import Any, Final, Self
 from fdbkafka.cdc.v1 import mutations_pb2
 from src.cdc.client import FDBClient, _raise_consume_failure, _to_bytes
 from src.cdc.errors import CDCConsumerClosedError, CDCError, CDCInvalidCursorError
+from src.observability import (
+    audit_version_end,
+    heartbeat,
+    record_cdc_versions,
+    record_mutation_polled,
+    record_serializer_bytes,
+    record_serializer_error,
+)
 from src.serialization import serialize_version_end, serialize_version_group
 from src.serialization.errors import RecordTooLargeError
 
@@ -222,49 +230,79 @@ class FDBMutationListener:
             CDCTerminalError: If the native consume failed with a terminal code.
             SerializationError: If a native mutation or record cannot be serialized.
         """
+        poll_started = time.perf_counter()
+        heartbeat()
         batch = self._consume_batch()
         self._delivery_failed = True
         timestamp_ns = (
             bridge_timestamp_ns if bridge_timestamp_ns is not None else time.time_ns()
         )
 
-        serialized: list[bytes] = []
-        last_group_version = -1
-        for version_group in getattr(batch, "mutations", ()):
-            serialized.extend(
-                serialize_version_group(
+        watermark = -1
+        try:
+            serialized: list[bytes] = []
+            last_group_version = -1
+            for version_group in getattr(batch, "mutations", ()):
+                for mutation in version_group.mutations:
+                    record_mutation_polled(int(mutation.type))
+                chunk = serialize_version_group(
                     version_group.mutations,
                     fdb_version=version_group.version,
                     max_record_bytes=self.max_record_bytes,
                     stream_name=self.stream_name,
                     bridge_timestamp_ns=timestamp_ns,
                 )
-            )
-            last_group_version = version_group.version
+                for payload in chunk:
+                    record_serializer_bytes(len(payload))
+                serialized.extend(chunk)
+                last_group_version = version_group.version
 
-        watermark = getattr(batch, "last_consumed_version", -1)
-        if watermark >= 0 and watermark > last_group_version:
-            watermark_record = serialize_version_end(
-                fdb_version=watermark,
-                total_mutations=0,
-                stream_name=self.stream_name,
-                bridge_timestamp_ns=timestamp_ns,
-            )
-            if len(watermark_record) > self.max_record_bytes:
-                record_bytes = len(watermark_record)
-                raise RecordTooLargeError(
-                    f"watermark version end of version {watermark} needs a "
-                    f"{record_bytes}-byte record; max_record_bytes is "
-                    f"{self.max_record_bytes}",
-                    index=None,
-                    record_bytes=record_bytes,
-                    max_record_bytes=self.max_record_bytes,
+            watermark = getattr(batch, "last_consumed_version", -1)
+            if watermark >= 0 and watermark > last_group_version:
+                watermark_record = serialize_version_end(
+                    fdb_version=watermark,
+                    total_mutations=0,
+                    stream_name=self.stream_name,
+                    bridge_timestamp_ns=timestamp_ns,
                 )
-            serialized.append(watermark_record)
+                if len(watermark_record) > self.max_record_bytes:
+                    record_bytes = len(watermark_record)
+                    raise RecordTooLargeError(
+                        f"watermark version end of version {watermark} needs a "
+                        f"{record_bytes}-byte record; max_record_bytes is "
+                        f"{self.max_record_bytes}",
+                        index=None,
+                        record_bytes=record_bytes,
+                        max_record_bytes=self.max_record_bytes,
+                    )
+                record_serializer_bytes(len(watermark_record))
+                serialized.append(watermark_record)
 
-        records = [
-            mutations_pb2.FDBMutationRecord.FromString(data) for data in serialized
-        ]
+            records = [
+                mutations_pb2.FDBMutationRecord.FromString(data) for data in serialized
+            ]
+        except Exception:
+            record_serializer_error()
+            raise
+
+        if watermark >= 0:
+            cluster_rv: int | None
+            try:
+                cluster_rv = int(self.client.get_read_version())
+            except Exception:
+                cluster_rv = None
+            record_cdc_versions(latest=watermark, cluster_read_version=cluster_rv)
+
+        duration = time.perf_counter() - poll_started
+        for record in records:
+            if record.WhichOneof("record") != "version_end":
+                continue
+            audit_version_end(
+                fdb_version=record.version_end.fdb_version,
+                mutation_count=record.version_end.total_mutations,
+                duration_seconds=duration,
+            )
+
         self._delivery_failed = False
         self._awaiting_ack = bool(records)
         return records

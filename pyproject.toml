@@ -4,7 +4,11 @@ version = "0.1.0"
 description = "FoundationDB native CDC to Kafka bridge (UNT capstone)."
 readme = "README.md"
 requires-python = ">=3.12"
-dependencies = ["protobuf>=7.34,<8"]
+dependencies = [
+    "protobuf>=7.34,<8",
+    "prometheus_client>=0.21,<1",
+    "structlog>=24.4,<26",
+]
 
 [tool.black]
 line-length = 88

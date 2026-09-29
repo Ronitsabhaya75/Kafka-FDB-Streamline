@@ -191,3 +191,37 @@ jobs:
                 tests/cdc/ \
                 -v
             '
+
+  test-observability:
+    needs: build-and-verify
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download Docker image artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: fdb-cdc-ci-image
+
+      - name: Load Docker image
+        run: |
+          gunzip -c fdb-cdc-ci.tar.gz | docker load
+
+      - name: Run Observability tests inside FDB container
+        run: |
+          docker run --rm \
+            -v "${{ github.workspace }}:/workspace" \
+            -w /workspace \
+            -e HYPOTHESIS_PROFILE=ci \
+            fdb-cdc:ci \
+            bash -c '
+              set -e
+              pip3 install --break-system-packages -r requirements-dev.txt
+
+              echo "=== Running Observability Tests ==="
+              PYTHONPATH=/workspace:/workspace/protobuf/gen \
+              python3 -m pytest \
+                tests/observability/ \
+                -v
+            '
