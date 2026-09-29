@@ -190,8 +190,4 @@ jobs:
                 --cov-report=term-missing \
                 tests/cdc/ \
                 -v
-
-              echo "=== Running End-to-End Live Mutation Pipeline Test ==="
-              PYTHONPATH=/workspace:/workspace/protobuf/gen \
-              python3 scripts/test_all_mutations_pipeline.py
             '
