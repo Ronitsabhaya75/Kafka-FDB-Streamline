@@ -36,8 +36,11 @@ def _native_error_code(exc: BaseException) -> int | None:
         The integer FDB error code, or ``None`` if ``exc`` is not a native
         ``FDBError``.
     """
-    if fdb is not None and isinstance(exc, fdb.FDBError):
-        return exc.code
+    fdb_err_type = getattr(fdb, "FDBError", None) or getattr(
+        getattr(fdb, "impl", None), "FDBError", None
+    )
+    if fdb_err_type is not None and isinstance(exc, fdb_err_type):
+        return getattr(exc, "code", None)
     # Offline (no bindings) and in tests, duck-type on FDBError's int ``code``.
     code = getattr(exc, "code", None)
     return code if type(code) is int else None
