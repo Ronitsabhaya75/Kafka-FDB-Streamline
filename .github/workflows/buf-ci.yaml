@@ -1,14 +1,10 @@
 name: Buf CI
 on:
-  push:
-    branches: ['main']
-
-  pull_request:
-    types: [opened, synchronize]
+  workflow_call:
+  workflow_dispatch:
 
 permissions:
   contents: read
-
 
 jobs:
   buf:
@@ -25,7 +21,7 @@ jobs:
         run: buf lint
 
       - name: Buf Breaking
-        if: github.event_name == 'pull_request'
+        if: github.event.pull_request.base.ref != ''
         run: |
           set +e
           OUTPUT=$(buf breaking --against "${{ github.event.repository.clone_url }}#branch=${{ github.event.pull_request.base.ref }}" 2>&1)

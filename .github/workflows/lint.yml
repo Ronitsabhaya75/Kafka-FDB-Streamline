@@ -4,15 +4,11 @@ name: Lint
 # Never edits files or pushes commits.
 
 on:
-  pull_request:
+  workflow_call:
   workflow_dispatch:
 
 permissions:
   contents: read
-
-concurrency:
-  group: lint-${{ github.ref }}
-  cancel-in-progress: true
 
 jobs:
   lint:

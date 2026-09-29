@@ -6,7 +6,7 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "confluent-kafka>=2.6,<3",
-    "protobuf>=6.30,<7",
+    "protobuf>=7.34,<8",
 ]
 
 [tool.black]
@@ -18,7 +18,7 @@ force-exclude = "^/protobuf/gen/"
 [tool.ruff]
 line-length = 88
 target-version = "py312"
-src = ["src", "tests", "protobuf/gen"]
+src = [".", "src", "tests", "protobuf/gen"]
 extend-exclude = ["protobuf/gen"]
 # Honour excludes even when pre-commit passes files explicitly.
 force-exclude = true
@@ -43,3 +43,16 @@ convention = "google"
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["D"]
 "protobuf/tests/**" = ["D"]
+
+[tool.pytest.ini_options]
+minversion = "9.0"
+testpaths = ["tests", "protobuf/tests"]
+pythonpath = [".", "protobuf/gen"]
+markers = ["slow: builds a ~10 MB version group; deselect with -m 'not slow'"]
+addopts = [
+  "-ra",
+  "--strict-markers",
+  "--strict-config",
+  # Manual smoke script: imports fdb and needs a live cluster.
+  "--ignore=tests/test_cdc_e2e.py",
+]
