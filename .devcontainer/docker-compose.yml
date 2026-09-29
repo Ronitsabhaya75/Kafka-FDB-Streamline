@@ -20,7 +20,10 @@ services:
     image: apache/kafka:3.9.0
     ports:
       - "9092:9092"
+    volumes:
+      - kafka_logs:/var/lib/kafka/data
     environment:
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
       KAFKA_NODE_ID: 1
       KAFKA_PROCESS_ROLES: broker,controller
       KAFKA_LISTENERS: PLAINTEXT://:19092,CONTROLLER://:9093,EXTERNAL://:9092
@@ -39,3 +42,7 @@ services:
 
 networks:
   devnet:
+
+volumes:
+  kafka_logs:
+
