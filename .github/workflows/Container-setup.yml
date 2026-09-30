@@ -73,7 +73,34 @@ jobs:
               echo "=== Container setup verified ==="
             '
 
-      - name: Run test suites and measure code coverage inside FDB container
+      - name: Save Docker image
+        run: |
+          docker save fdb-cdc:ci | gzip -1 > fdb-cdc-ci.tar.gz
+
+      - name: Upload Docker image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: fdb-cdc-ci-image
+          path: fdb-cdc-ci.tar.gz
+          retention-days: 1
+
+  test-protobuf:
+    needs: build-and-verify
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download Docker image artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: fdb-cdc-ci-image
+
+      - name: Load Docker image
+        run: |
+          gunzip -c fdb-cdc-ci.tar.gz | docker load
+
+      - name: Run Protobuf tests inside FDB container
         run: |
           docker run --rm \
             -v "${{ github.workspace }}:/workspace" \
@@ -84,39 +111,83 @@ jobs:
               set -e
               pip3 install --break-system-packages -r requirements-dev.txt
 
-              echo "=== Running Unit Tests with Coverage ==="
-              PYTHONPATH=/workspace/protobuf/gen \
-              COVERAGE_FILE=.coverage.unit \
+              echo "=== Running Protobuf Unit and Simulation Tests ==="
+              PYTHONPATH=/workspace:/workspace/protobuf/gen \
               python3 -m pytest \
-                --cov=src/serialization \
-                tests/serialization/ \
                 protobuf/tests/test_mutations_proto.py \
-                -v
-
-              python3 -m coverage json --data-file=.coverage.unit -o cov_unit.json
-
-              echo "=== Running Integration Simulation Tests with Coverage ==="
-              PYTHONPATH=/workspace/protobuf/gen \
-              COVERAGE_FILE=.coverage.integration \
-              python3 -m pytest \
-                --cov=src/serialization \
                 protobuf/tests/test_pipeline_simulation.py \
                 -v
-
-              python3 -m coverage json --data-file=.coverage.integration -o cov_int.json
-
-              echo "=== Combining Coverage ==="
-              python3 -m coverage combine .coverage.unit .coverage.integration
-              python3 -m coverage json -o cov_comb.json
-
-              python3 /workspace/scripts/format_coverage.py
-              echo "=== Coverage Summary Generated ==="
-              cat coverage_summary.md
             '
 
-      - name: Publish Code Coverage to Summary
-        if: always()
+  test-serialization:
+    needs: build-and-verify
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download Docker image artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: fdb-cdc-ci-image
+
+      - name: Load Docker image
         run: |
-          if [ -f coverage_summary.md ]; then
-            cat coverage_summary.md >> $GITHUB_STEP_SUMMARY
-          fi
+          gunzip -c fdb-cdc-ci.tar.gz | docker load
+
+      - name: Run Serialization tests inside FDB container
+        run: |
+          docker run --rm \
+            -v "${{ github.workspace }}:/workspace" \
+            -w /workspace \
+            -e HYPOTHESIS_PROFILE=ci \
+            fdb-cdc:ci \
+            bash -c '
+              set -e
+              pip3 install --break-system-packages -r requirements-dev.txt
+
+              echo "=== Running Serialization Tests with Coverage ==="
+              PYTHONPATH=/workspace:/workspace/protobuf/gen \
+              python3 -m pytest \
+                --cov=src/serialization \
+                --cov-report=term-missing \
+                tests/serialization/ \
+                -v
+            '
+
+  test-cdc-mutations:
+    needs: build-and-verify
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download Docker image artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: fdb-cdc-ci-image
+
+      - name: Load Docker image
+        run: |
+          gunzip -c fdb-cdc-ci.tar.gz | docker load
+
+      - name: Run CDC Mutations tests inside FDB container
+        run: |
+          docker run --rm \
+            -v "${{ github.workspace }}:/workspace" \
+            -w /workspace \
+            -e HYPOTHESIS_PROFILE=ci \
+            -e FDB_CDC_INTEGRATION=1 \
+            fdb-cdc:ci \
+            bash -c '
+              set -e
+              pip3 install --break-system-packages -r requirements-dev.txt
+
+              echo "=== Running CDC Mutation Tests with Coverage ==="
+              PYTHONPATH=/workspace:/workspace/protobuf/gen \
+              python3 -m pytest \
+                --cov=src/cdc \
+                --cov-report=term-missing \
+                tests/cdc/ \
+                -v
+            '
