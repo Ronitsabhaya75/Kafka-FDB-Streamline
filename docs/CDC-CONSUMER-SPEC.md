@@ -9,6 +9,11 @@ Schema: [`mutations.proto`](../protobuf/proto/fdbkafka/cdc/v1/mutations.proto).
 
 ## 1. Scope & Rules
 
+- **Terms:** a **cursor** is the value `CdcCursor(stream_id, last_consumed_version)`.
+  A **checkpoint** is the act of durably persisting a cursor, and the stored record
+  it leaves. Say "checkpoint the cursor", not "checkpoint version": a version alone
+  cannot resume a stream.
+
 - **FoundationDB API version:** Strictly gated on API version 800 (`fdb.api_version(800)`).
   Selecting an API version < 800 raises `CDCNotSupportedError`.
 - **Subspace range alignment:** Stream registration covers `[rawPrefix, strinc(rawPrefix))`,
