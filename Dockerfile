@@ -1,43 +1,32 @@
-FROM --platform=linux/amd64 foundationdb/build:rockylinux9-latest AS builder
-
-WORKDIR /build
-
-RUN git clone https://github.com/apple/foundationdb.git /fdb
-
-RUN cd /fdb && \
-    mkdir build && \
-    cd build && \
-    cmake -G Ninja \
-    -DCMAKE_BUILD_TYPE=Release \
-    -DCMAKE_C_COMPILER=clang \
-    -DCMAKE_CXX_COMPILER=clang++ \
-    -DUSE_JEMALLOC=OFF \
-    -DCMAKE_POLICY_DEFAULT_CMP0028=OLD \
-    .. && \
-    ninja fdbserver fdbcli fdb_c python_binding fdb_python_options
-
 FROM --platform=linux/amd64 ubuntu:24.04 AS runtime
 
+ARG FDB_VERSION=8.0.0
+
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl ca-certificates \
     python3 python3-pip python3-venv \
     libssl3t64 liblz4-1 zlib1g \
     && rm -rf /var/lib/apt/lists/*
 
 RUN mkdir -p /var/lib/foundationdb/data \
     /var/log/foundationdb \
-    /etc/foundationdb \
-    /opt/fdb-python
+    /etc/foundationdb
 
-COPY --from=builder /fdb/build/bin/fdbserver /usr/local/bin/
-COPY --from=builder /fdb/build/bin/fdbcli /usr/local/bin/
-COPY --from=builder /fdb/build/lib/libfdb_c.so /usr/local/lib/
-COPY --from=builder /fdb/build/bindings/python /opt/fdb-python
+# Download prebuilt FoundationDB 8.0.0 binaries and client library
+RUN ARCH="$(uname -m)" && \
+    case "$ARCH" in \
+      x86_64)  FDB_ARCH="x86_64" ;; \
+      aarch64) FDB_ARCH="aarch64" ;; \
+      *) echo "Unsupported architecture: $ARCH" >&2; exit 1 ;; \
+    esac && \
+    curl -fsSL -o /usr/local/bin/fdbserver "https://github.com/apple/foundationdb/releases/download/${FDB_VERSION}/fdbserver.${FDB_ARCH}" && \
+    curl -fsSL -o /usr/local/bin/fdbcli "https://github.com/apple/foundationdb/releases/download/${FDB_VERSION}/fdbcli.${FDB_ARCH}" && \
+    curl -fsSL -o /usr/local/lib/libfdb_c.so "https://github.com/apple/foundationdb/releases/download/${FDB_VERSION}/libfdb_c.${FDB_ARCH}.so" && \
+    chmod +x /usr/local/bin/fdbserver /usr/local/bin/fdbcli && \
+    ldconfig
 
-RUN chmod +x /usr/local/bin/fdbserver /usr/local/bin/fdbcli
-
-RUN ldconfig
-
-RUN cd /opt/fdb-python && pip3 install --break-system-packages --verbose .
+# Install official 8.0.0 Python bindings with CDC support from PyPI
+RUN pip3 install --break-system-packages --no-cache-dir foundationdb==${FDB_VERSION}
 
 ENV FDB_CLUSTER_FILE=/etc/foundationdb/fdb.cluster
 ENV LD_LIBRARY_PATH=/usr/local/lib
