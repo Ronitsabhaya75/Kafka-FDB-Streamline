@@ -10,6 +10,7 @@ How the team lays out the repo, branches, writes Python, and merges. Tooling enf
 │   ├── bridge/           # Core bridge pipeline (CDC → Kafka)
 │   ├── cdc/              # FDB CDC consumer wrapper
 │   ├── kafka/            # Kafka producer module
+│   ├── observability/    # Prometheus metrics, :9102 health HTTP, audit logs
 │   └── serialization/    # Protobuf serialization
 ├── protobuf/
 │   ├── proto/            # .proto schema definitions
@@ -18,6 +19,8 @@ How the team lays out the repo, branches, writes Python, and merges. Tooling enf
 ├── tests/                # Unit and integration tests
 ├── config/               # Configuration files
 ├── docs/                 # Documentation: INDEX.md (doc map), this file, research write-ups
+│   └── superpowers/
+│       └── specs/        # Design notes for Trello cards (approach + acceptance)
 ├── scripts/              # Helper scripts
 ├── .devcontainer/        # devcontainer.json + docker-compose.yml (FDB + Kafka stack)
 ├── .github/              # PR template, CI workflows
