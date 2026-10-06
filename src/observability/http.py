@@ -11,7 +11,7 @@ from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from src.observability import health
 from src.observability.metrics import REGISTRY
 
-DEFAULT_HOST: Final[str] = "127.0.0.1"
+DEFAULT_HOST: Final[str] = "0.0.0.0"
 DEFAULT_PORT: Final[int] = 9102
 
 _server: ThreadingHTTPServer | None = None
