@@ -94,6 +94,17 @@ def test_live_cdc_mutation_listener() -> None:
         assert pos is not None
         assert pos.last_consumed_version > 0
 
+        # Observability smoke: poll/ack path updates live gauges and heartbeat.
+        from prometheus_client import generate_latest
+
+        from src.observability.health import is_live
+        from src.observability.metrics import REGISTRY
+
+        body = generate_latest(REGISTRY).decode()
+        assert "fdb_mutations_polled_total" in body
+        assert "fdb_cdc_latest_read_version" in body
+        assert is_live() is True
+
     # Clean up test keys and stream
     del db[prefix : strinc(prefix)]
     try:

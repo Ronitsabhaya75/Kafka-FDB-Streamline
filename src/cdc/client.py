@@ -15,6 +15,7 @@ from src.cdc.errors import (
     CDCRetryableError,
     CDCTerminalError,
 )
+from src.observability import set_fdb_ready
 
 DEFAULT_CDC_API_VERSION: Final[int] = 800
 MINIMUM_CDC_API_VERSION: Final[int] = 800
@@ -189,7 +190,15 @@ class FDBClient:
         """
         if self._db is None:
             init_fdb(self.api_version)
-            self._db = fdb.open(self.cluster_file)
+            db = fdb.open(self.cluster_file)
+            self._db = db
+            try:
+                # Prove the handle can talk to the cluster before advertising ready.
+                _ = self.get_read_version()
+            except Exception:
+                self._db = None
+                raise
+            set_fdb_ready(True)
         return self._db
 
     @property
@@ -198,8 +207,11 @@ class FDBClient:
         return self.open()
 
     def close(self) -> None:
-        """Close client resources and release database handle."""
+        """Close client resources and release one FDB readiness owner if open."""
+        had_db = self._db is not None
         self._db = None
+        if had_db:
+            set_fdb_ready(False)
 
     def __enter__(self) -> Self:
         """Enter context manager, opening database connection."""
