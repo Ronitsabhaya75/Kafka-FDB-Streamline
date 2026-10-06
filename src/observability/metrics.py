@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from prometheus_client import CollectorRegistry, Counter, Gauge, Histogram
 
+from src.serialization.model import MutationType
+
 # Isolated registry so tests and the HTTP exporter share one coherent set and
 # do not clash with the process-wide default REGISTRY.
 REGISTRY = CollectorRegistry()
@@ -34,6 +36,7 @@ FDB_SERIALIZER_ERRORS_TOTAL = Counter(
     "Serialization failures in the CDC poll path.",
     registry=REGISTRY,
 )
+# Registered for the real Kafka producer; the stub must not touch these.
 KAFKA_RECORDS_PUBLISHED_TOTAL = Counter(
     "kafka_records_published_total",
     "Records successfully acknowledged by the Kafka publish path (acks=all).",
@@ -50,25 +53,6 @@ KAFKA_VERSION_END_MARKERS_TOTAL = Counter(
     registry=REGISTRY,
 )
 
-_OPCODE_NAMES: dict[int, str] = {
-    0: "SET_VALUE",
-    1: "CLEAR_RANGE",
-    2: "ADD",
-    6: "AND",
-    7: "OR",
-    8: "XOR",
-    9: "APPEND_IF_FITS",
-    12: "MAX",
-    13: "MIN",
-    14: "SET_VERSIONSTAMPED_KEY",
-    15: "SET_VERSIONSTAMPED_VALUE",
-    16: "BYTE_MIN",
-    17: "BYTE_MAX",
-    18: "MIN_V2",
-    19: "AND_V2",
-    20: "COMPARE_AND_CLEAR",
-}
-
 
 def opcode_name(type_code: int) -> str:
     """Return the Prometheus label for a native mutation type code.
@@ -77,9 +61,12 @@ def opcode_name(type_code: int) -> str:
         type_code: Native CDC mutation type (0..255).
 
     Returns:
-        A stable opcode name, or ``TYPE_<code>`` for undeclared codes.
+        A stable opcode name from ``MutationType``, or ``TYPE_<code>``.
     """
-    return _OPCODE_NAMES.get(type_code, f"TYPE_{type_code}")
+    try:
+        return MutationType(type_code).name
+    except ValueError:
+        return f"TYPE_{type_code}"
 
 
 def record_mutation_polled(type_code: int) -> None:
@@ -97,11 +84,10 @@ def record_cdc_versions(*, latest: int, cluster_read_version: int | None) -> Non
     Args:
         latest: Latest consumed / reply watermark version.
         cluster_read_version: Fresh cluster read version, or ``None`` if unknown.
+            When unknown, lag is left unchanged so an outage does not look caught up.
     """
     FDB_CDC_LATEST_READ_VERSION.set(latest)
-    if cluster_read_version is None:
-        FDB_CDC_LAG_VERSIONS.set(0)
-    else:
+    if cluster_read_version is not None:
         FDB_CDC_LAG_VERSIONS.set(max(0, cluster_read_version - latest))
 
 
@@ -121,7 +107,7 @@ def record_serializer_error() -> None:
 
 
 def record_kafka_publish(*, latency_seconds: float, version_end: bool) -> None:
-    """Record one successful Kafka publish (broker-ack semantics for the stub).
+    """Record one successful Kafka publish after broker acknowledgment.
 
     Args:
         latency_seconds: Observed produce latency.

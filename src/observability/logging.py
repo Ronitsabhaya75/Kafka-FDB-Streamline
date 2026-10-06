@@ -47,17 +47,16 @@ def audit_version_end(
     fdb_version: int,
     mutation_count: int,
     duration_seconds: float,
-    topic: str | None = None,
-    partition: int | None = None,
 ) -> None:
-    """Emit the INFO audit line for one VersionEnd watermark.
+    """Emit an audit line for one VersionEnd after durable ack.
+
+    Idle watermarks (``mutation_count == 0``) log at DEBUG so quiet streams do
+    not spam INFO. Non-zero VersionEnds log at INFO.
 
     Args:
         fdb_version: Commit version of the VersionEnd.
-        mutation_count: Mutations flushed for that version (0 for idle watermark).
-        duration_seconds: Wall time for the poll cycle that produced it.
-        topic: Optional Kafka topic context.
-        partition: Optional Kafka partition context.
+        mutation_count: Mutations for that version (0 for idle watermark).
+        duration_seconds: Wall time from consume return through serialization.
     """
     payload: dict[str, Any] = {
         "event": "version_end_audit",
@@ -65,8 +64,8 @@ def audit_version_end(
         "mutation_count": mutation_count,
         "duration_seconds": duration_seconds,
     }
-    if topic is not None:
-        payload["topic"] = topic
-    if partition is not None:
-        payload["partition"] = partition
-    get_logger("streamline.audit").info(**payload)
+    logger = get_logger("streamline.audit")
+    if mutation_count == 0:
+        logger.debug(**payload)
+    else:
+        logger.info(**payload)
