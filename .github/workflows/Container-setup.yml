@@ -191,3 +191,82 @@ jobs:
                 tests/cdc/ \
                 -v
             '
+
+  test-kafka:
+    needs: build-and-verify
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download Docker image artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: fdb-cdc-ci-image
+
+      - name: Load Docker image
+        run: |
+          gunzip -c fdb-cdc-ci.tar.gz | docker load
+
+      - name: Run Kafka Producer Unit Tests inside FDB container
+        run: |
+          docker run --rm \
+            -v "${{ github.workspace }}:/workspace" \
+            -w /workspace \
+            -e HYPOTHESIS_PROFILE=ci \
+            fdb-cdc:ci \
+            bash -c '
+              set -e
+              pip3 install --break-system-packages -r requirements-dev.txt
+
+              echo "=== Running Kafka Producer Unit Tests ==="
+              PYTHONPATH=/workspace:/workspace/protobuf/gen \
+              python3 -m pytest \
+                tests/kafka/ \
+                -v
+            '
+
+      - name: Start Kafka broker
+        run: |
+          docker compose -f .devcontainer/docker-compose.yml up -d kafka
+          echo "Waiting for Kafka broker on localhost:9092..."
+          python3 -c '
+          import socket, time
+          for i in range(30):
+              try:
+                  with socket.create_connection(("localhost", 9092), timeout=1):
+                      print("Kafka is ready on port 9092!")
+                      break
+              except OSError:
+                  time.sleep(1)
+          else:
+              raise SystemExit("Timed out waiting for Kafka broker on localhost:9092")
+          '
+
+      - name: Run Kafka Live Integration Tests inside FDB container
+        run: |
+          docker run --rm \
+            --network host \
+            -v "${{ github.workspace }}:/workspace" \
+            -w /workspace \
+            -e HYPOTHESIS_PROFILE=ci \
+            -e KAFKA_INTEGRATION=1 \
+            -e KAFKA_BOOTSTRAP_SERVERS=localhost:9092 \
+            fdb-cdc:ci \
+            bash -c '
+              set -e
+              pip3 install --break-system-packages -r requirements-dev.txt
+
+              echo "=== Running Kafka Live Integration Tests ==="
+              PYTHONPATH=/workspace:/workspace/protobuf/gen \
+              python3 -m pytest \
+                tests/kafka/test_producer_integration.py \
+                -v -m integration
+            '
+
+      - name: Run Kafka Producer Console Smoke Script
+        run: |
+          python3 -m venv .venv
+          . .venv/bin/activate
+          pip install -r requirements-dev.txt
+          PYTHONPATH=.:protobuf/gen python3 scripts/kafka_producer_smoke.py --bootstrap-servers localhost:9092 --console-bootstrap-servers kafka:19092
