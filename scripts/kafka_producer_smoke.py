@@ -8,31 +8,8 @@ import time
 import uuid
 from collections.abc import Sequence
 
-from google.protobuf.timestamp_pb2 import Timestamp
-
-from fdbkafka.cdc.v1 import mutations_pb2
 from src.kafka import MutationProducer
-
-
-def _record(stream_name: str) -> mutations_pb2.FDBMutationRecord:
-    timestamp = Timestamp()
-    timestamp.GetCurrentTime()
-    return mutations_pb2.FDBMutationRecord(
-        stream_name=stream_name,
-        bridge_timestamp=timestamp,
-        mutation=mutations_pb2.FDBMutation(
-            version_index=mutations_pb2.FDBVersionIndex(
-                fdb_version=time.time_ns(), sequence_no=0
-            ),
-            single_key_mutation=mutations_pb2.FDBSingleKeyMutation(
-                key=b"smoke:key",
-                value=b"smoke:value",
-                mutation_type=(
-                    mutations_pb2.FDBSingleKeyMutation.MUTATION_TYPE_SET_VALUE
-                ),
-            ),
-        ),
-    )
+from tests.kafka.utils import build_set_mutation_record
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -58,7 +35,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     key = f"smoke-{uuid.uuid4().hex}".encode()
     producer = MutationProducer(args.bootstrap_servers)
-    producer.produce(args.topic, _record("smoke-stream"), key=key)
+    record = build_set_mutation_record(
+        stream="smoke-stream",
+        version=time.time_ns(),
+        seq=0,
+        key=b"smoke:key",
+        value=b"smoke:value",
+    )
+    producer.produce(args.topic, record, key=key)
     remaining = producer.flush(args.timeout)
     if remaining:
         raise RuntimeError(f"Kafka still has {remaining} undelivered message(s)")
@@ -84,22 +68,39 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--property",
         "print.key=true",
         "--property",
-        "print.value=false",
+        "print.value=true",
     ]
     result = subprocess.run(
         command,
         check=True,
         capture_output=True,
-        text=True,
         timeout=args.timeout + 5,
     )
-    expected_key = key.decode()
-    if expected_key not in result.stdout.splitlines():
-        raise RuntimeError(
-            f"console consumer did not receive key {expected_key!r}: {result.stdout!r}"
-        )
-    print(f"verified Protobuf record on {args.topic!r} with key {expected_key!r}")
-    return 0
+    stdout = result.stdout
+    if key not in stdout:
+        raise RuntimeError(f"console consumer did not receive key {key!r}")
+
+    for line in stdout.split(b"\n"):
+        line = line.rstrip(b"\r")
+        if line.startswith(key + b"\t"):
+            value_bytes = line[len(key) + 1 :]
+            from fdbkafka.cdc.v1 import mutations_pb2
+
+            parsed = mutations_pb2.FDBMutationRecord.FromString(value_bytes)
+            if parsed.stream_name != "smoke-stream":
+                raise RuntimeError(
+                    "Decoded Protobuf does not match expected stream_name: "
+                    f"{parsed.stream_name!r}"
+                )
+            print(
+                f"verified Protobuf record on {args.topic!r} "
+                f"with key {key.decode()!r}"
+            )
+            return 0
+
+    raise RuntimeError(
+        "Could not find and parse the protobuf value from console consumer output"
+    )
 
 
 if __name__ == "__main__":

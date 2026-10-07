@@ -33,6 +33,7 @@ def test_enforces_durability_config(producer_class: MagicMock) -> None:
     assert config["enable.idempotence"] is True
     assert config["max.in.flight.requests.per.connection"] == 5
     assert config["linger.ms"] == 20
+    assert config["enable.gapless.guarantee"] is True
 
 
 def test_produce_serializes_record_and_polls(producer_class: MagicMock) -> None:
@@ -97,3 +98,22 @@ def test_len_delegates_to_client(producer_class: MagicMock) -> None:
     producer = MutationProducer("broker:9092")
 
     assert len(producer) == 4
+
+
+def test_produce_raises_after_delivery_failure(producer_class: MagicMock) -> None:
+    kafka_client = producer_class.return_value
+    producer = MutationProducer("broker:9092")
+    producer.produce("mutations", mutations_pb2.FDBMutationRecord())
+
+    # Simulate a delivery error reported by a previous produce poll/callback
+    report = kafka_client.produce.call_args.kwargs["on_delivery"]
+    error = MagicMock(spec=KafkaError)
+    report(error, MagicMock())
+
+    # The next produce must immediately raise without attempting delivery
+    with pytest.raises(KafkaException) as raised:
+        producer.produce("mutations", mutations_pb2.FDBMutationRecord())
+
+    assert raised.value.args == (error,)
+    # The inner producer's produce method should not have been called a second time
+    assert kafka_client.produce.call_count == 1

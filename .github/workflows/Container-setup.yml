@@ -260,7 +260,7 @@ jobs:
               echo "=== Running Kafka Live Integration Tests ==="
               PYTHONPATH=/workspace:/workspace/protobuf/gen \
               python3 -m pytest \
-                tests/test_kafka_producer.py \
+                tests/kafka/test_producer_integration.py \
                 -v -m integration
             '
 

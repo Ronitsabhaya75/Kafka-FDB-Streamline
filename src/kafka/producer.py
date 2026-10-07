@@ -25,6 +25,7 @@ _MANDATORY_CONFIG: dict[str, Any] = {
     "enable.idempotence": True,
     # Safe with idempotence — librdkafka reorders internally.
     "max.in.flight.requests.per.connection": 5,
+    "enable.gapless.guarantee": True,
 }
 
 _DEFAULT_PERFORMANCE_CONFIG: dict[str, Any] = {
@@ -64,13 +65,7 @@ class MutationProducer:
         bootstrap_servers: str,
         extra_config: dict[str, Any] | None = None,
     ) -> None:
-        """Initialise the producer with mandatory durability settings.
-
-        Args:
-            bootstrap_servers: Kafka bootstrap server(s).
-            extra_config: Optional librdkafka overrides. Durability keys are
-                ignored.
-        """
+        """Initialise the producer with mandatory durability settings."""
         merged: dict[str, Any] = {
             "bootstrap.servers": bootstrap_servers,
             **_DEFAULT_PERFORMANCE_CONFIG,
@@ -107,6 +102,9 @@ class MutationProducer:
             on_delivery: Optional ``(err, msg)`` callback invoked when the
                 broker acknowledges (or permanently fails) this message.
         """
+        if self._delivery_errors:
+            raise KafkaException(self._delivery_errors[0])
+
         payload = record.SerializeToString()
         kwargs: dict[str, Any] = {
             "value": payload,
@@ -132,9 +130,7 @@ class MutationProducer:
         """
         remaining = self._producer.flush(timeout)
         if self._delivery_errors:
-            error = self._delivery_errors.pop(0)
-            self._delivery_errors.clear()
-            raise KafkaException(error)
+            raise KafkaException(self._delivery_errors[0])
         return remaining
 
     def __len__(self) -> int:

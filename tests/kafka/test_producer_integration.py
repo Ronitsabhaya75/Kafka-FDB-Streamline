@@ -10,13 +10,19 @@ Run explicitly inside the devcontainer:
 import os
 import time
 import uuid
+from collections.abc import Iterator
 
 import pytest
 from confluent_kafka import Consumer, KafkaException
-from google.protobuf.timestamp_pb2 import Timestamp
 
 from fdbkafka.cdc.v1 import mutations_pb2
 from src.kafka.producer import MutationProducer
+from tests.kafka.utils import (
+    build_batch_record,
+    build_set_mutation_record,
+    build_version_end_record,
+    make_timestamp,
+)
 
 BOOTSTRAP_SERVERS = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
 # Unique topic per test run avoids cross-run interference.
@@ -32,78 +38,6 @@ pytestmark = [
 
 
 # -- helpers ---------------------------------------------------------------
-
-
-def _make_timestamp() -> Timestamp:
-    ts = Timestamp()
-    ts.GetCurrentTime()
-    return ts
-
-
-def _build_set_mutation_record(
-    stream: str,
-    version: int,
-    seq: int,
-    key: bytes,
-    value: bytes,
-) -> mutations_pb2.FDBMutationRecord:
-    return mutations_pb2.FDBMutationRecord(
-        stream_name=stream,
-        bridge_timestamp=_make_timestamp(),
-        mutation=mutations_pb2.FDBMutation(
-            version_index=mutations_pb2.FDBVersionIndex(
-                fdb_version=version,
-                sequence_no=seq,
-            ),
-            single_key_mutation=mutations_pb2.FDBSingleKeyMutation(
-                key=key,
-                value=value,
-                mutation_type=mutations_pb2.FDBSingleKeyMutation.MutationType.MUTATION_TYPE_SET_VALUE,
-            ),
-        ),
-    )
-
-
-def _build_version_end_record(
-    stream: str,
-    version: int,
-    total: int,
-) -> mutations_pb2.FDBMutationRecord:
-    return mutations_pb2.FDBMutationRecord(
-        stream_name=stream,
-        bridge_timestamp=_make_timestamp(),
-        version_end=mutations_pb2.VersionEnd(
-            fdb_version=version,
-            total_mutations=total,
-            bridge_timestamp=_make_timestamp(),
-        ),
-    )
-
-
-def _build_batch_record(
-    stream: str,
-    version: int,
-    count: int,
-) -> mutations_pb2.FDBMutationRecord:
-    mutations = [
-        mutations_pb2.FDBMutation(
-            version_index=mutations_pb2.FDBVersionIndex(
-                fdb_version=version,
-                sequence_no=i,
-            ),
-            single_key_mutation=mutations_pb2.FDBSingleKeyMutation(
-                key=f"batch:{i}".encode(),
-                value=f"val:{i}".encode(),
-                mutation_type=mutations_pb2.FDBSingleKeyMutation.MutationType.MUTATION_TYPE_SET_VALUE,
-            ),
-        )
-        for i in range(count)
-    ]
-    return mutations_pb2.FDBMutationRecord(
-        stream_name=stream,
-        bridge_timestamp=_make_timestamp(),
-        batch=mutations_pb2.FDBMutationBatch(mutations=mutations),
-    )
 
 
 def _consume_n(consumer: Consumer, n: int, timeout: float = 15.0) -> list[bytes]:
@@ -131,7 +65,7 @@ def producer() -> MutationProducer:
 
 
 @pytest.fixture(scope="module")
-def consumer() -> Consumer:
+def consumer() -> Iterator[Consumer]:
     c = Consumer(
         {
             "bootstrap.servers": BOOTSTRAP_SERVERS,
@@ -147,36 +81,13 @@ def consumer() -> Consumer:
 # -- tests -----------------------------------------------------------------
 
 
-class TestProducerConfig:
-    """Verify that MutationProducer enforces the mandatory config."""
-
-    def test_cannot_weaken_acks(self) -> None:
-        """Callers passing acks=1 must still get acks=all."""
-        p = MutationProducer(
-            BOOTSTRAP_SERVERS,
-            extra_config={"acks": "1"},
-        )
-        # We can't inspect internal config directly, but producing
-        # without error confirms the producer initialised successfully
-        # with the mandatory overrides applied.
-        assert p is not None
-
-    def test_custom_linger_ms(self) -> None:
-        """Performance knobs like linger.ms should be overridable."""
-        p = MutationProducer(
-            BOOTSTRAP_SERVERS,
-            extra_config={"linger.ms": 50},
-        )
-        assert p is not None
-
-
 class TestProduceAndConsume:
     """End-to-end produce → consume → deserialise round-trip."""
 
     def test_single_mutation_roundtrip(
         self, producer: MutationProducer, consumer: Consumer
     ) -> None:
-        record = _build_set_mutation_record(
+        record = build_set_mutation_record(
             stream="test-stream",
             version=100_000,
             seq=0,
@@ -199,7 +110,7 @@ class TestProduceAndConsume:
     def test_version_end_roundtrip(
         self, producer: MutationProducer, consumer: Consumer
     ) -> None:
-        record = _build_version_end_record(
+        record = build_version_end_record(
             stream="test-stream", version=100_000, total=5
         )
         producer.produce(TEST_TOPIC, record, key=b"test-stream")
@@ -216,7 +127,7 @@ class TestProduceAndConsume:
         self, producer: MutationProducer, consumer: Consumer
     ) -> None:
         batch_size = 25
-        record = _build_batch_record(
+        record = build_batch_record(
             stream="batch-stream", version=200_000, count=batch_size
         )
         producer.produce(TEST_TOPIC, record, key=b"batch-stream")
@@ -239,7 +150,7 @@ class TestProduceAndConsume:
         """Messages produced in order must be consumed in the same order."""
         count = 10
         for i in range(count):
-            record = _build_set_mutation_record(
+            record = build_set_mutation_record(
                 stream="order-test",
                 version=300_000,
                 seq=i,
@@ -260,7 +171,7 @@ class TestProduceAndConsume:
     ) -> None:
         record = mutations_pb2.FDBMutationRecord(
             stream_name="clear-test",
-            bridge_timestamp=_make_timestamp(),
+            bridge_timestamp=make_timestamp(),
             mutation=mutations_pb2.FDBMutation(
                 version_index=mutations_pb2.FDBVersionIndex(
                     fdb_version=400_000, sequence_no=0
