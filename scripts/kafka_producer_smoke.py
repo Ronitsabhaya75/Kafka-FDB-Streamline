@@ -8,6 +8,7 @@ import time
 import uuid
 from collections.abc import Sequence
 
+from fdbkafka.cdc.v1 import mutations_pb2
 from src.kafka import MutationProducer
 from tests.kafka.utils import build_set_mutation_record
 
@@ -77,30 +78,24 @@ def main(argv: Sequence[str] | None = None) -> int:
         timeout=args.timeout + 5,
     )
     stdout = result.stdout
-    if key not in stdout:
-        raise RuntimeError(f"console consumer did not receive key {key!r}")
+    # With --max-messages 1, stdout is exactly key + "\t" + value + "\n". The value
+    # is raw Protobuf and routinely contains 0x0A (every record starts with the
+    # field-1 tag byte), so it must be sliced by this framing, never split on lines.
+    prefix = key + b"\t"
+    start = stdout.find(prefix)
+    if start == -1 or not stdout.endswith(b"\n"):
+        raise RuntimeError(
+            f"console consumer output lacks a record for key {key!r}: {stdout!r}"
+        )
+    value_bytes = stdout[start + len(prefix) : -1]
 
-    for line in stdout.split(b"\n"):
-        line = line.rstrip(b"\r")
-        if line.startswith(key + b"\t"):
-            value_bytes = line[len(key) + 1 :]
-            from fdbkafka.cdc.v1 import mutations_pb2
-
-            parsed = mutations_pb2.FDBMutationRecord.FromString(value_bytes)
-            if parsed.stream_name != "smoke-stream":
-                raise RuntimeError(
-                    "Decoded Protobuf does not match expected stream_name: "
-                    f"{parsed.stream_name!r}"
-                )
-            print(
-                f"verified Protobuf record on {args.topic!r} "
-                f"with key {key.decode()!r}"
-            )
-            return 0
-
-    raise RuntimeError(
-        "Could not find and parse the protobuf value from console consumer output"
-    )
+    parsed = mutations_pb2.FDBMutationRecord.FromString(value_bytes)
+    if parsed != record:
+        raise RuntimeError(
+            f"decoded Protobuf does not match the produced record: {parsed!r}"
+        )
+    print(f"verified Protobuf record on {args.topic!r} with key {key.decode()!r}")
+    return 0
 
 
 if __name__ == "__main__":
