@@ -8,8 +8,19 @@ permissions:
   contents: read
 
 jobs:
-  build-and-verify:
+  test-containers:
+    name: container (${{ matrix.distro.name }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        distro:
+          - name: ubuntu-24.04
+            base: ubuntu:24.04
+          - name: rhel-9
+            base: redhat/ubi9:latest
+          - name: centos-stream-9
+            base: quay.io/centos/centos:stream9
 
     steps:
       - uses: actions/checkout@v4
@@ -17,22 +28,24 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Build FDB+CDC Docker image
+      - name: Build FDB+CDC Docker image (${{ matrix.distro.name }})
         uses: docker/build-push-action@v6
         with:
           context: .
           file: ./Dockerfile
+          build-args: |
+            BASE_IMAGE=${{ matrix.distro.base }}
           load: true
-          tags: fdb-cdc:ci
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          tags: fdb-cdc:${{ matrix.distro.name }}
+          cache-from: type=gha,scope=${{ matrix.distro.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.distro.name }}
 
-      - name: Verify FDB cluster, CDC bindings, and read/write
+      - name: Verify FDB cluster, CDC bindings, and read/write (${{ matrix.distro.name }})
         run: |
           docker run --rm \
             -v "${{ github.workspace }}:/workspace" \
             -w /workspace \
-            fdb-cdc:ci bash -c '
+            fdb-cdc:${{ matrix.distro.name }} bash -c '
               set -e
               echo "=== Checking binaries ==="
               which fdbserver && which fdbcli
@@ -63,43 +76,16 @@ jobs:
               echo "=== Verifying FDB read/write ==="
               python3 /workspace/scripts/verify_fdb_cluster.py
 
-              echo "=== Container setup verified ==="
+              echo "=== Container setup verified on ${{ matrix.distro.name }} ==="
             '
 
-      - name: Save Docker image
-        run: |
-          docker save fdb-cdc:ci | gzip -1 > fdb-cdc-ci.tar.gz
-
-      - name: Upload Docker image artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: fdb-cdc-ci-image
-          path: fdb-cdc-ci.tar.gz
-          retention-days: 1
-
-  test-protobuf:
-    needs: build-and-verify
-    runs-on: ubuntu-latest
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Download Docker image artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: fdb-cdc-ci-image
-
-      - name: Load Docker image
-        run: |
-          gunzip -c fdb-cdc-ci.tar.gz | docker load
-
-      - name: Run Protobuf tests inside FDB container
+      - name: Run Protobuf tests inside container (${{ matrix.distro.name }})
         run: |
           docker run --rm \
             -v "${{ github.workspace }}:/workspace" \
             -w /workspace \
             -e HYPOTHESIS_PROFILE=ci \
-            fdb-cdc:ci \
+            fdb-cdc:${{ matrix.distro.name }} \
             bash -c '
               set -e
               pip3 install --break-system-packages -r requirements-dev.txt
@@ -112,29 +98,13 @@ jobs:
                 -v
             '
 
-  test-serialization:
-    needs: build-and-verify
-    runs-on: ubuntu-latest
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Download Docker image artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: fdb-cdc-ci-image
-
-      - name: Load Docker image
-        run: |
-          gunzip -c fdb-cdc-ci.tar.gz | docker load
-
-      - name: Run Serialization tests inside FDB container
+      - name: Run Serialization tests inside container (${{ matrix.distro.name }})
         run: |
           docker run --rm \
             -v "${{ github.workspace }}:/workspace" \
             -w /workspace \
             -e HYPOTHESIS_PROFILE=ci \
-            fdb-cdc:ci \
+            fdb-cdc:${{ matrix.distro.name }} \
             bash -c '
               set -e
               pip3 install --break-system-packages -r requirements-dev.txt
@@ -148,29 +118,14 @@ jobs:
                 -v
             '
 
-  test-cdc-mutations:
-    needs: build-and-verify
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Download Docker image artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: fdb-cdc-ci-image
-
-      - name: Load Docker image
-        run: |
-          gunzip -c fdb-cdc-ci.tar.gz | docker load
-
-      - name: Run CDC Mutations tests inside FDB container
+      - name: Run CDC Mutation tests inside container (${{ matrix.distro.name }})
         run: |
           docker run --rm \
             -v "${{ github.workspace }}:/workspace" \
             -w /workspace \
             -e HYPOTHESIS_PROFILE=ci \
             -e FDB_CDC_INTEGRATION=1 \
-            fdb-cdc:ci \
+            fdb-cdc:${{ matrix.distro.name }} \
             bash -c '
               set -e
               pip3 install --break-system-packages -r requirements-dev.txt
@@ -183,3 +138,30 @@ jobs:
                 tests/cdc/ \
                 -v
             '
+
+  test-native-clients:
+    name: test-native (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, macos-13, windows-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Run client unit tests
+        env:
+          HYPOTHESIS_PROFILE: ci
+        run: pytest -m "not integration" -v
