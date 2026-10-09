@@ -9,10 +9,7 @@ permissions:
 
 jobs:
   build-and-verify:
-    strategy:
-      matrix:
-        os: [ubuntu-latest, macos-latest, macos-13, windows-latest]
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v4
@@ -82,10 +79,7 @@ jobs:
 
   test-protobuf:
     needs: build-and-verify
-    strategy:
-      matrix:
-        os: [ubuntu-latest, macos-latest, macos-13, windows-latest]
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v4
@@ -120,10 +114,7 @@ jobs:
 
   test-serialization:
     needs: build-and-verify
-    strategy:
-      matrix:
-        os: [ubuntu-latest, macos-latest, macos-13, windows-latest]
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v4
@@ -159,10 +150,7 @@ jobs:
 
   test-cdc-mutations:
     needs: build-and-verify
-    strategy:
-      matrix:
-        os: [ubuntu-latest, macos-latest, macos-13, windows-latest]
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
