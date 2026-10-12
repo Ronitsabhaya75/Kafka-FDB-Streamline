@@ -61,6 +61,14 @@ class FDBMutationListener:
     A listener permits only one unacknowledged native reply at a time. Callers must
     durably publish and checkpoint every record returned by :meth:`poll_records`
     before calling :meth:`acknowledge`.
+
+    Idle replies (no version groups, advanced watermark) normally each yield a
+    watermark ``VersionEnd`` that must be acknowledged. Setting
+    ``idle_ack_max_replies`` or ``idle_ack_max_seconds`` coalesces them: idle
+    replies return ``[]`` without needing an ack until a threshold is reached, then
+    one ``VersionEnd`` at the latest watermark is returned. Downstream therefore
+    sees idle heartbeats less often. Skipped progress is not acknowledged, so a
+    listener closed mid-window re-consumes it as empty after resume.
     """
 
     def __init__(
@@ -74,6 +82,8 @@ class FDBMutationListener:
         max_record_bytes: int = DEFAULT_MAX_RECORD_BYTES,
         resume_timeout_seconds: float = DEFAULT_RESUME_TIMEOUT_SECONDS,
         resume_poll_interval_seconds: float = DEFAULT_RESUME_POLL_INTERVAL_SECONDS,
+        idle_ack_max_replies: int | None = None,
+        idle_ack_max_seconds: float | None = None,
     ) -> None:
         """Initialize a CDC listener.
 
@@ -90,6 +100,12 @@ class FDBMutationListener:
             resume_timeout_seconds: Maximum wait for the cluster read version to
                 reach a resumed cursor.
             resume_poll_interval_seconds: Delay between resume read-version checks.
+            idle_ack_max_replies: Optional count of consecutive idle replies,
+                including the current one, at which a coalesced watermark is
+                returned. ``None`` disables the count threshold.
+            idle_ack_max_seconds: Optional time since the last ack, start, or
+                resume after which an idle reply returns a coalesced watermark.
+                Checked only when a reply arrives. ``None`` disables it.
 
         Raises:
             TypeError: If a numeric configuration value has an invalid type.
@@ -113,6 +129,18 @@ class FDBMutationListener:
             raise TypeError("resume_poll_interval_seconds must be numeric")
         if resume_poll_interval_seconds <= 0:
             raise ValueError("resume_poll_interval_seconds must be positive")
+        if idle_ack_max_replies is not None:
+            if type(idle_ack_max_replies) is not int:
+                raise TypeError("idle_ack_max_replies must be an integer")
+            if idle_ack_max_replies < 1:
+                raise ValueError("idle_ack_max_replies must be positive")
+        if idle_ack_max_seconds is not None:
+            if not isinstance(idle_ack_max_seconds, (int, float)) or isinstance(
+                idle_ack_max_seconds, bool
+            ):
+                raise TypeError("idle_ack_max_seconds must be numeric")
+            if idle_ack_max_seconds <= 0:
+                raise ValueError("idle_ack_max_seconds must be positive")
 
         self.client = client
         self.raw_stream_name = _to_bytes(stream_name)
@@ -128,6 +156,12 @@ class FDBMutationListener:
         self._is_closed = False
         self._awaiting_ack = False
         self._delivery_failed = False
+        self.idle_ack_max_replies = idle_ack_max_replies
+        self.idle_ack_max_seconds = (
+            float(idle_ack_max_seconds) if idle_ack_max_seconds is not None else None
+        )
+        self._skipped_idle_replies = 0
+        self._idle_window_start = 0.0
 
     def start(self) -> None:
         """Register when requested, then create or safely resume the consumer."""
@@ -143,6 +177,7 @@ class FDBMutationListener:
 
         if self.initial_cursor is None:
             self._consumer = self.client.create_cdc_consumer(self.raw_stream_name)
+            self._reset_idle_window()
             return
 
         consumer = self.client.resume_cdc_consumer(self.initial_cursor)
@@ -153,6 +188,7 @@ class FDBMutationListener:
             self._consumer = None
             consumer.close()
             raise
+        self._reset_idle_window()
 
     def _reconcile_resumed_consumer(self) -> None:
         """Wait for the cursor version to be readable, then restore its ack."""
@@ -206,14 +242,18 @@ class FDBMutationListener:
 
         Each version group produces one or more mutation batches followed by its
         ``VersionEnd``. If the reply watermark advances beyond its last group, an
-        additional empty ``VersionEnd`` preserves that progress. Any non-empty
-        result requires an explicit acknowledgement before another poll.
+        additional empty ``VersionEnd`` preserves that progress. When idle
+        coalescing is enabled, an idle reply below both thresholds returns ``[]``;
+        reaching either returns one ``VersionEnd`` at the latest watermark. Any
+        non-empty result requires an explicit acknowledgement before another poll;
+        an empty one does not.
 
         Args:
             bridge_timestamp_ns: Optional record timestamp in Unix nanoseconds.
 
         Returns:
-            Ordered mutation-batch and version-end records for one native reply.
+            Ordered mutation-batch and version-end records for one native reply,
+            or ``[]`` if there is nothing to deliver yet.
 
         Raises:
             CDCError: If another reply is unacknowledged, or prior serialization
@@ -243,6 +283,9 @@ class FDBMutationListener:
             last_group_version = version_group.version
 
         watermark = getattr(batch, "last_consumed_version", -1)
+        if not serialized and watermark >= 0 and self._skip_idle_reply():
+            self._delivery_failed = False
+            return []
         if watermark >= 0 and watermark > last_group_version:
             watermark_record = serialize_version_end(
                 fdb_version=watermark,
@@ -269,6 +312,23 @@ class FDBMutationListener:
         self._awaiting_ack = bool(records)
         return records
 
+    def _reset_idle_window(self) -> None:
+        """Start a new idle-coalescing window from the current acked position."""
+        self._skipped_idle_replies = 0
+        self._idle_window_start = time.monotonic()
+
+    def _skip_idle_reply(self) -> bool:
+        """Count one idle reply and report whether its watermark may go unacked."""
+        max_replies = self.idle_ack_max_replies
+        max_seconds = self.idle_ack_max_seconds
+        if max_replies is None and max_seconds is None:
+            return False
+        self._skipped_idle_replies += 1
+        if max_replies is not None and self._skipped_idle_replies >= max_replies:
+            return False
+        elapsed = time.monotonic() - self._idle_window_start
+        return max_seconds is None or elapsed < max_seconds
+
     def acknowledge(self) -> None:
         """Acknowledge the last fully delivered reply after durable processing.
 
@@ -293,6 +353,7 @@ class FDBMutationListener:
                 raise CDCConsumerClosedError("CDC consumer is closed.") from exc
             _raise_consume_failure(exc, "acknowledge CDC position")
         self._awaiting_ack = False
+        self._reset_idle_window()
 
     def get_position(self) -> Any:
         """Return the native cursor for the current consumer position."""
