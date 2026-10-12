@@ -4,7 +4,8 @@ Produces Protobuf-serialised FDBMutationRecord messages to a local Kafka
 topic, then consumes and deserialises them to verify the full round-trip.
 
 Run explicitly inside the devcontainer:
-    KAFKA_INTEGRATION=1 pytest tests/test_kafka_producer.py -v -m integration
+    KAFKA_INTEGRATION=1 pytest tests/kafka/test_producer_integration.py \
+        -v -m integration
 """
 
 import os

@@ -1,8 +1,9 @@
 """Kafka producer wrapper enforcing ordered, idempotent delivery.
 
-The critical durability knobs (``acks``, idempotence, in-flight limit) are
-set here and cannot be overridden by callers. This producer does not create
-Kafka transactions, so it does not provide end-to-end exactly-once delivery.
+The critical durability knobs (``acks``, idempotence, in-flight limit,
+gapless guarantee) are set here and cannot be overridden by callers. This
+producer does not create Kafka transactions, so it does not provide end-to-end
+exactly-once delivery.
 """
 
 from __future__ import annotations
@@ -37,7 +38,9 @@ _DEFAULT_PERFORMANCE_CONFIG: dict[str, Any] = {
 def _default_error_cb(err: KafkaError) -> None:
     """Log asynchronous client and broker errors.
 
-    Per-message delivery failures are surfaced by :meth:`MutationProducer.flush`.
+    Per-message delivery failures are not handled here: they are recorded by the
+    delivery callback and raised by every later :meth:`MutationProducer.produce`
+    and :meth:`MutationProducer.flush`.
 
     Args:
         err: Error reported by librdkafka.
@@ -101,6 +104,11 @@ class MutationProducer:
                 mutations for a directory land on the same partition.
             on_delivery: Optional ``(err, msg)`` callback invoked when the
                 broker acknowledges (or permanently fails) this message.
+
+        Raises:
+            KafkaException: An earlier message permanently failed; the
+                producer is unusable and must be replaced.
+            BufferError: librdkafka's local queue is full.
         """
         if self._delivery_errors:
             raise KafkaException(self._delivery_errors[0])
