@@ -1,5 +1,6 @@
 {
   "dev.containers.dockerPath": "docker",
   "dev.containers.dockerComposePath": "docker-compose",
-  "docker.dockerPath": "docker"
+  "docker.dockerPath": "docker",
+  "containers.containerCommand": "docker"
 }

@@ -1,43 +1,35 @@
-FROM --platform=linux/amd64 foundationdb/build:rockylinux9-latest AS builder
+FROM --platform=linux/amd64 ubuntu:24.04
 
-WORKDIR /build
-
-RUN git clone https://github.com/apple/foundationdb.git /fdb
-
-RUN cd /fdb && \
-    mkdir build && \
-    cd build && \
-    cmake -G Ninja \
-    -DCMAKE_BUILD_TYPE=Release \
-    -DCMAKE_C_COMPILER=clang \
-    -DCMAKE_CXX_COMPILER=clang++ \
-    -DUSE_JEMALLOC=OFF \
-    -DCMAKE_POLICY_DEFAULT_CMP0028=OLD \
-    .. && \
-    ninja fdbserver fdbcli fdb_c python_binding fdb_python_options
-
-FROM --platform=linux/amd64 ubuntu:24.04 AS runtime
+ARG FDB_VERSION=8.0.0
+ARG FDB_RELEASE_URL=https://github.com/apple/foundationdb/releases/download/${FDB_VERSION}
+ARG FDBSERVER_SHA256=9ca9b1514650c3085eaf9a82f329d4dcc036a73ab2bb1fc9696ae2aa72033063
+ARG FDBCLI_SHA256=912aeaa01bb25392c6460b0450d2905245cccc58863e658d171216b12e02f2ba
+ARG LIBFDB_C_SHA256=91ebcb6ca043b11cb840c95037699604674bce584dd71bd7b4e8bfcdacbed022
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl ca-certificates \
     python3 python3-pip python3-venv \
     libssl3t64 liblz4-1 zlib1g \
     && rm -rf /var/lib/apt/lists/*
 
 RUN mkdir -p /var/lib/foundationdb/data \
     /var/log/foundationdb \
-    /etc/foundationdb \
-    /opt/fdb-python
+    /etc/foundationdb
 
-COPY --from=builder /fdb/build/bin/fdbserver /usr/local/bin/
-COPY --from=builder /fdb/build/bin/fdbcli /usr/local/bin/
-COPY --from=builder /fdb/build/lib/libfdb_c.so /usr/local/lib/
-COPY --from=builder /fdb/build/bindings/python /opt/fdb-python
+# Download prebuilt FoundationDB 8.0.0 x86_64 binaries and client library
+RUN curl -fsSL -o /usr/local/bin/fdbserver "${FDB_RELEASE_URL}/fdbserver.x86_64" && \
+    curl -fsSL -o /usr/local/bin/fdbcli "${FDB_RELEASE_URL}/fdbcli.x86_64" && \
+    curl -fsSL -o /usr/local/lib/libfdb_c.so "${FDB_RELEASE_URL}/libfdb_c.x86_64.so" && \
+    printf '%s  %s\n' \
+      "$FDBSERVER_SHA256" /usr/local/bin/fdbserver \
+      "$FDBCLI_SHA256" /usr/local/bin/fdbcli \
+      "$LIBFDB_C_SHA256" /usr/local/lib/libfdb_c.so \
+      | sha256sum -c - && \
+    chmod +x /usr/local/bin/fdbserver /usr/local/bin/fdbcli && \
+    ldconfig
 
-RUN chmod +x /usr/local/bin/fdbserver /usr/local/bin/fdbcli
 
-RUN ldconfig
-
-RUN cd /opt/fdb-python && pip3 install --break-system-packages --verbose .
+RUN pip3 install --break-system-packages --no-cache-dir foundationdb==${FDB_VERSION}
 
 ENV FDB_CLUSTER_FILE=/etc/foundationdb/fdb.cluster
 ENV LD_LIBRARY_PATH=/usr/local/lib
