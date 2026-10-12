@@ -499,7 +499,13 @@ def test_close_mid_idle_window_then_resume_reacks_cursor_and_coalesces_afresh() 
     resumed.acknowledge()
 
     assert _version_ends(flushed) == [(800, 0)]
-    assert resumed_consumer.acknowledge.return_value.wait.call_count == 2
+    assert _consume_and_ack_order(resumed_consumer) == [
+        "acknowledge().wait",
+        "consume().wait",
+        "consume().wait",
+        "consume().wait",
+        "acknowledge().wait",
+    ]
 
 
 def _consume_and_ack_order(consumer: MagicMock) -> list[str]:
@@ -512,7 +518,7 @@ def _consume_and_ack_order(consumer: MagicMock) -> list[str]:
 
 def test_data_reply_acks_once_at_its_own_frontier_after_skipped_idles() -> None:
     data = MockConsumeResult(
-        [MockVersionGroup(300, [MockCdcMutation(0, b"key", b"value")])], 300
+        [MockVersionGroup(300, [MockCdcMutation(0, b"key", b"value")])], 350
     )
     listener, _, consumer = _listener_with_batches(
         [MockConsumeResult([], 100), MockConsumeResult([], 200), data],
@@ -525,7 +531,7 @@ def test_data_reply_acks_once_at_its_own_frontier_after_skipped_idles() -> None:
     listener.acknowledge()
 
     assert records[-1].HasField("version_end")
-    assert _version_ends(records) == [(300, 1)]
+    assert _version_ends(records) == [(300, 1), (350, 0)]
     assert _consume_and_ack_order(consumer) == [
         "consume().wait",
         "consume().wait",
