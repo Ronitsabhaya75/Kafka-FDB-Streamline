@@ -14,7 +14,9 @@ Wire FDB Listener into Kafka Mutation Producer.
 
 ## 1. Guarantees
 
-At-least-once delivery. Consumers drop duplicates by `(stream, commit version)`.
+At-least-once delivery. Consumers drop any record whose commit version is ≤ the highest
+seen for its stream. A replay can land after newer records, so exact-match dedup isn't
+enough.
 
 The checkpoint is an identity and integrity guard, not the only record of position.
 Every ack advances the stream's `min_version` in the cluster, and a fresh consumer on an
@@ -188,9 +190,60 @@ No row loses data. The worst case is redelivering one reply's records.
 - **Docker Compose:** `restart: unless-stopped`, one service, no `scale`.
 - **systemd:** `Restart=on-failure`, `RestartPreventExitStatus=2 3`.
 
-The write semantics' backwards-move guard is the only protection against two
-concurrent writers. It does not stop duplicate production. Active/passive fencing is
-not yet specified.
+**Two-writer window on node loss.** `Recreate` orders pods only during a rollout. When a
+node goes unreachable, k8s evicts its pods after 300 s (default `unreachable`
+toleration) and the ReplicaSet starts a replacement at once, even while the old pod is
+still Terminating ([Deployment docs](https://kubernetes.io/docs/concepts/workloads/controllers/deployment/#recreate-deployment)).
+If the old daemon is alive behind a partition, it runs until the partition heals. FDB
+rejects concurrent consumes but not interleaved ones
+([deep dive L4](CDC-DEEP-DIVE.md#3-known-limitations-and-gaps-deliverable-3)), so both
+can produce.
+
+A StatefulSet closes the window, with at most one pod per identity, but never replaces a
+pod on an unreachable node by itself. Failover then needs `kubectl delete pod --force`
+or the `node.kubernetes.io/out-of-service` taint (stable since 1.28), applied only once
+the node is confirmed down
+([force delete](https://kubernetes.io/docs/tasks/run-application/force-delete-stateful-set-pod/),
+[non-graceful shutdown](https://kubernetes.io/docs/concepts/cluster-administration/node-shutdown/#non-graceful-node-shutdown)).
+Which trade to accept is open (§7).
+
+Nothing fences two live daemons. The §3 backwards-move guard stops one on its next save,
+after it has already produced. See §4.7.
+
+### 4.7 Why restart, not standby
+
+Supervisor restart chosen over active/passive (§7). On ambiguity the daemon exits rather
+than guess, so availability is whatever the supervisor's restart gives.
+
+A standby buys little:
+
+- At-least-once already accepts duplicates, and preventing duplicates is most of what
+  fencing does.
+- Position lives in the cluster. A fresh consumer resumes at last ack + 1, so a standby
+  holds nothing a restart lacks.
+- On a process crash, the common case, a restart takes seconds plus the ≤ 6 s
+  first-consume retry (§4.3). A takeover waits out the same proxy lease plus its own
+  lease TTL.
+- A lease fences the checkpoint, not a zombie's Kafka produce. That needs a transactional
+  producer, which is out of scope.
+
+What it costs:
+
+- Node loss fails over only as fast as the platform. On k8s that's ≥ 5 min with a
+  two-writer window, or a manual step (§4.6). Single-host systemd never fails over.
+- Two live daemons produce duplicates interleaved out of version order. Consumers absorb
+  this only with the §1 dedup rule.
+- Downtime pins FDB, not just Kafka lag. Unacked history pins the TLog disk queue for
+  every tag on those TLogs. A long outage or exit-3 loop can trip Ratekeeper and halt
+  every cluster commit
+  ([deep dive L3](CDC-DEEP-DIVE.md#3-known-limitations-and-gaps-deliverable-3)). Alert on
+  exit 3 and on restart loops.
+
+Consumers see a pause during failover, never a gap.
+
+Revisit when node-loss failover must be automatic or retention pressure bites. Ship the
+lease together with the transactional producer. Alone it adds moving parts without
+closing the zombie-produce hole.
 
 ## 5. Store API
 
@@ -257,6 +310,9 @@ until the daemon lands. If 100% would need a non-deterministic test, the gate dr
 - **Active/passive fencing:** an FDB lease plus an owner token checked in the checkpoint
   transaction, for faster failover on node loss than platform rescheduling. It fences the
   checkpoint, not a zombie daemon's Kafka produce, which needs a transactional producer.
+  Trigger and trade-offs in §4.7.
+- **k8s workload type:** Deployment (automatic node failover, two-writer window) or
+  StatefulSet (one writer, manual node failover). §4.6.
 - **Atomic-MAX layout:** store the version under its own key, written with atomic `MAX`, if
   per-reply checkpoint latency is a bottleneck. This gives up the §3 guards.
 - **`reset-checkpoint` CLI:** wraps `CheckpointStore.delete()`.
