@@ -1,7 +1,7 @@
 # Checkpoint Spec
 
 Contract for durably checkpointing the CDC cursor in FoundationDB and for the run-loop
-ordering that makes restart safe.
+ordering that makes restart safe
 
 Trello: [FoundationDB Commit Version Checkpointing](https://trello.com/c/QmqdoJy5).
 Terms: [CDC consumer spec §1](CDC-CONSUMER-SPEC.md#1-scope--rules).
