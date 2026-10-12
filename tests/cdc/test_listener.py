@@ -1,5 +1,6 @@
 """Unit tests for the FoundationDB CDC listener."""
 
+import math
 from collections import namedtuple
 from unittest.mock import MagicMock, patch
 
@@ -461,6 +462,99 @@ def test_resume_starts_a_fresh_idle_window() -> None:
     assert _version_ends(flushed) == [(700, 0)]
 
 
+def test_close_mid_idle_window_then_resume_reacks_cursor_and_coalesces_afresh() -> None:
+    data = MockConsumeResult(
+        [MockVersionGroup(500, [MockCdcMutation(0, b"key", b"value")])], 500
+    )
+    first, client, first_consumer = _listener_with_batches(
+        [data, MockConsumeResult([], 600), MockConsumeResult([], 700)],
+        idle_ack_max_replies=3,
+    )
+    first.poll_records(bridge_timestamp_ns=1)
+    first.acknowledge()
+    assert first.poll_records(bridge_timestamp_ns=1) == []
+    assert first.poll_records(bridge_timestamp_ns=1) == []
+    first.close()
+
+    first_consumer.acknowledge.return_value.wait.assert_called_once()
+    first_consumer.close.assert_called_once()
+
+    resumed_consumer = MagicMock()
+    client.resume_cdc_consumer.return_value = resumed_consumer
+    client.get_read_version.return_value = 500
+    resumed_consumer.consume.return_value.wait.side_effect = [
+        MockConsumeResult([], version) for version in (600, 700, 800)
+    ]
+    cursor = MockCursor(42, 500)
+    resumed = FDBMutationListener(
+        client, "test-stream", cursor=cursor, idle_ack_max_replies=3
+    )
+    resumed.start()
+
+    client.resume_cdc_consumer.assert_called_once_with(cursor)
+    resumed_consumer.acknowledge.return_value.wait.assert_called_once()
+    assert resumed.poll_records(bridge_timestamp_ns=1) == []
+    assert resumed.poll_records(bridge_timestamp_ns=1) == []
+    flushed = resumed.poll_records(bridge_timestamp_ns=1)
+    resumed.acknowledge()
+
+    assert _version_ends(flushed) == [(800, 0)]
+    assert resumed_consumer.acknowledge.return_value.wait.call_count == 2
+
+
+def _consume_and_ack_order(consumer: MagicMock) -> list[str]:
+    return [
+        name
+        for name, _, _ in consumer.mock_calls
+        if name in ("consume().wait", "acknowledge().wait")
+    ]
+
+
+def test_data_reply_acks_once_at_its_own_frontier_after_skipped_idles() -> None:
+    data = MockConsumeResult(
+        [MockVersionGroup(300, [MockCdcMutation(0, b"key", b"value")])], 300
+    )
+    listener, _, consumer = _listener_with_batches(
+        [MockConsumeResult([], 100), MockConsumeResult([], 200), data],
+        idle_ack_max_replies=5,
+    )
+
+    assert listener.poll_records(bridge_timestamp_ns=1) == []
+    assert listener.poll_records(bridge_timestamp_ns=1) == []
+    records = listener.poll_records(bridge_timestamp_ns=1)
+    listener.acknowledge()
+
+    assert records[-1].HasField("version_end")
+    assert _version_ends(records) == [(300, 1)]
+    assert _consume_and_ack_order(consumer) == [
+        "consume().wait",
+        "consume().wait",
+        "consume().wait",
+        "acknowledge().wait",
+    ]
+
+
+def test_idle_flush_acks_once_at_latest_watermark() -> None:
+    listener, _, consumer = _listener_with_batches(
+        [MockConsumeResult([], version) for version in (100, 200, 300)],
+        idle_ack_max_replies=3,
+    )
+
+    assert listener.poll_records(bridge_timestamp_ns=1) == []
+    assert listener.poll_records(bridge_timestamp_ns=1) == []
+    flushed = listener.poll_records(bridge_timestamp_ns=1)
+    listener.acknowledge()
+
+    assert _version_ends(flushed) == [(300, 0)]
+    assert len(flushed) == 1
+    assert _consume_and_ack_order(consumer) == [
+        "consume().wait",
+        "consume().wait",
+        "consume().wait",
+        "acknowledge().wait",
+    ]
+
+
 @pytest.mark.parametrize(
     ("kwargs", "error"),
     [
@@ -472,6 +566,9 @@ def test_resume_starts_a_fresh_idle_window() -> None:
         ({"idle_ack_max_seconds": "5"}, TypeError),
         ({"idle_ack_max_seconds": 0}, ValueError),
         ({"idle_ack_max_seconds": -0.5}, ValueError),
+        ({"idle_ack_max_seconds": math.nan}, ValueError),
+        ({"idle_ack_max_seconds": math.inf}, ValueError),
+        ({"idle_ack_max_seconds": -math.inf}, ValueError),
     ],
 )
 def test_constructor_validates_idle_ack_thresholds(

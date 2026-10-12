@@ -1,5 +1,6 @@
 """FoundationDB CDC listener with explicit delivery and acknowledgement."""
 
+import math
 import time
 from typing import Any, Final, Self
 
@@ -109,7 +110,8 @@ class FDBMutationListener:
 
         Raises:
             TypeError: If a numeric configuration value has an invalid type.
-            ValueError: If both range forms are supplied or a value is not positive.
+            ValueError: If both range forms are supplied, a value is not positive,
+                or ``idle_ack_max_seconds`` is not finite.
         """
         if key_range is not None and subspace is not None:
             raise ValueError("Specify either key_range or subspace, not both")
@@ -139,6 +141,8 @@ class FDBMutationListener:
                 idle_ack_max_seconds, bool
             ):
                 raise TypeError("idle_ack_max_seconds must be numeric")
+            if not math.isfinite(idle_ack_max_seconds):
+                raise ValueError("idle_ack_max_seconds must be finite")
             if idle_ack_max_seconds <= 0:
                 raise ValueError("idle_ack_max_seconds must be positive")
 
@@ -283,7 +287,9 @@ class FDBMutationListener:
             last_group_version = version_group.version
 
         watermark = getattr(batch, "last_consumed_version", -1)
-        if not serialized and watermark >= 0 and self._skip_idle_reply():
+        if not serialized and watermark >= 0 and self._withhold_idle_watermark():
+            # Safe only because native ack is cumulative and this reply carries
+            # nothing but watermark progress; a later ack subsumes it.
             self._delivery_failed = False
             return []
         if watermark >= 0 and watermark > last_group_version:
@@ -317,7 +323,7 @@ class FDBMutationListener:
         self._skipped_idle_replies = 0
         self._idle_window_start = time.monotonic()
 
-    def _skip_idle_reply(self) -> bool:
+    def _withhold_idle_watermark(self) -> bool:
         """Count one idle reply and report whether its watermark may go unacked."""
         max_replies = self.idle_ack_max_replies
         max_seconds = self.idle_ack_max_seconds
