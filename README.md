@@ -11,6 +11,9 @@ make lint
 
 Requires Python 3.12. Commits must be signed — see [Signed commits](docs/conventions.md#signed-commits).
 
+Kafka producer behavior and local verification are documented in the
+[`Kafka producer specification`](docs/KAFKA-PRODUCER-SPEC.md).
+
 ## Contributing
 
 Repo layout, branching, code style and PR workflow: [`docs/conventions.md`](docs/conventions.md). Coding-agent guidance: [`AGENTS.md`](AGENTS.md).

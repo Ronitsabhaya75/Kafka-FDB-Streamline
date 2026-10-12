@@ -4,7 +4,10 @@ version = "0.1.0"
 description = "FoundationDB native CDC to Kafka bridge (UNT capstone)."
 readme = "README.md"
 requires-python = ">=3.12"
-dependencies = ["protobuf>=7.34,<8"]
+dependencies = [
+    "confluent-kafka>=2.6,<3",
+    "protobuf>=7.34,<8",
+]
 
 [tool.black]
 line-length = 88
@@ -47,7 +50,7 @@ testpaths = ["tests", "protobuf/tests"]
 pythonpath = [".", "protobuf/gen"]
 markers = [
   "slow: builds a ~10 MB version group; deselect with -m 'not slow'",
-  "integration: tests requiring a live FoundationDB cluster",
+  "integration: runs against a live local cluster or broker",
 ]
 addopts = [
   "-ra",
