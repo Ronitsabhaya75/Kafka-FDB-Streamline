@@ -1,7 +1,7 @@
 # Observability module spec
 
-Contract for `src/observability/` and the Kafka producer stub in `src/kafka/`.
-Trello:
+Contract for `src/observability/` and how it meets the Kafka producer in
+`src/kafka/`. Trello:
 [End-to-End Pipeline Telemetry, Healthz & Structured Audit Logging](https://trello.com/c/JENLbMhs).
 
 ## 1. Metrics (`GET /metrics` on `:9102`)
@@ -13,9 +13,9 @@ Trello:
 | `fdb_cdc_lag_versions` | Gauge | cached `get_read_version() - watermark` |
 | `fdb_serializer_bytes_out_total` | Counter | Serialized record sizes |
 | `fdb_serializer_errors_total` | Counter | `SerializationError` on serialize (then re-raise) |
-| `kafka_records_published_total` | Counter | real producer only (registered, unused by stub) |
-| `kafka_publish_latency_seconds` | Histogram | real producer only (registered, unused by stub) |
-| `kafka_version_end_markers_total` | Counter | real producer only (registered, unused by stub) |
+| `kafka_records_published_total` | Counter | registered; wired after broker ack |
+| `kafka_publish_latency_seconds` | Histogram | registered; wired after broker ack |
+| `kafka_version_end_markers_total` | Counter | registered; wired after broker ack |
 
 Opcode labels come from `MutationType(type_code).name`, or `TYPE_<n>` for unknown codes.
 
@@ -35,8 +35,8 @@ Background daemon thread (`start_http_server`), default bind `0.0.0.0:9102`:
 
 `FDBClient.open()` acquires one FDB readiness owner only after a successful
 `get_read_version()`. `close()` releases one owner. Kafka readiness stays false
-until a real producer can set it after a successful metadata fetch; the stub does
-not touch it.
+until `MutationProducer` sets it after a successful metadata fetch (not wired
+yet).
 
 HTTP server start and `configure_logging()` are wired by the daemon entrypoint
 (see stacked PR), not by importing this package.
