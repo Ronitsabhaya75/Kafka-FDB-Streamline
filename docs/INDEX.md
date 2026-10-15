@@ -11,5 +11,3 @@ Map of the project's docs. Check here before reading docs wholesale, then open o
 | [`KAFKA-PRODUCER-SPEC.md`](KAFKA-PRODUCER-SPEC.md) | `src.kafka.MutationProducer` contract, enforced idempotent-delivery settings, acknowledgement boundary, and local Kafka verification commands. |
 | [`SERIALIZATION-SPEC.md`](SERIALIZATION-SPEC.md) | `src/serialization/` contract: public API, wire mapping, input rules, errors and decode failures, reader contract for a version group |
 | [`CDC-CONSUMER-SPEC.md`](CDC-CONSUMER-SPEC.md) | `src/cdc/` contract: FDBClient, stream lifecycle, bounded record polling, safe resume and acknowledgement |
-| [`OBSERVABILITY-SPEC.md`](OBSERVABILITY-SPEC.md) | Metrics, `:9102` health endpoints, structured audit logging, Kafka produce instrumentation |
-| [`superpowers/specs/2026-09-28-pipeline-telemetry-design.md`](superpowers/specs/2026-09-28-pipeline-telemetry-design.md) | Design notes for the telemetry card (approach + acceptance mapping) |
