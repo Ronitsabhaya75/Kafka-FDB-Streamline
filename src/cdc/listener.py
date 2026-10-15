@@ -6,12 +6,21 @@ from typing import Any, Final, Self
 from fdbkafka.cdc.v1 import mutations_pb2
 from src.cdc.client import FDBClient, _raise_consume_failure, _to_bytes
 from src.cdc.errors import CDCConsumerClosedError, CDCError, CDCInvalidCursorError
+from src.observability import (
+    audit_version_end,
+    heartbeat,
+    record_cdc_versions,
+    record_mutation_polled,
+    record_serializer_bytes,
+    record_serializer_error,
+)
 from src.serialization import serialize_version_end, serialize_version_group
-from src.serialization.errors import RecordTooLargeError
+from src.serialization.errors import RecordTooLargeError, SerializationError
 
 DEFAULT_MAX_RECORD_BYTES: Final[int] = 1_000_000
 DEFAULT_RESUME_TIMEOUT_SECONDS: Final[float] = 10.0
 DEFAULT_RESUME_POLL_INTERVAL_SECONDS: Final[float] = 0.05
+DEFAULT_GRV_CACHE_TTL_SECONDS: Final[float] = 2.0
 
 
 def strinc(key: bytes) -> bytes:
@@ -128,6 +137,9 @@ class FDBMutationListener:
         self._is_closed = False
         self._awaiting_ack = False
         self._delivery_failed = False
+        self._grv_cache: int | None = None
+        self._grv_cache_monotonic: float = 0.0
+        self._pending_audits: list[tuple[int, int, float]] = []
 
     def start(self) -> None:
         """Register when requested, then create or safely resume the consumer."""
@@ -223,35 +235,51 @@ class FDBMutationListener:
             SerializationError: If a native mutation or record cannot be serialized.
         """
         batch = self._consume_batch()
+        # Duration is serialize work only — not the long-poll wait inside consume.
+        poll_started = time.perf_counter()
+        heartbeat()
         self._delivery_failed = True
         timestamp_ns = (
             bridge_timestamp_ns if bridge_timestamp_ns is not None else time.time_ns()
         )
 
+        watermark = -1
         serialized: list[bytes] = []
         last_group_version = -1
         for version_group in getattr(batch, "mutations", ()):
-            serialized.extend(
-                serialize_version_group(
+            for mutation in version_group.mutations:
+                record_mutation_polled(int(mutation.type))
+            try:
+                chunk = serialize_version_group(
                     version_group.mutations,
                     fdb_version=version_group.version,
                     max_record_bytes=self.max_record_bytes,
                     stream_name=self.stream_name,
                     bridge_timestamp_ns=timestamp_ns,
                 )
-            )
+            except SerializationError:
+                record_serializer_error()
+                raise
+            for payload in chunk:
+                record_serializer_bytes(len(payload))
+            serialized.extend(chunk)
             last_group_version = version_group.version
 
         watermark = getattr(batch, "last_consumed_version", -1)
         if watermark >= 0 and watermark > last_group_version:
-            watermark_record = serialize_version_end(
-                fdb_version=watermark,
-                total_mutations=0,
-                stream_name=self.stream_name,
-                bridge_timestamp_ns=timestamp_ns,
-            )
+            try:
+                watermark_record = serialize_version_end(
+                    fdb_version=watermark,
+                    total_mutations=0,
+                    stream_name=self.stream_name,
+                    bridge_timestamp_ns=timestamp_ns,
+                )
+            except SerializationError:
+                record_serializer_error()
+                raise
             if len(watermark_record) > self.max_record_bytes:
                 record_bytes = len(watermark_record)
+                record_serializer_error()
                 raise RecordTooLargeError(
                     f"watermark version end of version {watermark} needs a "
                     f"{record_bytes}-byte record; max_record_bytes is "
@@ -260,14 +288,48 @@ class FDBMutationListener:
                     record_bytes=record_bytes,
                     max_record_bytes=self.max_record_bytes,
                 )
+            record_serializer_bytes(len(watermark_record))
             serialized.append(watermark_record)
 
         records = [
             mutations_pb2.FDBMutationRecord.FromString(data) for data in serialized
         ]
+
+        if watermark >= 0:
+            record_cdc_versions(
+                latest=watermark,
+                cluster_read_version=self._cluster_read_version(),
+            )
+
+        duration = time.perf_counter() - poll_started
+        self._pending_audits = [
+            (
+                record.version_end.fdb_version,
+                record.version_end.total_mutations,
+                duration,
+            )
+            for record in records
+            if record.WhichOneof("record") == "version_end"
+        ]
+
         self._delivery_failed = False
         self._awaiting_ack = bool(records)
         return records
+
+    def _cluster_read_version(self) -> int | None:
+        """Return a cached cluster read version, refreshing every few seconds."""
+        now = time.monotonic()
+        if (
+            self._grv_cache is not None
+            and now - self._grv_cache_monotonic < DEFAULT_GRV_CACHE_TTL_SECONDS
+        ):
+            return self._grv_cache
+        try:
+            self._grv_cache = int(self.client.get_read_version())
+            self._grv_cache_monotonic = now
+            return self._grv_cache
+        except Exception:
+            return None
 
     def acknowledge(self) -> None:
         """Acknowledge the last fully delivered reply after durable processing.
@@ -293,6 +355,14 @@ class FDBMutationListener:
                 raise CDCConsumerClosedError("CDC consumer is closed.") from exc
             _raise_consume_failure(exc, "acknowledge CDC position")
         self._awaiting_ack = False
+        heartbeat()
+        for fdb_version, mutation_count, duration_seconds in self._pending_audits:
+            audit_version_end(
+                fdb_version=fdb_version,
+                mutation_count=mutation_count,
+                duration_seconds=duration_seconds,
+            )
+        self._pending_audits = []
 
     def get_position(self) -> Any:
         """Return the native cursor for the current consumer position."""
