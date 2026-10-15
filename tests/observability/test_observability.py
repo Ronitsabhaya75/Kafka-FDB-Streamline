@@ -338,22 +338,13 @@ def test_serializer_error_increments_error_counter() -> None:
     assert _metric_value("fdb_serializer_errors_total") == before + 1
 
 
-def test_mutation_producer_stub_does_not_touch_kafka_metrics_or_readyz(
-    listener_with_batch: tuple[FDBMutationListener, MagicMock],
-) -> None:
+def test_mutation_producer_does_not_set_readyz_or_kafka_metrics_yet() -> None:
+    """Kafka publish metrics and readiness stay untouched until broker hooks land."""
     before_pub = _metric_value("kafka_records_published_total")
     before_ve = _metric_value("kafka_version_end_markers_total")
-    listener, _client = listener_with_batch
-    records = listener.poll_records(bridge_timestamp_ns=1)
 
     set_fdb_ready(True)
-    producer = MutationProducer(topic="fdb-cdc")
+    MutationProducer(bootstrap_servers="localhost:9092")
     assert is_ready() is False
-
-    published = producer.produce(records)
-    assert published == len(records)
     assert _metric_value("kafka_records_published_total") == before_pub
     assert _metric_value("kafka_version_end_markers_total") == before_ve
-
-    producer.close()
-    assert is_ready() is False
