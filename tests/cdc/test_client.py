@@ -52,7 +52,6 @@ def test_fdb_client_open_and_close() -> None:
     mock_fdb = MagicMock()
     mock_fdb.get_api_version.return_value = 800
     mock_db = MagicMock()
-    mock_db.get_read_version.return_value = 1
     mock_fdb.open.return_value = mock_db
 
     with patch("src.cdc.client.fdb", mock_fdb):
@@ -73,7 +72,6 @@ def test_fdb_client_context_manager() -> None:
     mock_fdb = MagicMock()
     mock_fdb.get_api_version.return_value = 800
     mock_db = MagicMock()
-    mock_db.get_read_version.return_value = 1
     mock_fdb.open.return_value = mock_db
 
     with patch("src.cdc.client.fdb", mock_fdb):
@@ -86,7 +84,6 @@ def test_fdb_client_cdc_delegates() -> None:
     mock_fdb = MagicMock()
     mock_fdb.get_api_version.return_value = 800
     mock_db = MagicMock()
-    mock_db.get_read_version.return_value = 1
     mock_fdb.open.return_value = mock_db
 
     mock_db.register_cdc_stream.return_value.wait.return_value = 42
