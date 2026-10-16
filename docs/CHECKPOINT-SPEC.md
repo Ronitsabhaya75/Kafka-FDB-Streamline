@@ -31,6 +31,7 @@ What it adds is detection of a stream that is no longer the one this daemon cons
 |---|---|---|
 | Stream removed and re-registered under the same name | Fresh consumer starts at the new registration. Mutations committed in between are skipped silently. | `stream_id` mismatch, exit 3 |
 | Another consumer acked the stream | Fresh consumer starts past the foreign ack. Its replies never reach Kafka. | Resume at the stored cursor fails with `transaction_too_old` instead of skipping silently |
+| Two daemons on one stream, different sinks (topic or Kafka cluster) | Each sink misses every version the other daemon acked. Silent loss. | Sink mismatch, exit 3 before the second daemon acks |
 
 ## 2. Storage
 
@@ -40,8 +41,14 @@ What it adds is detection of a stream that is no longer the one this daemon cons
   durability comes from FDB itself.
 - **Key:** `dir.pack((stream_name,))`. The name is known before registration, unlike
   `stream_id`, so startup can find the checkpoint first.
-- **Value:** tuple-packed `(format_version, stream_id, last_consumed_version)`, where
+- **Value:** tuple-packed
+  `(format_version, stream_id, last_consumed_version, kafka_cluster_id, topic)`, where
   `format_version` is `1`. A decoder rejects any other format version.
+- **Sink identity:** `(kafka_cluster_id, topic)`. The cluster id comes from broker
+  metadata (`list_topics().cluster_id`), not `bootstrap.servers`, which can name one
+  cluster under several addresses. Acks advance one per-stream frontier
+  (`min_version`) whatever sink the acking daemon wrote to, so a checkpoint is only
+  valid for the sink that received everything up to its cursor.
 - **Overlap guard:** checkpoint writes must never be captured as mutations. At startup,
   if the checkpoint key or the directory-layer metadata (`\xfe`) falls inside any
   registered range of the stream, exit 3. Check `begin_key`/`end_key` now, and `ranges`
@@ -51,11 +58,13 @@ What it adds is detection of a stream that is no longer the one this daemon cons
 
 `save(stream_name, cursor)` is one `@fdb.transactional` function: read the stored
 record, apply the guards, then `set`. It is optimistic, not a lock. A concurrent writer
-conflicts and the transaction retries.
+conflicts and the transaction retries. Rows are checked in order; the sink row comes
+first so a second daemon on another sink is stopped before any version comparison.
 
 | Stored record, relative to the new cursor | Result |
 |---|---|
 | none | `set` |
+| different sink identity | `CheckpointSinkMismatchError(stored, attempted)` |
 | same `stream_id`, older version | `set` |
 | same `stream_id`, same version | No-op success, no `set`. Makes a retry after `commit_unknown_result` safe. |
 | same `stream_id`, newer version | `CheckpointRegressionError(stored, attempted)` |
@@ -66,7 +75,17 @@ Exhausting either raises `CheckpointWriteError`.
 
 `CheckpointError` is the base, separate from `CDCError`, and every subclass is fatal: the
 run loop exits 1 without acking (§4.3). The ack has not happened yet, so the cost is
-duplicates, never loss.
+duplicates, never loss. A sink or `stream_id` mismatch then exits 3 at the next startup
+(§4.2).
+
+The sink guard only works if every daemon on a stream reads the same checkpoint key, so
+the directory path (§2) must be the same for all deployments of a stream. Two daemons
+with different paths bypass the guard.
+
+Changing the sink on purpose (new topic, new cluster, DR cut-over) means
+`delete(stream_name)` first. The new sink then starts at last ack + 1 with no backfill.
+Backfilling it needs a baseline snapshot
+([deep dive §1.6](CDC-DEEP-DIVE.md#16-baseline-snapshot-and-handoff-)).
 
 ## 4. Failover
 
@@ -107,7 +126,9 @@ flowchart TD
     CEX -- no --> E2(["exit 3"])
     CEX -- yes --> SID{"stream_id matches<br/>checkpoint?"}
     SID -- no --> E3(["exit 3"])
-    SID -- yes --> RNG2{"Range matches prefix<br/>if one was given?"}
+    SID -- yes --> SNK{"Sink identity matches<br/>checkpoint?"}
+    SNK -- no --> E7(["exit 3"])
+    SNK -- yes --> RNG2{"Range matches prefix<br/>if one was given?"}
     RNG2 -- no --> E4(["exit 3"])
     RNG2 -- yes --> RES["resume_cdc_consumer(cursor)<br/>wait read version ≥ cursor, re-ack"]
 
@@ -124,7 +145,7 @@ flowchart TD
     FRESH --> LOOP
 
     classDef fatal fill:#fde2e2,stroke:#c0392b,color:#000
-    class E1,E2,E3,E4,E5,E6 fatal
+    class E1,E2,E3,E4,E5,E6,E7 fatal
 ```
 
 ### 4.3 Run loop
@@ -180,35 +201,46 @@ No row loses data. The worst case is redelivering one reply's records.
 | 0 | Clean shutdown (SIGINT/SIGTERM) | Stays down if stopped intentionally |
 | 1 | Runtime failure: flush, checkpoint, or ack | Restart with backoff |
 | 2 | Config or usage error | systemd: no restart. Docker/k8s: crash loop |
-| 3 | Operator action needed: stream missing, `stream_id` or range mismatch, overlap | systemd: no restart. Docker/k8s: crash loop, alert on the code |
+| 3 | Operator action needed: stream missing, `stream_id`, sink or range mismatch, overlap | systemd: no restart. Docker/k8s: crash loop, alert on the code |
 
 ### 4.6 Deployment requirements
 
-- **Kubernetes:** `replicas: 1` and `strategy: Recreate`, or a StatefulSet. Rolling
-  updates briefly run two daemons, and both would produce.
-  `terminationGracePeriodSeconds ≥ 60` covers the flush deadline plus the ack retry.
+- **Kubernetes:** a StatefulSet with `replicas: 1`, one per stream per environment.
+  `terminationGracePeriodSeconds ≥ 60` covers the flush deadline plus the ack retry. A
+  Deployment is not supported under either strategy: `RollingUpdate` runs two daemons on
+  every rollout, and `Recreate` orders pods only during a rollout, so node loss or a
+  partition can leave the old pod running beside its replacement
+  ([Deployment docs](https://kubernetes.io/docs/concepts/workloads/controllers/deployment/#recreate-deployment)).
 - **Docker Compose:** `restart: unless-stopped`, one service, no `scale`.
 - **systemd:** `Restart=on-failure`, `RestartPreventExitStatus=2 3`.
+- **Readers:** every reader applies the §1 version watermark. No compacted topics and no
+  readers that keep the last value per key by offset until the transactional producer
+  lands. Two daemons can place an older version after a newer one, and only the
+  watermark discards it.
 
-**Two-writer window on node loss.** `Recreate` orders pods only during a rollout. When a
-node goes unreachable, k8s evicts its pods after 300 s (default `unreachable`
-toleration) and the ReplicaSet starts a replacement at once, even while the old pod is
-still Terminating ([Deployment docs](https://kubernetes.io/docs/concepts/workloads/controllers/deployment/#recreate-deployment)).
-If the old daemon is alive behind a partition, it runs until the partition heals. FDB
-rejects concurrent consumes but not interleaved ones
-([deep dive L4](CDC-DEEP-DIVE.md#3-known-limitations-and-gaps-deliverable-3)), so both
-can produce.
+**Node loss.** A StatefulSet keeps at most one pod per identity, so it never replaces a
+pod on an unreachable node by itself
+([force delete](https://kubernetes.io/docs/tasks/run-application/force-delete-stateful-set-pod/)).
+Recovery is `kubectl delete pod --force` or the `node.kubernetes.io/out-of-service` taint
+([non-graceful shutdown](https://kubernetes.io/docs/concepts/cluster-administration/node-shutdown/#non-graceful-node-shutdown)),
+applied **only once the node is confirmed powered off**. Force-deleting a pod on a node
+that is only partitioned starts a second live daemon. Unattended failover needs a
+node-fencing operator that powers the node off before tainting it, e.g. Medik8s Node
+Healthcheck with
+[Fence Agents Remediation](https://github.com/medik8s/fence-agents-remediation). Until
+recovery, unacked history pins the TLogs (§4.7).
 
-A StatefulSet closes the window, with at most one pod per identity, but never replaces a
-pod on an unreachable node by itself. Failover then needs `kubectl delete pod --force`
-or the `node.kubernetes.io/out-of-service` taint (stable since 1.28), applied only once
-the node is confirmed down
-([force delete](https://kubernetes.io/docs/tasks/run-application/force-delete-stateful-set-pod/),
-[non-graceful shutdown](https://kubernetes.io/docs/concepts/cluster-administration/node-shutdown/#non-graceful-node-shutdown)).
-Which trade to accept is open (§7).
+**What two daemons do.** Nothing fences two live daemons. That leaves only operator error:
+an unconfirmed force delete, or a second release on the same stream. What happens then
+depends on the sink:
 
-Nothing fences two live daemons. The §3 backwards-move guard stops one on its next save,
-after it has already produced. See §4.7.
+| Two daemons write to | Outcome |
+|---|---|
+| The same sink | No loss. Duplicates arrive out of version order, and the §1 watermark absorbs them. One daemon exits on its next `save` (regression) or consume (`transaction_too_old` or `client_invalid_operation`). |
+| Different sinks | Without the §3 sink guard, each sink silently misses the other daemon's acked versions. With it, the second daemon to `save` exits before acking. |
+
+The §3 guards detect a second daemon; they do not prevent its produce. Fencing a zombie's
+produce needs the transactional producer (§4.7).
 
 ### 4.7 Why restart, not standby
 
@@ -229,8 +261,8 @@ A standby buys little:
 
 What it costs:
 
-- Node loss fails over only as fast as the platform. On k8s that's ≥ 5 min with a
-  two-writer window, or a manual step (§4.6). Single-host systemd never fails over.
+- Node loss fails over only as fast as the platform. On k8s that's a manual step, or a
+  node-fencing operator (§4.6). Single-host systemd never fails over.
 - Two live daemons produce duplicates interleaved out of version order. Consumers absorb
   this only with the §1 dedup rule.
 - Downtime pins FDB, not just Kafka lag. Unacked history pins the TLog disk queue for
@@ -255,6 +287,7 @@ class CheckpointStore:
         self,
         client: FDBClient,
         *,
+        sink: SinkIdentity,                             # (kafka_cluster_id, topic), §2
         path: tuple[str, ...] = ("fdb-kafka-bridge", "checkpoints"),
         timeout_s: float = 5.0,
         retry_limit: int = 10,
@@ -271,18 +304,23 @@ verified. If it can't, `load` returns a dataclass exposing `stream_id` and
 `last_consumed_version`, which `FDBClient.resume_cdc_consumer` already validates
 (`src/cdc/client.py`).
 
+`SinkIdentity` is a frozen dataclass of `kafka_cluster_id: str` and `topic: str`. The
+daemon builds it at startup from the configured topic and a new
+`MutationProducer.cluster_id()`, which reads `list_topics(timeout=...).cluster_id` and
+raises if the broker reports none.
+
 `resolve_startup(client, store, stream_name, key_range) -> (cursor | None, register)` lives
 in `src/bridge/` and runs the §4.2 checks. Its decision core takes plain values
-(checkpoint, stream list, configured prefix) so every branch can be unit-tested. The
-daemon builds the listener with `cursor=` and passes `key_range` only when `register` is
-true. The store is injected as `BridgeDaemon(..., checkpoint_store=)`.
+(checkpoint, stream list, configured prefix, sink identity) so every branch can be
+unit-tested. The daemon builds the listener with `cursor=` and passes `key_range` only
+when `register` is true. The store is injected as `BridgeDaemon(..., checkpoint_store=)`.
 
 ## 6. Tests
 
 | Area | Kind | Location |
 |---|---|---|
 | Value encode/decode | Unit | `tests/cdc/` |
-| §3 guards, deterministic stale writer (save V2 then V1), retry exhaustion via a tiny timeout | Live FDB, throwaway directory per test | `tests/cdc/` |
+| §3 guards, deterministic stale writer (save V2 then V1), sink mismatch (two stores, same path, different sinks), retry exhaustion via a tiny timeout | Live FDB, throwaway directory per test | `tests/cdc/` |
 | §4.3 order, exit codes, SIGTERM mid-reply, first-consume retry | Unit: fake listener, producer and store sharing one call log, failure injected at each step | `tests/bridge/` |
 | §4.4 crash points, one case per row | Live FDB: real CDC and store, in-memory producer. A crash is a raise at step N plus abandoning the listener; a second daemon resumes. | `tests/bridge/` |
 | §4.2 every branch, plus no write before exit 3 | Unit, with a store fake that records writes | `tests/bridge/` |
@@ -311,8 +349,6 @@ until the daemon lands. If 100% would need a non-deterministic test, the gate dr
   transaction, for faster failover on node loss than platform rescheduling. It fences the
   checkpoint, not a zombie daemon's Kafka produce, which needs a transactional producer.
   Trigger and trade-offs in §4.7.
-- **k8s workload type:** Deployment (automatic node failover, two-writer window) or
-  StatefulSet (one writer, manual node failover). §4.6.
 - **Atomic-MAX layout:** store the version under its own key, written with atomic `MAX`, if
   per-reply checkpoint latency is a bottleneck. This gives up the §3 guards.
 - **`reset-checkpoint` CLI:** wraps `CheckpointStore.delete()`.
@@ -325,13 +361,13 @@ These replace the original criteria on the Trello card. They correct the origina
 version-only checkpoint, its "+1" resume, its `\xff` subspace, and its ack-before-checkpoint
 order.
 
-- [ ] The checkpoint is the full cursor `(stream_id, last_consumed_version)`, stored per
-      §2. Never under `\xff`.
+- [ ] The checkpoint is the full cursor `(stream_id, last_consumed_version)` plus the
+      sink identity `(kafka_cluster_id, topic)`, stored per §2. Never under `\xff`.
 - [ ] Startup exits 3 if the checkpoint key or the directory metadata overlaps the
       stream's range.
 - [ ] `save()` follows §3: one optimistic transaction with the equal-version no-op, and
-      fatal `CheckpointError` subclasses for regression, `stream_id` mismatch and retry
-      exhaustion.
+      fatal `CheckpointError` subclasses for sink mismatch, regression, `stream_id`
+      mismatch and retry exhaustion.
 - [ ] The run loop follows §4.3: poll → produce → flush → `save(get_position())` → ack.
       A flush or checkpoint failure exits 1 without acking. The ack retries
       `CDCRetryableError` for ~30 s. SIGTERM finishes the polled reply. The first consume
