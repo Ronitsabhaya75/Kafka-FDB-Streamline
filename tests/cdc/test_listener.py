@@ -1,5 +1,6 @@
 """Unit tests for the FoundationDB CDC listener."""
 
+import math
 from collections import namedtuple
 from unittest.mock import MagicMock, patch
 
@@ -310,3 +311,282 @@ def test_acknowledge_maps_native_error_code() -> None:
         listener.acknowledge()
 
     assert excinfo.value.code == 1211
+
+
+def _listener_with_batches(
+    batches: list[MockConsumeResult],
+    **kwargs: object,
+) -> tuple[FDBMutationListener, MagicMock, MagicMock]:
+    """Build a listener whose native consumer returns ``batches`` in order."""
+    listener, client, consumer = _listener_with_batch(batches[0], **kwargs)
+    consumer.consume.return_value.wait.side_effect = batches
+    return listener, client, consumer
+
+
+def _version_ends(
+    records: list[object],
+) -> list[tuple[int, int]]:
+    return [
+        (record.version_end.fdb_version, record.version_end.total_mutations)
+        for record in records
+        if record.HasField("version_end")
+    ]
+
+
+def test_idle_replies_without_coalescing_each_emit_watermark_and_require_ack() -> None:
+    listener, _, consumer = _listener_with_batches(
+        [MockConsumeResult([], 100), MockConsumeResult([], 200)]
+    )
+
+    first = listener.poll_records(bridge_timestamp_ns=1)
+    with pytest.raises(CDCError, match="acknowledged before polling"):
+        listener.poll_records()
+    listener.acknowledge()
+    second = listener.poll_records(bridge_timestamp_ns=1)
+    listener.acknowledge()
+
+    assert _version_ends(first) == [(100, 0)]
+    assert _version_ends(second) == [(200, 0)]
+    assert consumer.acknowledge.return_value.wait.call_count == 2
+
+
+def test_idle_reply_below_threshold_is_skipped_without_ack() -> None:
+    listener, _, consumer = _listener_with_batches(
+        [MockConsumeResult([], 100), MockConsumeResult([], 200)],
+        idle_ack_max_replies=3,
+    )
+
+    assert listener.poll_records(bridge_timestamp_ns=1) == []
+    assert listener.poll_records(bridge_timestamp_ns=1) == []
+
+    with pytest.raises(CDCError, match="awaiting acknowledgement"):
+        listener.acknowledge()
+    consumer.acknowledge.assert_not_called()
+
+
+def test_idle_replies_flush_one_watermark_at_reply_threshold() -> None:
+    listener, _, consumer = _listener_with_batches(
+        [MockConsumeResult([], version) for version in (100, 200, 300, 400, 500)],
+        idle_ack_max_replies=3,
+    )
+
+    assert listener.poll_records(bridge_timestamp_ns=1) == []
+    assert listener.poll_records(bridge_timestamp_ns=1) == []
+    flushed = listener.poll_records(bridge_timestamp_ns=1)
+    with pytest.raises(CDCError, match="acknowledged before polling"):
+        listener.poll_records()
+    listener.acknowledge()
+
+    assert _version_ends(flushed) == [(300, 0)]
+    assert len(flushed) == 1
+    consumer.acknowledge.return_value.wait.assert_called_once()
+    assert listener.poll_records(bridge_timestamp_ns=1) == []
+    assert listener.poll_records(bridge_timestamp_ns=1) == []
+
+
+def test_idle_replies_flush_one_watermark_when_time_threshold_elapses() -> None:
+    listener, _, consumer = _listener_with_batches(
+        [MockConsumeResult([], version) for version in (100, 200, 300)],
+        idle_ack_max_seconds=5.0,
+    )
+
+    with patch("src.cdc.listener.time.monotonic") as clock:
+        clock.return_value = 0.0
+        listener.start()
+        clock.return_value = 4.9
+        assert listener.poll_records(bridge_timestamp_ns=1) == []
+        clock.return_value = 5.0
+        flushed = listener.poll_records(bridge_timestamp_ns=1)
+        listener.acknowledge()
+        clock.return_value = 9.9
+        after_ack = listener.poll_records(bridge_timestamp_ns=1)
+
+    assert _version_ends(flushed) == [(200, 0)]
+    assert after_ack == []
+    consumer.acknowledge.return_value.wait.assert_called_once()
+
+
+def test_data_reply_after_skipped_idles_is_delivered_and_resets_window() -> None:
+    data = MockConsumeResult(
+        [MockVersionGroup(300, [MockCdcMutation(0, b"key", b"value")])], 350
+    )
+    listener, _, consumer = _listener_with_batches(
+        [
+            MockConsumeResult([], 100),
+            MockConsumeResult([], 200),
+            data,
+            MockConsumeResult([], 400),
+            MockConsumeResult([], 500),
+        ],
+        idle_ack_max_replies=3,
+    )
+
+    assert listener.poll_records(bridge_timestamp_ns=1) == []
+    assert listener.poll_records(bridge_timestamp_ns=1) == []
+    records = listener.poll_records(bridge_timestamp_ns=1)
+    with pytest.raises(CDCError, match="acknowledged before polling"):
+        listener.poll_records()
+    listener.acknowledge()
+
+    assert _version_ends(records) == [(300, 1), (350, 0)]
+    consumer.acknowledge.return_value.wait.assert_called_once()
+    assert listener.poll_records(bridge_timestamp_ns=1) == []
+    assert listener.poll_records(bridge_timestamp_ns=1) == []
+
+
+def test_resume_starts_a_fresh_idle_window() -> None:
+    client = MagicMock(spec=FDBClient)
+    consumer = MagicMock()
+    client.resume_cdc_consumer.return_value = consumer
+    client.get_read_version.return_value = 500
+    consumer.consume.return_value.wait.side_effect = [
+        MockConsumeResult([], 600),
+        MockConsumeResult([], 700),
+    ]
+    listener = FDBMutationListener(
+        client,
+        "stream",
+        cursor=MockCursor(42, 500),
+        idle_ack_max_seconds=5.0,
+    )
+
+    with patch("src.cdc.listener.time.monotonic") as clock:
+        clock.return_value = 1000.0
+        listener.start()
+        clock.return_value = 1004.9
+        skipped = listener.poll_records(bridge_timestamp_ns=1)
+        clock.return_value = 1005.0
+        flushed = listener.poll_records(bridge_timestamp_ns=1)
+
+    assert skipped == []
+    assert _version_ends(flushed) == [(700, 0)]
+
+
+def test_close_mid_idle_window_then_resume_reacks_cursor_and_coalesces_afresh() -> None:
+    data = MockConsumeResult(
+        [MockVersionGroup(500, [MockCdcMutation(0, b"key", b"value")])], 500
+    )
+    first, client, first_consumer = _listener_with_batches(
+        [data, MockConsumeResult([], 600), MockConsumeResult([], 700)],
+        idle_ack_max_replies=3,
+    )
+    first.poll_records(bridge_timestamp_ns=1)
+    first.acknowledge()
+    assert first.poll_records(bridge_timestamp_ns=1) == []
+    assert first.poll_records(bridge_timestamp_ns=1) == []
+    first.close()
+
+    first_consumer.acknowledge.return_value.wait.assert_called_once()
+    first_consumer.close.assert_called_once()
+
+    resumed_consumer = MagicMock()
+    client.resume_cdc_consumer.return_value = resumed_consumer
+    client.get_read_version.return_value = 500
+    resumed_consumer.consume.return_value.wait.side_effect = [
+        MockConsumeResult([], version) for version in (600, 700, 800)
+    ]
+    cursor = MockCursor(42, 500)
+    resumed = FDBMutationListener(
+        client, "test-stream", cursor=cursor, idle_ack_max_replies=3
+    )
+    resumed.start()
+
+    client.resume_cdc_consumer.assert_called_once_with(cursor)
+    resumed_consumer.acknowledge.return_value.wait.assert_called_once()
+    assert resumed.poll_records(bridge_timestamp_ns=1) == []
+    assert resumed.poll_records(bridge_timestamp_ns=1) == []
+    flushed = resumed.poll_records(bridge_timestamp_ns=1)
+    resumed.acknowledge()
+
+    assert _version_ends(flushed) == [(800, 0)]
+    assert _consume_and_ack_order(resumed_consumer) == [
+        "acknowledge().wait",
+        "consume().wait",
+        "consume().wait",
+        "consume().wait",
+        "acknowledge().wait",
+    ]
+
+
+def _consume_and_ack_order(consumer: MagicMock) -> list[str]:
+    return [
+        name
+        for name, _, _ in consumer.mock_calls
+        if name in ("consume().wait", "acknowledge().wait")
+    ]
+
+
+def test_data_reply_acks_once_at_its_own_frontier_after_skipped_idles() -> None:
+    data = MockConsumeResult(
+        [MockVersionGroup(300, [MockCdcMutation(0, b"key", b"value")])], 350
+    )
+    listener, _, consumer = _listener_with_batches(
+        [MockConsumeResult([], 100), MockConsumeResult([], 200), data],
+        idle_ack_max_replies=5,
+    )
+
+    assert listener.poll_records(bridge_timestamp_ns=1) == []
+    assert listener.poll_records(bridge_timestamp_ns=1) == []
+    records = listener.poll_records(bridge_timestamp_ns=1)
+    listener.acknowledge()
+
+    assert records[-1].HasField("version_end")
+    assert _version_ends(records) == [(300, 1), (350, 0)]
+    assert _consume_and_ack_order(consumer) == [
+        "consume().wait",
+        "consume().wait",
+        "consume().wait",
+        "acknowledge().wait",
+    ]
+
+
+def test_idle_flush_acks_once_at_latest_watermark() -> None:
+    listener, _, consumer = _listener_with_batches(
+        [MockConsumeResult([], version) for version in (100, 200, 300)],
+        idle_ack_max_replies=3,
+    )
+
+    assert listener.poll_records(bridge_timestamp_ns=1) == []
+    assert listener.poll_records(bridge_timestamp_ns=1) == []
+    flushed = listener.poll_records(bridge_timestamp_ns=1)
+    listener.acknowledge()
+
+    assert _version_ends(flushed) == [(300, 0)]
+    assert len(flushed) == 1
+    assert _consume_and_ack_order(consumer) == [
+        "consume().wait",
+        "consume().wait",
+        "consume().wait",
+        "acknowledge().wait",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "error"),
+    [
+        ({"idle_ack_max_replies": True}, TypeError),
+        ({"idle_ack_max_replies": 2.0}, TypeError),
+        ({"idle_ack_max_replies": 0}, ValueError),
+        ({"idle_ack_max_replies": -1}, ValueError),
+        ({"idle_ack_max_seconds": True}, TypeError),
+        ({"idle_ack_max_seconds": "5"}, TypeError),
+        ({"idle_ack_max_seconds": 0}, ValueError),
+        ({"idle_ack_max_seconds": -0.5}, ValueError),
+        ({"idle_ack_max_seconds": math.nan}, ValueError),
+        ({"idle_ack_max_seconds": math.inf}, ValueError),
+        ({"idle_ack_max_seconds": -math.inf}, ValueError),
+    ],
+)
+def test_constructor_validates_idle_ack_thresholds(
+    kwargs: dict[str, object], error: type[Exception]
+) -> None:
+    with pytest.raises(error, match=next(iter(kwargs))):
+        FDBMutationListener(MagicMock(spec=FDBClient), "stream", **kwargs)
+
+
+def test_constructor_accepts_integer_idle_ack_seconds() -> None:
+    listener = FDBMutationListener(
+        MagicMock(spec=FDBClient), "stream", idle_ack_max_seconds=5
+    )
+
+    assert listener.idle_ack_max_seconds == 5.0

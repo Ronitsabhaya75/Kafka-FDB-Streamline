@@ -10,4 +10,4 @@ Map of the project's docs. Check here before reading docs wholesale, then open o
 | [`kafka-delivery-guarantees.md`](kafka-delivery-guarantees.md) | Kafka delivery semantics (acks, idempotence), exactly-once transaction strategies, error handling, and Python client (`confluent-kafka` vs `kafka-python`) comparison. |
 | [`KAFKA-PRODUCER-SPEC.md`](KAFKA-PRODUCER-SPEC.md) | `src.kafka.MutationProducer` contract, enforced idempotent-delivery settings, acknowledgement boundary, and local Kafka verification commands. |
 | [`SERIALIZATION-SPEC.md`](SERIALIZATION-SPEC.md) | `src/serialization/` contract: public API, wire mapping, input rules, errors and decode failures, reader contract for a version group |
-| [`CDC-CONSUMER-SPEC.md`](CDC-CONSUMER-SPEC.md) | `src/cdc/` contract: FDBClient, stream lifecycle, bounded record polling, safe resume and acknowledgement |
+| [`CDC-CONSUMER-SPEC.md`](CDC-CONSUMER-SPEC.md) | `src/cdc/` contract: FDBClient, stream lifecycle, bounded record polling, safe resume and acknowledgement, opt-in idle-reply ack coalescing |
