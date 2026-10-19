@@ -1,9 +1,9 @@
 """Kafka producer wrapper enforcing ordered, idempotent delivery.
 
-The critical durability knobs (``acks``, idempotence, in-flight limit,
-gapless guarantee) are set here and cannot be overridden by callers. This
-producer does not create Kafka transactions, so it does not provide end-to-end
-exactly-once delivery.
+Mandatory durability knobs (``acks``, idempotence, in-flight limit) are set
+here and cannot be overridden by callers.  When a ``transactional_id`` is
+supplied the producer acquires a transactional context; the bridge pipeline
+drives its ``begin`` / ``commit`` / ``abort`` lifecycle.
 """
 
 from __future__ import annotations
@@ -20,13 +20,10 @@ logger = logging.getLogger(__name__)
 
 DeliveryCallback = Callable[[KafkaError | None, Message], None]
 
-# Durability / ordering settings that must not be weakened by callers.
 _MANDATORY_CONFIG: dict[str, Any] = {
     "acks": "all",
     "enable.idempotence": True,
-    # Safe with idempotence — librdkafka reorders internally.
     "max.in.flight.requests.per.connection": 5,
-    "enable.gapless.guarantee": True,
 }
 
 _DEFAULT_PERFORMANCE_CONFIG: dict[str, Any] = {
@@ -38,10 +35,6 @@ _DEFAULT_PERFORMANCE_CONFIG: dict[str, Any] = {
 def _default_error_cb(err: KafkaError) -> None:
     """Log asynchronous client and broker errors.
 
-    Per-message delivery failures are not handled here: they are recorded by the
-    delivery callback and raised by every later :meth:`MutationProducer.produce`
-    and :meth:`MutationProducer.flush`.
-
     Args:
         err: Error reported by librdkafka.
     """
@@ -50,25 +43,40 @@ def _default_error_cb(err: KafkaError) -> None:
 
 
 class MutationProducer:
-    """Produces Protobuf-serialised ``FDBMutationRecord`` messages to Kafka.
+    """Produce Protobuf-serialised ``FDBMutationRecord`` messages to Kafka.
 
     Constructor merges caller-supplied config under mandatory ordering and
     durability settings so the critical guarantees cannot be accidentally
-    weakened. Performance knobs (``linger.ms``, ``compression.type``) can
+    weakened.  Performance knobs (``linger.ms``, ``compression.type``) can
     be overridden via *extra_config*.
+
+    When *transactional_id* is given the underlying librdkafka producer is
+    configured for Kafka transactions.  The caller must invoke
+    :meth:`init_transactions` once before the first transaction.
 
     Args:
         bootstrap_servers: Kafka bootstrap server(s), e.g. ``"kafka:19092"``.
-        extra_config: Optional librdkafka configuration overrides. Keys that
+        extra_config: Optional librdkafka configuration overrides.  Keys that
             collide with the mandatory durability settings are ignored.
+        transactional_id: Optional stable transaction identifier.  Enables
+            Kafka transactions and producer fencing.
     """
 
     def __init__(
         self,
         bootstrap_servers: str,
         extra_config: dict[str, Any] | None = None,
+        *,
+        transactional_id: str | None = None,
     ) -> None:
-        """Initialise the producer with mandatory durability settings."""
+        """Initialise the producer with mandatory durability settings.
+
+        Args:
+            bootstrap_servers: Kafka bootstrap server(s).
+            extra_config: Optional librdkafka overrides.  Durability keys
+                are ignored.
+            transactional_id: Optional stable transaction identifier.
+        """
         merged: dict[str, Any] = {
             "bootstrap.servers": bootstrap_servers,
             **_DEFAULT_PERFORMANCE_CONFIG,
@@ -76,11 +84,79 @@ class MutationProducer:
         if extra_config:
             merged.update(extra_config)
 
+        if transactional_id is not None:
+            merged["transactional.id"] = transactional_id
+
         merged.update(_MANDATORY_CONFIG)
         merged.setdefault("error_cb", _default_error_cb)
 
         self._producer = Producer(merged)
         self._delivery_errors: list[KafkaError] = []
+        self._transactional = transactional_id is not None
+
+    @property
+    def transactional(self) -> bool:
+        """Whether this producer was created with a transactional id."""
+        return self._transactional
+
+    def init_transactions(self, timeout: float = 30.0) -> None:
+        """Initialise the transactional state with the broker coordinator.
+
+        Must be called exactly once before any ``begin_transaction``.
+
+        Args:
+            timeout: Maximum seconds to wait for coordinator handshake.
+
+        Raises:
+            KafkaException: On coordinator or fencing errors.
+            RuntimeError: If the producer is not transactional.
+        """
+        if not self._transactional:
+            raise RuntimeError("init_transactions requires a transactional_id")
+        self._producer.init_transactions(timeout)
+
+    def begin_transaction(self) -> None:
+        """Begin a new Kafka transaction.
+
+        Raises:
+            KafkaException: If the previous transaction was not committed or
+                aborted, or the producer is fenced.
+            RuntimeError: If the producer is not transactional.
+        """
+        if not self._transactional:
+            raise RuntimeError("begin_transaction requires a transactional_id")
+        self._producer.begin_transaction()
+
+    def commit_transaction(self, timeout: float = 30.0) -> None:
+        """Commit the current Kafka transaction.
+
+        All records produced since :meth:`begin_transaction` become atomically
+        visible to ``read_committed`` consumers.
+
+        Args:
+            timeout: Maximum seconds to wait for commit.
+
+        Raises:
+            KafkaException: On commit failure (retriable, abortable, or fatal).
+            RuntimeError: If the producer is not transactional.
+        """
+        if not self._transactional:
+            raise RuntimeError("commit_transaction requires a transactional_id")
+        self._producer.commit_transaction(timeout)
+
+    def abort_transaction(self, timeout: float = 30.0) -> None:
+        """Abort the current Kafka transaction.
+
+        Args:
+            timeout: Maximum seconds to wait for abort.
+
+        Raises:
+            KafkaException: On abort failure.
+            RuntimeError: If the producer is not transactional.
+        """
+        if not self._transactional:
+            raise RuntimeError("abort_transaction requires a transactional_id")
+        self._producer.abort_transaction(timeout)
 
     def produce(
         self,
@@ -93,26 +169,18 @@ class MutationProducer:
         """Enqueue one ``FDBMutationRecord`` for async delivery.
 
         The record is serialised to Protobuf wire format before being
-        handed to librdkafka's internal queue. Call :meth:`flush` to
+        handed to librdkafka's internal queue.  Call :meth:`flush` to
         block until all queued messages are broker-acknowledged.
 
         Args:
             topic: Destination Kafka topic.
             record: The CDC mutation record to publish.
-            key: Optional partition key (bytes). In production this will
-                typically be the UTF-8-encoded ``stream_name`` so all
-                mutations for a directory land on the same partition.
+            key: Optional partition key (bytes).  Typically the UTF-8-encoded
+                ``stream_name`` so all mutations for a stream land on the same
+                partition.
             on_delivery: Optional ``(err, msg)`` callback invoked when the
                 broker acknowledges (or permanently fails) this message.
-
-        Raises:
-            KafkaException: An earlier message permanently failed; the
-                producer is unusable and must be replaced.
-            BufferError: librdkafka's local queue is full.
         """
-        if self._delivery_errors:
-            raise KafkaException(self._delivery_errors[0])
-
         payload = record.SerializeToString()
         kwargs: dict[str, Any] = {
             "value": payload,
@@ -138,8 +206,18 @@ class MutationProducer:
         """
         remaining = self._producer.flush(timeout)
         if self._delivery_errors:
-            raise KafkaException(self._delivery_errors[0])
+            error = self._delivery_errors.pop(0)
+            self._delivery_errors.clear()
+            raise KafkaException(error)
         return remaining
+
+    def close(self) -> None:
+        """Flush remaining messages and release the underlying producer."""
+        try:
+            self._producer.flush(10.0)
+        except Exception:
+            logger.exception("Error flushing producer during close")
+        self._delivery_errors.clear()
 
     def __len__(self) -> int:
         """Return the number of messages waiting in the producer queue."""
