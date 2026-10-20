@@ -1,0 +1,687 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CDC-Kafka Bridge Demo</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Inter:wght@400;500;600;700&display=swap">
+<style>
+  :root {
+    --bg: #0c1117;
+    --surface: #161b22;
+    --surface-raised: #1c2129;
+    --border: #30363d;
+    --fg: #e6edf3;
+    --fg-muted: #8b949e;
+    --accent: #58a6ff;
+    --accent-glow: rgba(88, 166, 255, 0.15);
+    --green: #3fb950;
+    --green-glow: rgba(63, 185, 80, 0.15);
+    --orange: #d29922;
+    --orange-glow: rgba(210, 153, 34, 0.15);
+    --red: #f85149;
+    --red-glow: rgba(248, 81, 73, 0.15);
+    --purple: #bc8cff;
+    --purple-glow: rgba(188, 140, 255, 0.15);
+    --font-body: 'Inter', system-ui, sans-serif;
+    --font-mono: 'IBM Plex Mono', 'Menlo', monospace;
+    color-scheme: dark;
+  }
+  @media (prefers-color-scheme: light) {
+    :root:not([data-theme="dark"]) {
+      --bg: #f6f8fa;
+      --surface: #ffffff;
+      --surface-raised: #f0f3f6;
+      --border: #d0d7de;
+      --fg: #1f2328;
+      --fg-muted: #656d76;
+      --accent: #0969da;
+      --accent-glow: rgba(9, 105, 218, 0.1);
+      --green: #1a7f37;
+      --green-glow: rgba(26, 127, 55, 0.1);
+      --orange: #9a6700;
+      --orange-glow: rgba(154, 103, 0, 0.1);
+      --red: #cf222e;
+      --red-glow: rgba(207, 34, 46, 0.1);
+      --purple: #8250df;
+      --purple-glow: rgba(130, 80, 223, 0.1);
+      color-scheme: light;
+    }
+  }
+  :root[data-theme="light"] {
+    --bg: #f6f8fa;
+    --surface: #ffffff;
+    --surface-raised: #f0f3f6;
+    --border: #d0d7de;
+    --fg: #1f2328;
+    --fg-muted: #656d76;
+    --accent: #0969da;
+    --accent-glow: rgba(9, 105, 218, 0.1);
+    --green: #1a7f37;
+    --green-glow: rgba(26, 127, 55, 0.1);
+    --orange: #9a6700;
+    --orange-glow: rgba(154, 103, 0, 0.1);
+    --red: #cf222e;
+    --red-glow: rgba(207, 34, 46, 0.1);
+    --purple: #8250df;
+    --purple-glow: rgba(130, 80, 223, 0.1);
+    color-scheme: light;
+  }
+
+  *, *::before, *::after { box-sizing: border-box; margin: 0; }
+
+  body {
+    background: var(--bg);
+    color: var(--fg);
+    font-family: var(--font-body);
+    padding: 0 16px;
+    max-width: 960px;
+    margin: 0 auto;
+    line-height: 1.5;
+    font-size: 14px;
+  }
+
+  h1 {
+    font-size: 1.5rem;
+    font-weight: 700;
+    margin: 2rem 0 0.25rem;
+    text-wrap: balance;
+  }
+  h1 span { color: var(--accent); }
+
+  .subtitle {
+    color: var(--fg-muted);
+    font-size: 0.875rem;
+    margin: 0 0 1.5rem;
+  }
+
+  .pipeline {
+    display: flex;
+    align-items: stretch;
+    gap: 0;
+    margin-bottom: 1.5rem;
+    position: relative;
+    min-height: 140px;
+  }
+
+  .stage {
+    flex: 1;
+    min-width: 0;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 0.75rem;
+    background: var(--surface);
+    display: flex;
+    flex-direction: column;
+    position: relative;
+    transition: border-color 0.3s, box-shadow 0.3s;
+  }
+  .stage.active {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 1px var(--accent), 0 0 20px var(--accent-glow);
+  }
+  .stage.success {
+    border-color: var(--green);
+    box-shadow: 0 0 0 1px var(--green), 0 0 20px var(--green-glow);
+  }
+  .stage.error {
+    border-color: var(--red);
+    box-shadow: 0 0 0 1px var(--red), 0 0 20px var(--red-glow);
+  }
+
+  .stage-label {
+    font-family: var(--font-mono);
+    font-size: 0.65rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--fg-muted);
+    margin-bottom: 0.5rem;
+  }
+
+  .stage-name {
+    font-weight: 600;
+    font-size: 0.85rem;
+    margin-bottom: 0.25rem;
+  }
+
+  .stage-detail {
+    font-family: var(--font-mono);
+    font-size: 0.7rem;
+    color: var(--fg-muted);
+    line-height: 1.5;
+  }
+
+  .arrow {
+    display: flex;
+    align-items: center;
+    padding: 0 0.25rem;
+    color: var(--border);
+    font-size: 1.25rem;
+    flex-shrink: 0;
+    transition: color 0.3s;
+  }
+  .arrow.active { color: var(--accent); }
+  .arrow.success { color: var(--green); }
+
+  .controls {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 0.75rem;
+    margin-bottom: 1.5rem;
+  }
+
+  .control-group {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 0.75rem;
+  }
+
+  .control-group label {
+    display: block;
+    font-family: var(--font-mono);
+    font-size: 0.65rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--fg-muted);
+    margin-bottom: 0.5rem;
+  }
+
+  .mode-toggle {
+    display: flex;
+    gap: 0;
+    border-radius: 6px;
+    overflow: hidden;
+    border: 1px solid var(--border);
+  }
+
+  .mode-btn {
+    flex: 1;
+    padding: 0.5rem 0.75rem;
+    font-family: var(--font-mono);
+    font-size: 0.75rem;
+    font-weight: 500;
+    border: none;
+    background: var(--surface);
+    color: var(--fg-muted);
+    cursor: pointer;
+    transition: all 0.2s;
+  }
+  .mode-btn.selected {
+    background: var(--accent);
+    color: #fff;
+  }
+
+  .slider-row {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+  }
+  .slider-row input[type="range"] {
+    flex: 1;
+    accent-color: var(--accent);
+  }
+  .slider-val {
+    font-family: var(--font-mono);
+    font-size: 0.75rem;
+    font-variant-numeric: tabular-nums;
+    min-width: 2ch;
+    text-align: right;
+    color: var(--fg);
+  }
+
+  .btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.4rem;
+    padding: 0.6rem 1.25rem;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    font-family: var(--font-mono);
+    font-size: 0.8rem;
+    font-weight: 500;
+    cursor: pointer;
+    transition: all 0.2s;
+    background: var(--surface);
+    color: var(--fg);
+  }
+  .btn:hover { border-color: var(--accent); background: var(--accent-glow); }
+  .btn:disabled { opacity: 0.4; cursor: default; pointer-events: none; }
+
+  .btn-primary {
+    background: var(--accent);
+    color: #fff;
+    border-color: var(--accent);
+  }
+  .btn-primary:hover { opacity: 0.9; }
+
+  .btn-row {
+    display: flex;
+    gap: 0.5rem;
+    margin-bottom: 1.5rem;
+    flex-wrap: wrap;
+  }
+
+  .inject-error {
+    background: var(--red-glow);
+    border-color: var(--red);
+    color: var(--red);
+  }
+
+  .log-section h2 {
+    font-size: 0.9rem;
+    font-weight: 600;
+    margin: 0 0 0.5rem;
+  }
+
+  .log {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 0.75rem;
+    max-height: 280px;
+    overflow-y: auto;
+    font-family: var(--font-mono);
+    font-size: 0.72rem;
+    line-height: 1.7;
+  }
+
+  .log-entry {
+    display: flex;
+    gap: 0.5rem;
+    align-items: baseline;
+  }
+
+  .log-ts {
+    color: var(--fg-muted);
+    flex-shrink: 0;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .log-msg { min-width: 0; }
+  .log-msg.info { color: var(--accent); }
+  .log-msg.ok { color: var(--green); }
+  .log-msg.warn { color: var(--orange); }
+  .log-msg.err { color: var(--red); }
+  .log-msg.txn { color: var(--purple); }
+
+  .stats {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 0.75rem;
+    margin-bottom: 1.5rem;
+  }
+
+  .stat {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 0.6rem 0.75rem;
+    text-align: center;
+  }
+
+  .stat-val {
+    font-family: var(--font-mono);
+    font-size: 1.4rem;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .stat-label {
+    font-size: 0.65rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--fg-muted);
+    margin-top: 0.15rem;
+  }
+
+  .empty-log {
+    color: var(--fg-muted);
+    font-style: italic;
+  }
+
+  @media (max-width: 600px) {
+    .pipeline { flex-direction: column; gap: 0; }
+    .arrow { transform: rotate(90deg); padding: 0.15rem 0; justify-content: center; }
+    .controls { grid-template-columns: 1fr; }
+    .stats { grid-template-columns: repeat(2, 1fr); }
+  }
+</style>
+</head>
+<body>
+
+<h1>FDB <span>CDC</span> &rarr; Kafka Bridge</h1>
+<p class="subtitle">Interactive simulation of the CDC poll &rarr; serialize &rarr; produce &rarr; acknowledge pipeline</p>
+
+<div class="stats" id="stats">
+  <div class="stat">
+    <div class="stat-val" id="stat-produced">0</div>
+    <div class="stat-label">Produced</div>
+  </div>
+  <div class="stat">
+    <div class="stat-val" id="stat-acked">0</div>
+    <div class="stat-label">Acknowledged</div>
+  </div>
+  <div class="stat">
+    <div class="stat-val" id="stat-errors">0</div>
+    <div class="stat-label">Errors</div>
+  </div>
+  <div class="stat">
+    <div class="stat-val" id="stat-version" style="font-size:1rem">0</div>
+    <div class="stat-label">FDB Version</div>
+  </div>
+</div>
+
+<div class="pipeline" id="pipeline">
+  <div class="stage" id="stage-fdb">
+    <div class="stage-label">Source</div>
+    <div class="stage-name">FoundationDB CDC</div>
+    <div class="stage-detail" id="fdb-detail">Awaiting poll&hellip;</div>
+  </div>
+  <div class="arrow" id="arrow-1">&rarr;</div>
+  <div class="stage" id="stage-serial">
+    <div class="stage-label">Transform</div>
+    <div class="stage-name">Protobuf Serialize</div>
+    <div class="stage-detail" id="serial-detail">Idle</div>
+  </div>
+  <div class="arrow" id="arrow-2">&rarr;</div>
+  <div class="stage" id="stage-kafka">
+    <div class="stage-label">Sink</div>
+    <div class="stage-name">Kafka Producer</div>
+    <div class="stage-detail" id="kafka-detail">Idle</div>
+  </div>
+  <div class="arrow" id="arrow-3">&rarr;</div>
+  <div class="stage" id="stage-ack">
+    <div class="stage-label">Checkpoint</div>
+    <div class="stage-name">FDB Acknowledge</div>
+    <div class="stage-detail" id="ack-detail">Idle</div>
+  </div>
+</div>
+
+<div class="controls">
+  <div class="control-group">
+    <label>Delivery Mode</label>
+    <div class="mode-toggle">
+      <button class="mode-btn selected" id="mode-idempotent" onclick="setMode('idempotent')">Idempotent</button>
+      <button class="mode-btn" id="mode-txn" onclick="setMode('transactional')">Transactional</button>
+    </div>
+  </div>
+  <div class="control-group">
+    <label>Mutations per batch</label>
+    <div class="slider-row">
+      <input type="range" id="batch-size" min="1" max="8" value="3" oninput="document.getElementById('batch-val').textContent=this.value">
+      <span class="slider-val" id="batch-val">3</span>
+    </div>
+  </div>
+</div>
+
+<div class="btn-row">
+  <button class="btn btn-primary" id="btn-step" onclick="runStep()">Run pipeline.step()</button>
+  <button class="btn" id="btn-auto" onclick="toggleAuto()">Auto-run</button>
+  <button class="btn inject-error" id="btn-error" onclick="injectError()">Inject Kafka error</button>
+  <button class="btn" onclick="resetDemo()">Reset</button>
+</div>
+
+<div class="log-section">
+  <h2>Event Log</h2>
+  <div class="log" id="log">
+    <div class="empty-log">Run a pipeline step to see events&hellip;</div>
+  </div>
+</div>
+
+<script>
+(function() {
+  var MUTATION_TYPES = ['SET_VALUE', 'CLEAR_RANGE', 'ADD', 'AND', 'XOR', 'APPEND_IF_FITS', 'MAX', 'MIN'];
+  var mode = 'idempotent';
+  var fdbVersion = 10000000;
+  var totalProduced = 0;
+  var totalAcked = 0;
+  var totalErrors = 0;
+  var running = false;
+  var autoInterval = null;
+  var pendingError = false;
+  var stepInProgress = false;
+  var logCleared = false;
+
+  function setMode(m) {
+    mode = m;
+    document.getElementById('mode-idempotent').classList.toggle('selected', m === 'idempotent');
+    document.getElementById('mode-txn').classList.toggle('selected', m === 'transactional');
+    log('info', 'Mode switched to ' + (m === 'idempotent' ? 'idempotent (acks=all, flush before ack)' : 'transactional (begin/commit/abort)'));
+  }
+
+  function getBatchSize() {
+    return parseInt(document.getElementById('batch-size').value, 10);
+  }
+
+  function log(level, msg) {
+    var el = document.getElementById('log');
+    if (!logCleared) {
+      el.innerHTML = '';
+      logCleared = true;
+    }
+    var now = new Date();
+    var ts = [now.getHours(), now.getMinutes(), now.getSeconds()]
+      .map(function(n) { return String(n).padStart(2, '0'); }).join(':') +
+      '.' + String(now.getMilliseconds()).padStart(3, '0');
+    var entry = document.createElement('div');
+    entry.className = 'log-entry';
+    entry.innerHTML = '<span class="log-ts">' + ts + '</span><span class="log-msg ' + level + '">' + msg + '</span>';
+    el.appendChild(entry);
+    el.scrollTop = el.scrollHeight;
+  }
+
+  function updateStats() {
+    document.getElementById('stat-produced').textContent = totalProduced;
+    document.getElementById('stat-acked').textContent = totalAcked;
+    document.getElementById('stat-errors').textContent = totalErrors;
+    document.getElementById('stat-version').textContent = fdbVersion.toLocaleString();
+  }
+
+  function setStage(id, state) {
+    var el = document.getElementById('stage-' + id);
+    el.classList.remove('active', 'success', 'error');
+    if (state) el.classList.add(state);
+  }
+
+  function setArrow(id, state) {
+    var el = document.getElementById('arrow-' + id);
+    el.classList.remove('active', 'success');
+    if (state) el.classList.add(state);
+  }
+
+  function clearStages() {
+    ['fdb', 'serial', 'kafka', 'ack'].forEach(function(s) { setStage(s, ''); });
+    ['1', '2', '3'].forEach(function(a) { setArrow(a, ''); });
+  }
+
+  function detail(id, text) {
+    document.getElementById(id + '-detail').textContent = text;
+  }
+
+  function sleep(ms) {
+    return new Promise(function(r) { setTimeout(r, ms); });
+  }
+
+  function randomKey() {
+    var prefixes = ['/users/', '/orders/', '/products/', '/sessions/', '/events/'];
+    var p = prefixes[Math.floor(Math.random() * prefixes.length)];
+    return p + Math.random().toString(36).substring(2, 8);
+  }
+
+  function randomMutationType() {
+    return MUTATION_TYPES[Math.floor(Math.random() * MUTATION_TYPES.length)];
+  }
+
+  async function runStep() {
+    if (stepInProgress) return;
+    stepInProgress = true;
+    document.getElementById('btn-step').disabled = true;
+    var batchSize = getBatchSize();
+    var currentVersion = fdbVersion;
+    fdbVersion += Math.floor(Math.random() * 50000) + 10000;
+    var isTxn = mode === 'transactional';
+
+    clearStages();
+
+    setStage('fdb', 'active');
+    detail('fdb', 'Polling version ' + currentVersion + '…');
+    log('info', 'listener.poll_records() — consuming CDC reply');
+    await sleep(500);
+
+    var mutations = [];
+    for (var i = 0; i < batchSize; i++) {
+      mutations.push({ type: randomMutationType(), key: randomKey(), seq: i });
+    }
+
+    detail('fdb', batchSize + ' mutations @ v' + currentVersion);
+    log('ok', 'Got ' + batchSize + ' mutations in version group v' + currentVersion);
+    setStage('fdb', 'success');
+    setArrow('1', 'active');
+    await sleep(400);
+
+    setStage('serial', 'active');
+    detail('serial', 'Encoding ' + batchSize + ' records…');
+    for (var j = 0; j < mutations.length; j++) {
+      var m = mutations[j];
+      log('info', 'serialize: ' + m.type + ' key=' + m.key + ' seq=' + m.seq);
+      await sleep(150);
+    }
+    var wireBytes = Math.floor(Math.random() * 2000) + 500;
+    log('ok', 'Serialized to ' + wireBytes + ' bytes Protobuf + VersionEnd marker');
+    detail('serial', wireBytes + 'B protobuf wire');
+    setStage('serial', 'success');
+    setArrow('1', 'success');
+    setArrow('2', 'active');
+    await sleep(300);
+
+    setStage('kafka', 'active');
+    if (isTxn) {
+      log('txn', 'producer.begin_transaction()');
+      detail('kafka', 'TXN: begin');
+      await sleep(300);
+    }
+
+    for (var k = 0; k < batchSize; k++) {
+      detail('kafka', 'Producing ' + (k + 1) + '/' + batchSize + '…');
+      log('info', 'producer.produce("cdc-mutations", record[' + k + '], key=b"stream")');
+      await sleep(200);
+    }
+
+    if (pendingError) {
+      pendingError = false;
+      totalErrors++;
+      setStage('kafka', 'error');
+      if (isTxn) {
+        log('err', 'KafkaException: commit failed — txn_requires_abort=True');
+        log('txn', 'producer.abort_transaction() — rolling back');
+        detail('kafka', 'TXN: ABORTED');
+        await sleep(400);
+        log('warn', 'CDC reply NOT acknowledged — FDB will replay on next poll');
+      } else {
+        log('err', 'KafkaException: delivery permanently failed on flush');
+        detail('kafka', 'DELIVERY FAILED');
+        await sleep(400);
+        log('warn', 'Pipeline step returned 0 — no records committed');
+      }
+      detail('ack', 'Skipped (error)');
+      updateStats();
+      stepInProgress = false;
+      document.getElementById('btn-step').disabled = false;
+      return;
+    }
+
+    if (isTxn) {
+      log('txn', 'producer.commit_transaction() — atomic visibility');
+      detail('kafka', 'TXN: commit');
+      await sleep(400);
+      log('ok', 'Transaction committed — ' + batchSize + ' records visible to read_committed consumers');
+    } else {
+      log('info', 'producer.flush() — waiting for broker acks (acks=all)');
+      detail('kafka', 'Flushing…');
+      await sleep(500);
+      log('ok', 'Flush complete — ' + batchSize + ' records durably acked by all ISRs');
+    }
+    totalProduced += batchSize;
+    detail('kafka', batchSize + ' records delivered');
+    setStage('kafka', 'success');
+    setArrow('2', 'success');
+    setArrow('3', 'active');
+    await sleep(300);
+
+    setStage('ack', 'active');
+    detail('ack', 'Acknowledging v' + currentVersion + '…');
+    log('info', 'listener.acknowledge() — advancing CDC cursor past v' + currentVersion);
+    await sleep(400);
+    totalAcked += batchSize;
+    detail('ack', 'Cursor @ v' + fdbVersion);
+    log('ok', 'CDC position acknowledged — step() returned ' + batchSize);
+    setStage('ack', 'success');
+    setArrow('3', 'success');
+
+    updateStats();
+    stepInProgress = false;
+    document.getElementById('btn-step').disabled = false;
+  }
+
+  function toggleAuto() {
+    running = !running;
+    var btn = document.getElementById('btn-auto');
+    if (running) {
+      btn.textContent = 'Stop auto';
+      btn.classList.add('btn-primary');
+      function tick() {
+        if (!running) return;
+        runStep().then(function() {
+          if (running) autoInterval = setTimeout(tick, 800);
+        });
+      }
+      tick();
+    } else {
+      btn.textContent = 'Auto-run';
+      btn.classList.remove('btn-primary');
+      if (autoInterval) { clearTimeout(autoInterval); autoInterval = null; }
+    }
+  }
+
+  function injectError() {
+    pendingError = true;
+    log('warn', 'Error injection armed — next step will simulate a Kafka failure');
+  }
+
+  function resetDemo() {
+    if (running) toggleAuto();
+    stepInProgress = false;
+    document.getElementById('btn-step').disabled = false;
+    fdbVersion = 10000000;
+    totalProduced = 0;
+    totalAcked = 0;
+    totalErrors = 0;
+    pendingError = false;
+    logCleared = false;
+    clearStages();
+    detail('fdb', 'Awaiting poll…');
+    detail('serial', 'Idle');
+    detail('kafka', 'Idle');
+    detail('ack', 'Idle');
+    updateStats();
+    document.getElementById('log').innerHTML = '<div class="empty-log">Run a pipeline step to see events…</div>';
+    log('info', 'Demo reset');
+  }
+
+  window.setMode = setMode;
+  window.runStep = runStep;
+  window.toggleAuto = toggleAuto;
+  window.injectError = injectError;
+  window.resetDemo = resetDemo;
+
+  updateStats();
+})();
+</script>
+
+</body>
+</html>
