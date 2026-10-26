@@ -1,33 +1,45 @@
 """Core bridge pipeline: CDC poll → Kafka produce → FDB acknowledge.
 
-Each :meth:`step` processes exactly one CDC reply.  When the producer is
-transactional the step wraps every produce in a Kafka transaction so
-downstream ``read_committed`` consumers observe the batch atomically.
-When non-transactional, records are flushed with ``acks=all`` and
-idempotent delivery before the CDC position is acknowledged.
+Each :meth:`BridgePipeline.step` processes exactly one CDC reply.  When
+the producer is transactional the step wraps every produce batch in a
+Kafka transaction so downstream ``read_committed`` consumers observe the
+batch atomically.  When non-transactional, records are flushed with
+``acks=all`` and idempotent delivery before the CDC position is
+acknowledged.
 
 Neither mode provides cross-system exactly-once between FDB and Kafka.
 A crash after Kafka commit/flush but before ``acknowledge()`` causes FDB
-to replay; downstream consumers may see the batch twice (idempotent mode)
-or exactly once per transaction epoch (transactional mode, provided they
-use ``read_committed``).
+to replay the batch; downstream consumers may see duplicates (idempotent
+mode) or see the batch once per transaction epoch (transactional mode,
+provided they use ``read_committed``).
+
+On any delivery failure, the pipeline raises :class:`PublishFailedError`
+without acknowledging FDB.  The caller must close and resume the listener
+from its last persisted cursor to replay the batch.
 """
 
 from __future__ import annotations
 
 import logging
-import threading
-import time
-from dataclasses import dataclass
-from typing import Any
 
 from confluent_kafka import KafkaException
 
-from src.cdc.client import FDBClient
+from fdbkafka.cdc.v1 import mutations_pb2
+from src.cdc.errors import CDCRetryableError
 from src.cdc.listener import FDBMutationListener
 from src.kafka.producer import MutationProducer
 
 logger = logging.getLogger(__name__)
+
+DEFAULT_ACK_RETRIES: int = 3
+
+
+class PublishFailedError(Exception):
+    """Raised when Kafka delivery or flush failed for the current CDC batch.
+
+    The CDC batch was **not** acknowledged.  The caller must close the
+    listener and resume from its last persisted cursor to replay the batch.
+    """
 
 
 class BridgePipeline:
@@ -41,8 +53,11 @@ class BridgePipeline:
         producer: A :class:`MutationProducer`, already initialised for
             transactions when transactional mode is desired.
         topic: Destination Kafka topic.
-        partition_key: Kafka record key for every produced message, typically
-            the UTF-8-encoded stream name.
+        partition_key: Kafka record key for every produced message.  Should
+            be the UTF-8-encoded stream name so all mutations for a stream
+            land on the same partition.
+        ack_retries: Maximum number of retries for transient FDB
+            acknowledgement failures.
     """
 
     def __init__(
@@ -52,6 +67,7 @@ class BridgePipeline:
         topic: str,
         *,
         partition_key: bytes | None = None,
+        ack_retries: int = DEFAULT_ACK_RETRIES,
     ) -> None:
         """Bind a listener and producer to the given topic.
 
@@ -60,22 +76,35 @@ class BridgePipeline:
             producer: A Kafka mutation producer.
             topic: Destination Kafka topic.
             partition_key: Optional Kafka record key for partitioning.
+            ack_retries: Maximum retries for transient ack failures.
         """
         self._listener = listener
         self._producer = producer
         self._topic = topic
         self._partition_key = partition_key
+        self._ack_retries = ack_retries
 
     def step(self) -> int:
         """Process one CDC reply end-to-end.
+
+        1. Polls one CDC reply from FDB.
+        2. Produces all records to Kafka with the configured partition key.
+        3. Confirms delivery (flush in idempotent mode, commit in
+           transactional mode).
+        4. Acknowledges the CDC batch back to FDB.
 
         Returns:
             The number of records published (0 when the reply was empty).
 
         Raises:
-            KafkaException: A transactional commit failed with a fatal or
-                non-retriable error after the abort attempt.
+            PublishFailedError: Kafka delivery or transaction commit failed.
+                The CDC batch was not acknowledged.  The caller must close
+                the listener and resume from the last persisted cursor.
+            KafkaException: A fatal producer error occurred; the producer
+                must be replaced.
             CDCError: The listener raised a non-recoverable CDC error.
+            CDCRetryableError: All acknowledgement retries were exhausted
+                after successful Kafka delivery.
         """
         records = self._listener.poll_records()
         if not records:
@@ -85,187 +114,159 @@ class BridgePipeline:
             return self._step_transactional(records)
         return self._step_idempotent(records)
 
-    def _step_idempotent(self, records: list[Any]) -> int:
-        """Produce, flush, then acknowledge."""
+    def _produce_all(
+        self,
+        records: list[mutations_pb2.FDBMutationRecord],
+    ) -> None:
+        """Produce every record; propagates ``BufferError`` and ``KafkaException``.
+
+        Args:
+            records: CDC mutation records to publish.
+        """
         for record in records:
             self._producer.produce(self._topic, record, key=self._partition_key)
-        self._producer.flush()
-        self._listener.acknowledge()
+
+    def _acknowledge_with_retry(self) -> None:
+        """Acknowledge the CDC batch, retrying transient FDB failures.
+
+        Raises:
+            CDCRetryableError: Retries exhausted on a transient failure.
+            CDCError: A non-retryable acknowledgement error.
+        """
+        last_err: CDCRetryableError | None = None
+        for attempt in range(1, self._ack_retries + 1):
+            try:
+                self._listener.acknowledge()
+                return
+            except CDCRetryableError as exc:
+                last_err = exc
+                logger.warning(
+                    "Transient FDB ack failure (attempt %d/%d): %s",
+                    attempt,
+                    self._ack_retries,
+                    exc,
+                )
+        raise last_err  # type: ignore[misc]
+
+    def _step_idempotent(
+        self,
+        records: list[mutations_pb2.FDBMutationRecord],
+    ) -> int:
+        """Produce, flush, then acknowledge.
+
+        Raises:
+            PublishFailedError: If produce raises ``BufferError``, flush raises
+                ``KafkaException``, or flush returns a nonzero count.
+        """
+        try:
+            self._produce_all(records)
+            remaining = self._producer.flush()
+        except (KafkaException, BufferError) as exc:
+            raise PublishFailedError(
+                "Kafka delivery failed in idempotent mode"
+            ) from exc
+
+        if remaining > 0:
+            raise PublishFailedError(
+                f"Flush timed out with {remaining} message(s) still in queue"
+            )
+
+        self._acknowledge_with_retry()
         return len(records)
 
-    def _step_transactional(self, records: list[Any]) -> int:
+    def _step_transactional(
+        self,
+        records: list[mutations_pb2.FDBMutationRecord],
+    ) -> int:
         """Produce inside a Kafka transaction, then acknowledge.
 
-        On an abortable error the transaction is aborted and the CDC reply
-        is **not** acknowledged, so FDB will replay it on the next poll.
+        On an abortable or retriable error the transaction is aborted and
+        :class:`PublishFailedError` is raised without acknowledging FDB.  The
+        caller must close and resume the listener to replay the batch.
+
+        Raises:
+            PublishFailedError: The transaction was aborted.  The CDC batch was
+                not acknowledged.
+            KafkaException: Fatal producer error; the producer must be
+                replaced.
         """
-        self._producer.begin_transaction()
         try:
-            for record in records:
-                self._producer.produce(self._topic, record, key=self._partition_key)
+            self._producer.begin_transaction()
+        except (KafkaException, RuntimeError) as exc:
+            raise PublishFailedError("Failed to begin Kafka transaction") from exc
+
+        try:
+            self._produce_all(records)
             self._producer.commit_transaction()
         except KafkaException as exc:
             self._handle_transaction_error(exc)
             return 0
-        self._listener.acknowledge()
+        except BufferError as exc:
+            self._abort_or_escalate(exc)
+            return 0
+
+        self._acknowledge_with_retry()
         return len(records)
+
+    def _abort_or_escalate(self, original: BaseException) -> None:
+        """Attempt to abort the transaction; raise ``PublishFailedError`` or fatal.
+
+        Args:
+            original: The exception that caused the abort attempt.
+
+        Raises:
+            PublishFailedError: If the abort succeeds.
+            KafkaException: If the abort fails with a fatal error.
+        """
+        try:
+            self._producer.abort_transaction()
+        except KafkaException as abort_exc:
+            self._producer.mark_fatal()
+            raise KafkaException(
+                abort_exc.args[0] if abort_exc.args else None
+            ) from original
+        raise PublishFailedError(
+            "Transaction aborted after production error"
+        ) from original
 
     def _handle_transaction_error(self, exc: KafkaException) -> None:
         """Classify the error and abort if the transaction requires it.
 
         Raises:
-            KafkaException: Re-raised when the error is fatal or when
-                the abort itself fails.
+            PublishFailedError: When the error is abortable or retriable and the
+                abort succeeds.
+            KafkaException: When the error is fatal, or when both the
+                original operation and the abort fail.
         """
         error = exc.args[0] if exc.args else None
-        if error is not None and callable(getattr(error, "txn_requires_abort", None)):
-            if error.txn_requires_abort():
-                logger.warning("Aborting Kafka transaction: %s", error)
-                try:
-                    self._producer.abort_transaction()
-                except KafkaException:
-                    logger.exception("Abort after abortable error also failed")
-                    raise exc from None
-                return
-        if error is not None and callable(getattr(error, "retriable", None)):
-            if error.retriable():
-                logger.warning(
-                    "Retriable transaction error (will replay from CDC): %s",
-                    error,
-                )
-                try:
-                    self._producer.abort_transaction()
-                except KafkaException:
-                    logger.exception("Abort after retriable error also failed")
-                    raise exc from None
-                return
-        raise exc
 
+        if error is not None and getattr(error, "fatal", lambda: False)():
+            self._producer.mark_fatal()
+            raise
 
-@dataclass
-class BridgeMetrics:
-    """Runtime metrics for the autonomous bridge loop."""
-
-    mutations_published: int = 0
-    records_published: int = 0
-    batches_acked: int = 0
-    errors_retried: int = 0
-
-
-class Bridge:
-    """Autonomous Bridge daemon managing CDC listener, producer, and run loop."""
-
-    def __init__(self, config: Any) -> None:
-        """Initialize the Bridge with declarative configuration.
-
-        Args:
-            config: Validated BridgeConfig instance.
-        """
-        self.config = config
-        self._shutdown_requested = threading.Event()
-        self.metrics = BridgeMetrics()
-        self._client: FDBClient | None = None
-        self._listener: FDBMutationListener | None = None
-        self._producer: MutationProducer | None = None
-        self._pipeline: BridgePipeline | None = None
-
-    @property
-    def mutations_published(self) -> int:
-        """Total count of individual mutations published to Kafka."""
-        return self.metrics.mutations_published
-
-    @property
-    def batches_acked(self) -> int:
-        """Total count of CDC batches acknowledged back to FoundationDB."""
-        return self.metrics.batches_acked
-
-    def start(self) -> None:
-        """Initialize FDB client, register CDC stream, and start listener."""
-        self._client = FDBClient(
-            cluster_file=self.config.fdb.cluster_file,
-            api_version=self.config.fdb.api_version,
+        needs_abort = (
+            error is not None and getattr(error, "txn_requires_abort", lambda: False)()
         )
-        self._client.open()
-
-        key_range = (self.config.cdc.begin_key, self.config.cdc.end_key)
-        self._listener = FDBMutationListener(
-            self._client,
-            stream_name=self.config.cdc.stream_name,
-            key_range=key_range,
-            max_record_bytes=self.config.cdc.max_record_bytes,
-        )
-        self._listener.start()
-
-        self._producer = MutationProducer(
-            self.config.kafka.bootstrap_servers,
+        is_retriable = (
+            error is not None and getattr(error, "retriable", lambda: False)()
         )
 
-        partition_key = self.config.cdc.stream_name.encode("utf-8")
-        self._pipeline = BridgePipeline(
-            self._listener,
-            self._producer,
-            topic=self.config.kafka.topic,
-            partition_key=partition_key,
-        )
-
-    def run(self) -> None:
-        """Execute continuous streaming run loop until shutdown is requested."""
-        if self._listener is None or self._producer is None:
-            raise RuntimeError("Bridge must be started before calling run()")
-
-        backoff = self.config.pipeline.backoff_base_seconds
-        partition_key = self.config.cdc.stream_name.encode("utf-8")
-
-        while not self._shutdown_requested.is_set():
+        if needs_abort or is_retriable:
+            logger.warning(
+                "Aborting Kafka transaction (%s): %s",
+                "abort-required" if needs_abort else "retriable",
+                error,
+            )
             try:
-                records = self._listener.poll_records()
-                if not records:
-                    time.sleep(backoff)
-                    backoff = min(
-                        backoff * 1.5, self.config.pipeline.backoff_max_seconds
-                    )
-                    continue
+                self._producer.abort_transaction()
+            except KafkaException as abort_exc:
+                self._producer.mark_fatal()
+                raise KafkaException(
+                    abort_exc.args[0] if abort_exc.args else None
+                ) from exc
+            raise PublishFailedError(
+                "Transaction aborted after commit failure"
+            ) from exc
 
-                backoff = self.config.pipeline.backoff_base_seconds
-                for record in records:
-                    self._producer.produce(
-                        self.config.kafka.topic,
-                        record,
-                        key=partition_key,
-                    )
-                self._producer.flush(self.config.pipeline.flush_timeout_seconds)
-                self._listener.acknowledge()
-
-                batch_mutations = 0
-                for record in records:
-                    if record.HasField("batch"):
-                        batch_mutations += len(record.batch.mutations)
-                    elif record.HasField("mutation"):
-                        batch_mutations += 1
-
-                self.metrics.mutations_published += batch_mutations
-                self.metrics.records_published += len(records)
-                self.metrics.batches_acked += 1
-            except Exception as exc:
-                logger.warning("Error in bridge run loop: %s", exc)
-                self.metrics.errors_retried += 1
-                if self._shutdown_requested.is_set():
-                    break
-                time.sleep(backoff)
-
-    def request_shutdown(self) -> None:
-        """Signal the daemon run loop to stop cleanly."""
-        self._shutdown_requested.set()
-
-    def stop(self) -> None:
-        """Request shutdown and release all handles."""
-        self.request_shutdown()
-        if self._producer is not None:
-            self._producer.close()
-            self._producer = None
-        if self._listener is not None:
-            self._listener.close()
-            self._listener = None
-        if self._client is not None:
-            self._client.close()
-            self._client = None
+        self._producer.mark_fatal()
+        raise
