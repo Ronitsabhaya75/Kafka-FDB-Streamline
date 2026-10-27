@@ -12,3 +12,4 @@ Map of the project's docs. Check here before reading docs wholesale, then open o
 | [`SERIALIZATION-SPEC.md`](SERIALIZATION-SPEC.md) | `src/serialization/` contract: public API, wire mapping, input rules, errors and decode failures, reader contract for a version group |
 | [`BRIDGE-PIPELINE-SPEC.md`](BRIDGE-PIPELINE-SPEC.md) | `src.bridge.BridgePipeline` contract: poll → produce → flush/commit → checkpoint → acknowledge, partition key, retriable commit retries, and caller recovery. |
 | [`CDC-CONSUMER-SPEC.md`](CDC-CONSUMER-SPEC.md) | `src/cdc/` contract: FDBClient, stream lifecycle, bounded record polling, safe resume and acknowledgement |
+| [`../demo/README.md`](../demo/README.md) | Live 10,000-mutation bridge demo: prerequisites, Docker Compose setup, CLI flags. |
