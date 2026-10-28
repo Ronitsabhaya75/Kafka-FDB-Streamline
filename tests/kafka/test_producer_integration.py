@@ -14,7 +14,7 @@ import uuid
 from collections.abc import Iterator
 
 import pytest
-from confluent_kafka import Consumer, KafkaException
+from confluent_kafka import Consumer, KafkaError, KafkaException
 
 from fdbkafka.cdc.v1 import mutations_pb2
 from src.kafka.producer import MutationProducer
@@ -50,6 +50,11 @@ def _consume_n(consumer: Consumer, n: int, timeout: float = 15.0) -> list[bytes]
         if msg is None:
             continue
         if msg.error():
+            if msg.error().code() in (
+                KafkaError._PARTITION_EOF,
+                KafkaError.UNKNOWN_TOPIC_OR_PART,
+            ):
+                continue
             raise KafkaException(msg.error())
         messages.append(msg.value())
     if len(messages) < n:
@@ -192,3 +197,30 @@ class TestProduceAndConsume:
         assert parsed.mutation.WhichOneof("mutation") == "clear_range"
         assert parsed.mutation.clear_range.begin_key == b"tmp:"
         assert parsed.mutation.clear_range.end_key == b"tmp:\xff"
+
+
+class TestTransactionalProducerIntegration:
+    """Integration tests for transactional MutationProducer against live Kafka."""
+
+    def test_produce_abort_then_clean_flush(self) -> None:
+        """Producing then aborting in a transaction leaves no delivery errors."""
+        producer = MutationProducer(
+            BOOTSTRAP_SERVERS,
+            transactional_id=f"test-abort-{uuid.uuid4().hex[:8]}",
+        )
+        try:
+            producer.init_transactions()
+            producer.begin_transaction()
+            record = build_set_mutation_record(
+                stream="abort-stream",
+                version=500_000,
+                seq=0,
+                key=b"abort:1",
+                value=b"v1",
+            )
+            producer.produce(TEST_TOPIC, record, key=b"abort-stream")
+            producer.abort_transaction()
+            remaining = producer.flush()
+            assert remaining == 0
+        finally:
+            producer.close()
