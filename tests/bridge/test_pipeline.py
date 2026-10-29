@@ -8,7 +8,7 @@ from confluent_kafka import KafkaError, KafkaException
 
 from fdbkafka.cdc.v1 import mutations_pb2
 from src.bridge.pipeline import BridgePipeline
-from src.cdc.errors import CDCRetryableError
+from src.cdc.errors import CDCRetryableError, CDCTerminalError
 from src.cdc.listener import FDBMutationListener
 from src.kafka.producer import MutationProducer
 
@@ -253,6 +253,32 @@ class TestTransactionalPath:
         assert producer.commit_transaction.call_count == 1
         listener.acknowledge.assert_not_called()
 
+    def test_plain_nonretriable_error_aborts(self) -> None:
+        pipeline, producer, listener, _checkpoint, _cursor = _make_pipeline(
+            transactional=True, records=[_make_record()]
+        )
+        producer.commit_transaction.side_effect = KafkaException(
+            _kafka_error(retriable=False, txn_requires_abort=False)
+        )
+
+        with pytest.raises(KafkaException):
+            pipeline.step()
+
+        producer.abort_transaction.assert_called_once()
+        listener.acknowledge.assert_not_called()
+
+    def test_errorless_kafka_exception_aborts(self) -> None:
+        pipeline, producer, listener, _checkpoint, _cursor = _make_pipeline(
+            transactional=True, records=[_make_record()]
+        )
+        producer.commit_transaction.side_effect = KafkaException("plain string error")
+
+        with pytest.raises(KafkaException):
+            pipeline.step()
+
+        producer.abort_transaction.assert_called_once()
+        listener.acknowledge.assert_not_called()
+
     def test_exhausted_retriable_commit_retries_on_next_step(self) -> None:
         pipeline, producer, listener, _checkpoint, _cursor = _make_pipeline(
             transactional=True,
@@ -364,9 +390,12 @@ class TestTransactionalPath:
 
 
 class TestCheckpoint:
-    def test_checkpoint_failure_skips_ack_and_retries_without_republish(self) -> None:
+    @pytest.mark.parametrize("transactional", [False, True])
+    def test_checkpoint_failure_skips_ack_and_retries_without_republish(
+        self, transactional: bool
+    ) -> None:
         pipeline, producer, listener, checkpoint, cursor = _make_pipeline(
-            records=[_make_record()]
+            transactional=transactional, records=[_make_record()]
         )
         checkpoint.side_effect = [RuntimeError("disk full"), None]
 
@@ -382,6 +411,9 @@ class TestCheckpoint:
         assert producer.produce.call_count == 1
         listener.acknowledge.assert_called_once()
         checkpoint.assert_called_with(cursor)
+        assert checkpoint.call_count == 2
+        if transactional:
+            assert producer.commit_transaction.call_count == 1
 
 
 class TestAckRetry:
@@ -395,7 +427,7 @@ class TestAckRetry:
         assert listener.acknowledge.call_count == 2
 
     def test_retry_budget_exhausted_then_step_retries_ack_only(self) -> None:
-        pipeline, producer, listener, _checkpoint, _cursor = _make_pipeline(
+        pipeline, producer, listener, checkpoint, _cursor = _make_pipeline(
             records=[_make_record()], ack_retries=2
         )
         listener.acknowledge.side_effect = [
@@ -409,12 +441,36 @@ class TestAckRetry:
 
         assert listener.acknowledge.call_count == 2
         assert producer.produce.call_count == 1
+        assert checkpoint.call_count == 1
 
         assert pipeline.step() == 1
 
         listener.poll_records.assert_called_once()
         assert producer.produce.call_count == 1
+        assert checkpoint.call_count == 1
         assert listener.acknowledge.call_count == 3
+
+    def test_terminal_ack_error_propagates_immediately(self) -> None:
+        pipeline, producer, listener, checkpoint, _cursor = _make_pipeline(
+            records=[_make_record()], ack_retries=3
+        )
+        listener.acknowledge.side_effect = CDCTerminalError("stream removed")
+
+        with pytest.raises(CDCTerminalError, match="stream removed"):
+            pipeline.step()
+
+        assert listener.acknowledge.call_count == 1
+        assert checkpoint.call_count == 1
+        assert producer.produce.call_count == 1
+
+        # Pipeline remains delivered_unacked: next step retries ack
+        # without re-producing.
+        listener.acknowledge.side_effect = None
+        assert pipeline.step() == 1
+        listener.poll_records.assert_called_once()
+        assert producer.produce.call_count == 1
+        assert checkpoint.call_count == 1
+        assert listener.acknowledge.call_count == 2
 
     def test_no_republish_during_ack_retry(self) -> None:
         pipeline, producer, listener, _checkpoint, _cursor = _make_pipeline(
@@ -519,6 +575,19 @@ class TestPartitionKey:
         with pytest.raises(ValueError, match="partition_key"):
             _make_pipeline(partition_key=b"")
 
+    def test_non_bytes_key_rejected(self) -> None:
+        listener = create_autospec(FDBMutationListener, instance=True)
+        listener.raw_stream_name = b"stream"
+        producer = create_autospec(MutationProducer, instance=True)
+        with pytest.raises(TypeError, match="partition_key must be bytes or None"):
+            BridgePipeline(
+                listener,
+                producer,
+                "cdc-topic",
+                lambda cursor: None,
+                partition_key="not-bytes",  # type: ignore[arg-type]
+            )
+
     def test_missing_key_rejected(self) -> None:
         with pytest.raises(ValueError, match="partition_key"):
             _make_pipeline(partition_key=None)
@@ -537,6 +606,10 @@ class TestPartitionKey:
 
 
 class TestConstruction:
+    def test_commit_outstanding_initial_state(self) -> None:
+        pipeline, _producer, _listener, _checkpoint, _cursor = _make_pipeline()
+        assert pipeline.commit_outstanding is False
+
     def test_ack_retries_must_be_positive(self) -> None:
         with pytest.raises(ValueError, match="ack_retries"):
             _make_pipeline(ack_retries=0)

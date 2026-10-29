@@ -11,7 +11,9 @@ the checkpoint and before ``acknowledge()`` is closed on resume, because the
 listener re-acknowledges a restored cursor. Both modes are at-least-once.
 
 Kafka failures do not acknowledge FDB. A failed idempotent step closes the
-producer so a later flush cannot publish the partial batch.
+producer, which flushes and then purges queued messages. Because some messages
+may have reached the broker, downstream consumers may see duplicate records
+upon replay, but at-least-once is preserved because FDB is not acknowledged.
 """
 
 from __future__ import annotations
@@ -19,14 +21,14 @@ from __future__ import annotations
 import logging
 import time
 from collections.abc import Callable
-from typing import Any
+from typing import Any, NoReturn
 
 from confluent_kafka import KafkaException
 
 from fdbkafka.cdc.v1 import mutations_pb2
 from src.cdc.errors import CDCRetryableError
 from src.cdc.listener import FDBMutationListener
-from src.kafka.producer import MutationProducer
+from src.kafka import MutationProducer, is_fatal_kafka_error
 
 logger = logging.getLogger(__name__)
 
@@ -120,7 +122,8 @@ class BridgePipeline:
         Raises:
             ValueError: If the partition key is empty, or a retry count is
                 less than 1, or a delay is negative.
-            TypeError: If a delay is not a number.
+            TypeError: If a delay is not a number, or partition_key is not
+                bytes or None.
         """
         _require_retries("ack_retries", ack_retries)
         _require_retries("commit_retries", commit_retries)
@@ -139,8 +142,15 @@ class BridgePipeline:
         self._pending_count = 0
         # Kafka has the batch. The cursor is not yet acknowledged.
         self._delivered_unacked = False
+        # Whether the checkpoint callback has run successfully for the current batch.
+        self._checkpointed = False
         # commit_transaction() was retriable. Do not abort; retry the commit.
         self._commit_outstanding = False
+
+    @property
+    def commit_outstanding(self) -> bool:
+        """Whether a Kafka transaction commit is in progress / needs retry."""
+        return self._commit_outstanding
 
     def step(self) -> int:
         """Process one CDC reply, or finish a delivery already in progress.
@@ -151,16 +161,28 @@ class BridgePipeline:
         Raises:
             KafkaException: Delivery or transaction failure. FDB was not
                 acknowledged. A fatal error means the producer must be
-                replaced. A retriable commit whose budget is exhausted leaves
+                replaced and the listener closed. A non-fatal transactional
+                abort aborts the transaction; close the listener and resume
+                from the last checkpoint (the transactional producer is
+                reusable). A retriable commit whose budget is exhausted leaves
                 the transaction open; call ``step`` again and do not close
                 the producer.
             BufferError: The local produce queue was full. The idempotent
-                producer has been closed. A transactional batch was aborted.
+                producer has been closed. A transactional batch was aborted
+                (close the listener and resume from the last checkpoint).
             TimeoutError: Idempotent flush timed out. The producer has been
                 closed. FDB was not acknowledged.
-            CDCRetryableError: Acknowledgement retries were exhausted after
-                Kafka delivery and a successful checkpoint. Call ``step``
-                again to retry the acknowledgement without republishing.
+            RuntimeError: The producer is closed or in a fatal error state.
+                The producer must be replaced and the listener closed.
+            CDCRetryableError: Transient FDB error. If raised during
+                ``poll_records()``, nothing was delivered. If raised after
+                Kafka delivery and checkpoint, all acknowledgement retries
+                were exhausted (call ``step`` again to retry the ack).
+            CDCTerminalError: Non-recoverable CDC error (e.g. stream removed).
+            CDCConsumerClosedError: The listener was closed.
+            CDCError: Underlying FDB CDC error.
+            SerializationError: Mutation could not be serialized into a valid
+                Protobuf record.
             Exception: ``checkpoint`` failed. FDB was not acknowledged. Call
                 ``step`` again to retry the checkpoint without republishing.
         """
@@ -190,7 +212,7 @@ class BridgePipeline:
         try:
             self._produce_all(records)
             self._producer.flush_or_raise()
-        except (KafkaException, BufferError, TimeoutError):
+        except (KafkaException, BufferError, TimeoutError, RuntimeError):
             self._producer.close()
             raise
         self._delivered_unacked = True
@@ -203,7 +225,7 @@ class BridgePipeline:
         try:
             self._produce_all(records)
         except (KafkaException, BufferError) as exc:
-            self._abort_open_transaction(exc)
+            self._abort_and_raise(exc)
         self._commit_outstanding = True
 
     def _finish_delivery(self) -> int:
@@ -223,19 +245,22 @@ class BridgePipeline:
             try:
                 self._producer.commit_transaction()
                 return
+            except RuntimeError:
+                self._commit_outstanding = False
+                raise
             except KafkaException as exc:
-                error = _kafka_error(exc)
-                if error is not None and _flag(error, "fatal"):
+                if is_fatal_kafka_error(exc):
                     self._commit_outstanding = False
                     self._producer.mark_fatal()
                     raise
+                error = _kafka_error(exc)
                 if (
                     error is None
                     or _flag(error, "txn_requires_abort")
                     or not _flag(error, "retriable")
                 ):
                     self._commit_outstanding = False
-                    self._abort_open_transaction(exc)
+                    self._abort_and_raise(exc)
                 last_exc = exc
                 logger.warning(
                     "Retriable Kafka commit failure (attempt %d/%d): %s",
@@ -251,17 +276,15 @@ class BridgePipeline:
         assert last_exc is not None
         raise last_exc
 
-    def _abort_open_transaction(self, exc: KafkaException | BufferError) -> None:
+    def _abort_and_raise(self, exc: KafkaException | BufferError) -> NoReturn:
         """Abort the open transaction and raise ``exc``.
 
         A fatal Kafka error is re-raised without an abort. An abort failure
         is chained to ``exc``; the producer marks itself fatal.
         """
-        if isinstance(exc, KafkaException):
-            error = _kafka_error(exc)
-            if error is not None and _flag(error, "fatal"):
-                self._producer.mark_fatal()
-                raise exc
+        if is_fatal_kafka_error(exc):
+            self._producer.mark_fatal()
+            raise exc
         try:
             self._producer.abort_transaction()
         except KafkaException as abort_exc:
@@ -273,9 +296,12 @@ class BridgePipeline:
 
         A checkpoint failure skips the acknowledgement.
         """
-        cursor = self._listener.get_position()
-        self._checkpoint(cursor)
+        if not self._checkpointed:
+            cursor = self._listener.get_position()
+            self._checkpoint(cursor)
+            self._checkpointed = True
         self._acknowledge_with_retry()
+        self._checkpointed = False
 
     def _acknowledge_with_retry(self) -> None:
         """Acknowledge the delivered reply, backing off on ``CDCRetryableError``."""
@@ -301,8 +327,15 @@ class BridgePipeline:
 def _resolve_partition_key(
     listener: FDBMutationListener, partition_key: bytes | None
 ) -> bytes:
-    """Return a non-empty key, deriving it from the listener when omitted."""
-    if isinstance(partition_key, (bytes, bytearray)):
+    """Return a non-empty key, deriving it from the listener when omitted.
+
+    Raises:
+        TypeError: If partition_key is not bytes or None.
+        ValueError: If the derived or passed partition key is empty.
+    """
+    if partition_key is not None:
+        if not isinstance(partition_key, (bytes, bytearray)):
+            raise TypeError("partition_key must be bytes or None")
         resolved = bytes(partition_key)
     else:
         raw = getattr(listener, "raw_stream_name", None)

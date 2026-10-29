@@ -29,9 +29,11 @@ acknowledge FDB
 ```
 
 `BufferError`, `KafkaException`, or `TimeoutError` closes the producer and
-does not checkpoint or acknowledge. `close()` purges anything still queued,
-so a later flush cannot publish the failed batch. Replace the producer,
-close the listener, and resume from the last checkpoint.
+does not checkpoint or acknowledge. `close()` flushes and then purges queued
+messages. Because some messages may have reached the broker, downstream consumers
+may see duplicate records upon replay, but at-least-once is preserved because
+FDB is not acknowledged. Replace the producer, close the listener, and resume
+from the last checkpoint.
 
 ## Transactional mode
 
@@ -45,13 +47,15 @@ acknowledge FDB
 
 | Commit error | Action |
 |--------------|--------|
-| `fatal()` | `mark_fatal()`, no abort, no ack. Replace the producer. |
-| `txn_requires_abort()`, or not retriable | `abort_transaction()`, no ack. |
+| `fatal()` | `mark_fatal()`, no abort, no ack. Replace the producer and close the listener. |
+| `txn_requires_abort()`, or not retriable | `abort_transaction()`, no ack. Close the listener and resume from checkpoint (producer is reusable). |
 | `retriable()` within the budget | `commit_transaction()` again. |
 | `retriable()` after the budget | Leave the transaction open and raise. Call `step()` again. Do not `close()` the producer: that aborts a commit which may still be finishing. |
 
-A produce failure aborts the open transaction unless the error is fatal.
-FDB is not acknowledged.
+A produce failure or non-fatal abort-required commit failure aborts the open
+transaction unless the error is fatal. FDB is not acknowledged. After an abort,
+the transactional producer remains reusable: close the listener and resume from
+the last checkpoint with the existing producer.
 
 ## Checkpoint and acknowledgement
 
@@ -64,20 +68,27 @@ not acknowledged.
 is re-polled or re-produced.
 
 If the checkpoint or the acknowledgement budget fails after delivery, the
-next `step()` retries that phase only.
+next `step()` retries that phase only (`checkpoint` is not re-invoked on an
+ack-only retry).
 
 ## Caller responsibilities
 
 1. Create and start the listener and producer. Call `init_transactions()` once
    before using a transactional producer.
-2. Pass a checkpoint that durably stores the CDC cursor.
+2. Pass a checkpoint callback that durably stores the CDC cursor.
 3. Call `step()` in a loop.
 4. After an idempotent delivery failure, replace the closed producer, close
    the listener, and resume from the last checkpoint.
-5. After retriable-commit exhaustion, or a checkpoint/ack failure, call
-   `step()` again. Do not close the producer while a commit is outstanding.
-6. On a fatal producer error, replace the producer and close the listener.
-7. Close both on shutdown.
+5. After a transactional abort, close the listener and resume from the last
+   checkpoint (the transactional producer is reusable; do not close it).
+6. After retriable-commit exhaustion, or a checkpoint/ack failure, call
+   `step()` again.
+7. On shutdown: check `pipeline.commit_outstanding`. If true, continue calling
+   `step()` until the commit succeeds or raises a non-retriable error; do not
+   close the producer while a commit is in progress. Once no commit is
+   outstanding, close the listener and producer.
+8. On a fatal producer error, replace the producer and close the listener.
+
 
 ## Guarantees and limitations
 
