@@ -13,13 +13,11 @@ use a browser or a simulator. The script walks through seven visible stages:
 
 ## Prerequisites
 
-The project branch used to run this demo must provide
-`src.bridge.config.from_dict` and `src.bridge.pipeline.Bridge`. This checkout
-does not currently contain those daemon APIs. It also requires live FDB 8.0 CDC
-and Kafka services, normally supplied by the project's Docker Compose stack.
+Running the demonstration requires live FoundationDB 8.0 (with CDC enabled)
+and Kafka broker services, normally supplied by the project's Docker Compose stack.
 
-Once those daemon APIs are present, run the demo from inside the application
-container so `kafka:19092` and the FDB cluster file are available:
+Run the demo from inside the application container so `kafka:19092` and the FDB
+cluster file are available:
 
 ```bash
 docker compose -f .devcontainer/docker-compose.yml up -d --build

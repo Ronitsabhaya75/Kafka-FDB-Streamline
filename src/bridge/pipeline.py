@@ -18,14 +18,25 @@ upon replay, but at-least-once is preserved because FDB is not acknowledged.
 
 from __future__ import annotations
 
+import json
 import logging
+import os
+import threading
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any, NoReturn
+
+try:
+    import fdb
+except ImportError:
+    fdb = None  # type: ignore[assignment]
 
 from confluent_kafka import KafkaException
 
 from fdbkafka.cdc.v1 import mutations_pb2
+from src.bridge.config import BridgeConfig
+from src.cdc.client import FDBClient
 from src.cdc.errors import CDCRetryableError
 from src.cdc.listener import FDBMutationListener
 from src.kafka import MutationProducer, is_fatal_kafka_error
@@ -350,3 +361,297 @@ def _resolve_partition_key(
             "expose a non-empty raw_stream_name or stream_name"
         )
     return resolved
+
+
+@dataclass
+class BridgeMetrics:
+    """Runtime metrics for the autonomous bridge loop.
+
+    Attributes:
+        mutations_published: Total count of individual mutations published to Kafka.
+        records_published: Total count of Kafka records published.
+        batches_acked: Total count of CDC batches acknowledged back to FDB.
+        errors_retried: Total count of transient errors caught and retried in the loop.
+    """
+
+    mutations_published: int = 0
+    records_published: int = 0
+    batches_acked: int = 0
+    errors_retried: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class _PersistedCursor:
+    """Minimal cursor structure exposing stream_id and last_consumed_version."""
+
+    stream_id: int
+    last_consumed_version: int
+
+
+def _save_cursor_to_file(path: str | None, position: Any) -> None:
+    """Persist current consumer position coordinates to a file atomically.
+
+    Args:
+        path: Destination file path, or None to skip persistence.
+        position: Native CDC cursor object exposing coordinates.
+    """
+    if not path or position is None:
+        return
+
+    stream_id = getattr(position, "stream_id", None)
+    version = getattr(position, "last_consumed_version", None)
+    if isinstance(position, dict):
+        stream_id = position.get("stream_id", stream_id)
+        version = position.get("last_consumed_version", version)
+
+    if stream_id is not None and version is not None:
+        try:
+            tmp_path = f"{path}.tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(
+                    {"stream_id": stream_id, "last_consumed_version": version},
+                    f,
+                )
+            os.replace(tmp_path, path)
+        except OSError as exc:
+            logger.warning("Failed to write cursor to %s: %s", path, exc)
+
+
+def _load_cursor_from_file(path: str | None) -> Any | None:
+    """Load persisted cursor coordinates from a file if present.
+
+    Args:
+        path: Path to the cursor file, or None.
+
+    Returns:
+        A reconstructed cursor instance, or None if unavailable.
+    """
+    if not path or not os.path.exists(path):
+        return None
+
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        stream_id = int(data["stream_id"])
+        version = int(data["last_consumed_version"])
+        if fdb is not None and hasattr(fdb, "CdcCursor"):
+            return fdb.CdcCursor(stream_id, version)
+        return _PersistedCursor(stream_id=stream_id, last_consumed_version=version)
+    except (OSError, ValueError, KeyError) as exc:
+        logger.warning("Could not read cursor file %s: %s", path, exc)
+        return None
+
+
+class _RecordCountingListener:
+    """Wrapper around FDBMutationListener to capture published records and counts."""
+
+    def __init__(self, listener: FDBMutationListener) -> None:
+        """Bind the underlying CDC listener.
+
+        Args:
+            listener: Underlying FDBMutationListener instance.
+        """
+        self._listener = listener
+        self._last_records: list[mutations_pb2.FDBMutationRecord] = []
+
+    def poll_records(
+        self, bridge_timestamp_ns: int | None = None
+    ) -> list[mutations_pb2.FDBMutationRecord]:
+        """Poll the underlying listener and buffer records for metric tallying.
+
+        Args:
+            bridge_timestamp_ns: Optional timestamp for record headers.
+
+        Returns:
+            List of polled Protobuf mutation records.
+        """
+        records = self._listener.poll_records(bridge_timestamp_ns=bridge_timestamp_ns)
+        self._last_records = records
+        return records
+
+    def pop_last_records(self) -> list[mutations_pb2.FDBMutationRecord]:
+        """Return and clear the buffered records from the latest poll.
+
+        Returns:
+            List of Protobuf mutation records from the last successful poll.
+        """
+        records = self._last_records
+        self._last_records = []
+        return records
+
+    def __getattr__(self, name: str) -> Any:
+        """Delegate attribute access to the underlying listener."""
+        return getattr(self._listener, name)
+
+
+class Bridge:
+    """Autonomous Bridge daemon managing CDC listener, producer, and run loop.
+
+    Orchestrates FoundationDB CDC polling, Protobuf serialization, durable Kafka
+    publishing, and watermark advancement via :class:`BridgePipeline`.
+
+    Args:
+        config: Declarative configuration for FDB, CDC stream, Kafka, and pipeline.
+        client: Optional pre-configured :class:`FDBClient` (useful for testing).
+        listener: Optional pre-configured :class:`FDBMutationListener`.
+        producer: Optional pre-configured :class:`MutationProducer`.
+    """
+
+    def __init__(
+        self,
+        config: BridgeConfig,
+        *,
+        client: FDBClient | None = None,
+        listener: FDBMutationListener | None = None,
+        producer: MutationProducer | None = None,
+    ) -> None:
+        """Initialize the Bridge with declarative configuration.
+
+        Args:
+            config: Validated BridgeConfig instance.
+            client: Optional injected FDBClient.
+            listener: Optional injected FDBMutationListener.
+            producer: Optional injected MutationProducer.
+        """
+        self.config = config
+        self._shutdown_requested = threading.Event()
+        self.metrics = BridgeMetrics()
+        self._client: FDBClient | None = client
+        self._listener: FDBMutationListener | None = listener
+        self._producer: MutationProducer | None = producer
+        self._pipeline: BridgePipeline | None = None
+        self._counting_listener: _RecordCountingListener | None = None
+
+    @property
+    def mutations_published(self) -> int:
+        """Total count of individual mutations published to Kafka."""
+        return self.metrics.mutations_published
+
+    @property
+    def batches_acked(self) -> int:
+        """Total count of CDC batches acknowledged back to FoundationDB."""
+        return self.metrics.batches_acked
+
+    def start(self) -> None:
+        """Initialize FDB client, register CDC stream, and start listener."""
+        if self._pipeline is not None:
+            return
+
+        if self._client is None:
+            self._client = FDBClient(
+                cluster_file=self.config.fdb.cluster_file,
+                api_version=self.config.fdb.api_version,
+            )
+            self._client.open()
+
+        if self._listener is None:
+            key_range = (
+                (self.config.cdc.begin_key, self.config.cdc.end_key)
+                if self.config.cdc.begin_key or self.config.cdc.end_key
+                else None
+            )
+            cursor = _load_cursor_from_file(self.config.cdc.cursor_file)
+            self._listener = FDBMutationListener(
+                self._client,
+                stream_name=self.config.cdc.stream_name,
+                key_range=key_range,
+                cursor=cursor,
+                max_record_bytes=self.config.cdc.max_record_bytes,
+            )
+            self._listener.start()
+
+        if self._producer is None:
+            self._producer = MutationProducer(
+                self.config.kafka.bootstrap_servers,
+            )
+
+        self._counting_listener = _RecordCountingListener(self._listener)
+        stream_bytes = (
+            self.config.cdc.stream_name.encode("utf-8")
+            if isinstance(self.config.cdc.stream_name, str)
+            else self.config.cdc.stream_name
+        )
+        partition_key = stream_bytes if stream_bytes else None
+
+        def _checkpoint_callback(position: Any) -> None:
+            _save_cursor_to_file(self.config.cdc.cursor_file, position)
+
+        self._pipeline = BridgePipeline(
+            self._counting_listener,  # type: ignore[arg-type]
+            self._producer,
+            topic=self.config.kafka.topic,
+            checkpoint=_checkpoint_callback,
+            partition_key=partition_key,
+        )
+
+    def run(self) -> None:
+        """Execute continuous streaming run loop until shutdown is requested.
+
+        Raises:
+            RuntimeError: If called before :meth:`start`.
+        """
+        if (
+            self._listener is None
+            or self._producer is None
+            or self._pipeline is None
+            or self._counting_listener is None
+        ):
+            raise RuntimeError("Bridge must be started before calling run()")
+
+        backoff = self.config.pipeline.backoff_base_seconds
+
+        while not self._shutdown_requested.is_set():
+            try:
+                published = self._pipeline.step()
+                if published == 0:
+                    self._shutdown_requested.wait(timeout=backoff)
+                    backoff = min(
+                        backoff * 1.5, self.config.pipeline.backoff_max_seconds
+                    )
+                    continue
+
+                backoff = self.config.pipeline.backoff_base_seconds
+                records = self._counting_listener.pop_last_records()
+                batch_mutations = 0
+                for record in records:
+                    if record.HasField("batch"):
+                        batch_mutations += len(record.batch.mutations)
+                    elif record.HasField("mutation"):
+                        batch_mutations += 1
+
+                self.metrics.mutations_published += batch_mutations
+                self.metrics.records_published += len(records) if records else published
+                self.metrics.batches_acked += 1
+            except Exception as exc:
+                logger.warning("Error in bridge run loop: %s", exc)
+                self.metrics.errors_retried += 1
+                if self._shutdown_requested.is_set():
+                    break
+                self._shutdown_requested.wait(timeout=backoff)
+
+    def request_shutdown(self) -> None:
+        """Signal the daemon run loop to stop cleanly."""
+        self._shutdown_requested.set()
+
+    def stop(self) -> None:
+        """Request shutdown and release all handles."""
+        self.request_shutdown()
+        if self._producer is not None:
+            self._producer.close(timeout=self.config.pipeline.shutdown_timeout_seconds)
+            self._producer = None
+        if self._listener is not None:
+            self._listener.close()
+            self._listener = None
+        if self._client is not None:
+            self._client.close()
+            self._client = None
+        self._pipeline = None
+        self._counting_listener = None
+
+
+__all__ = [
+    "Bridge",
+    "BridgeMetrics",
+    "BridgePipeline",
+    "Checkpoint",
+]

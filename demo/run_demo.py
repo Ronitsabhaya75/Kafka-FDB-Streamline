@@ -441,9 +441,9 @@ def run_demo(bootstrap_servers: str, timeout: float, count: int) -> None:
             if rec.HasField("batch"):
                 schema_counts["FDBMutationBatch (Payload)"] += 1
                 if "FDBMutationBatch" not in sample_messages:
-                    sample_messages[
-                        "FDBMutationBatch"
-                    ] = f"{len(rec.batch.mutations)} batched mutations"
+                    sample_messages["FDBMutationBatch"] = (
+                        f"{len(rec.batch.mutations)} batched mutations"
+                    )
 
                 for m in rec.batch.mutations:
                     schema_counts["FDBMutation (Container)"] += 1
