@@ -95,3 +95,4 @@ def test_from_dict_raw_bytes_keys() -> None:
     cfg = from_dict(raw)
     assert cfg.cdc.begin_key == b"\x01\x02"
     assert cfg.cdc.end_key == b"\x01\x03"
+
