@@ -111,11 +111,18 @@ remains accessible for configuration inspection.
   expires, returning the count of remaining messages.
 - `flush_or_raise(timeout)` blocks until all messages are delivered; if any
   messages remain queued after timeout, it raises `TimeoutError`.
-- `close()` attempts to abort any open transaction (only if a transaction is
-  currently open), then flushes remaining messages. It logs but does not propagate
-  exceptions. After close, the producer is marked closed. If undelivered messages
-  remain after the final flush (or if flush raises), the remaining count is
-  inspected via `len()` and a warning is logged.
+- `close(timeout=10.0)` aborts any open transaction, then flushes remaining
+  messages; `timeout` bounds the abort and each flush. If messages remain
+  undelivered (or the flush raises), a warning with the remaining count is logged
+  and the queue is purged: their `on_delivery` callbacks receive
+  `KafkaError._PURGE_QUEUE` or `KafkaError._PURGE_INFLIGHT`. A purged in-flight
+  message may still have reached the broker, so its outcome is unknown and the
+  caller must replay it. The underlying librdkafka producer is then released and
+  the wrapper marked closed. `close()` logs but does not propagate exceptions, and
+  is idempotent.
+- Without the purge, pending delivery callbacks would keep the wrapper (and its
+  librdkafka threads) alive indefinitely, retrying forever under
+  `message.timeout.ms=0`.
 
 ## Tests
 

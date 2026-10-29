@@ -147,7 +147,8 @@ class MutationProducer:
         self._user_error_cb = user_error_cb
         merged["error_cb"] = self._error_cb
 
-        self._producer = Producer(merged)
+        # None once closed; every other method checks _closed before use.
+        self._producer: Producer | None = Producer(merged)
         self._delivery_errors: list[KafkaError] = []
         self._transactional: bool = transactional_id is not None
         self._txn_initialized: bool = False
@@ -422,30 +423,43 @@ class MutationProducer:
         """
         self._fatal = True
 
-    def close(self) -> None:
+    def close(self, timeout: float = 10.0) -> None:
         """Flush remaining messages and release the underlying producer.
 
-        Aborts an open transaction in transactional mode, then flushes.
-        Logs but does not propagate exceptions.  After close, the producer
-        is marked closed.  If undelivered messages remain, a warning is logged.
+        Aborts an open transaction in transactional mode, then flushes.  If
+        messages remain undelivered after the flush (or the flush raises), they
+        are purged: their ``on_delivery`` callbacks receive
+        ``KafkaError._PURGE_QUEUE`` or ``KafkaError._PURGE_INFLIGHT`` and a
+        warning is logged.  A purged in-flight message may still have reached
+        the broker, so its outcome is unknown and the caller must replay it.
+
+        The underlying librdkafka producer is then dropped and the wrapper
+        marked closed.  Logs but does not propagate exceptions.  Idempotent.
+
+        Args:
+            timeout: Maximum seconds for the transaction abort and for each
+                flush (before and after the purge).
         """
         if self._closed:
             return
+        producer = self._producer
 
         if self._transactional and self._txn_open:
             try:
-                self._producer.abort_transaction(10.0)
+                producer.abort_transaction(timeout)
                 self._txn_open = False
             except Exception:
                 logger.debug("Abort during close (may be expected)", exc_info=True)
 
-        undelivered = -1
+        flush_failed = False
+        undelivered = 0
         try:
-            undelivered = self._producer.flush(10.0)
+            undelivered = producer.flush(timeout)
         except Exception:
+            flush_failed = True
             logger.exception("Error flushing producer during close")
             try:
-                undelivered = len(self._producer)
+                undelivered = len(producer)
             except Exception:
                 undelivered = -1
 
@@ -453,6 +467,17 @@ class MutationProducer:
             logger.warning(
                 "%d message(s) could not be delivered during close", undelivered
             )
+        if undelivered > 0 or flush_failed:
+            # Pending delivery callbacks hold references to self that librdkafka
+            # owns, so without a purge the wrapper is never collected and, with
+            # message.timeout.ms=0, keeps retrying for the life of the process.
+            try:
+                producer.purge()
+                producer.flush(timeout)
+            except Exception:
+                logger.exception("Error purging producer during close")
+
+        self._producer = None
         self._closed = True
 
     def __len__(self) -> int:
