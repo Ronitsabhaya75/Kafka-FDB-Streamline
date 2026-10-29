@@ -172,6 +172,16 @@ class FDBMutationListener:
             _raise_consume_failure(exc, "restore resumed CDC position")
 
     @property
+    def delivery_failed(self) -> bool:
+        """Whether the last reply failed to serialize; only a resume clears it."""
+        return self._delivery_failed
+
+    @property
+    def awaiting_ack(self) -> bool:
+        """Whether a delivered reply must be acknowledged before the next poll."""
+        return self._awaiting_ack
+
+    @property
     def consumer(self) -> Any:
         """Return the active native consumer, starting it on first access."""
         if self._is_closed:

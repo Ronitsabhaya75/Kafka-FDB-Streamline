@@ -621,3 +621,24 @@ class TestConstruction:
     def test_negative_delay_rejected(self) -> None:
         with pytest.raises(ValueError, match="ack_retry_delay_seconds"):
             _make_pipeline(ack_retry_delay_seconds=-0.1)
+
+
+def test_flush_timeout_seconds_reaches_flush_or_raise() -> None:
+    listener = create_autospec(FDBMutationListener, instance=True)
+    listener.poll_records.return_value = [_make_record()]
+    producer = create_autospec(MutationProducer, instance=True)
+    type(producer).transactional = PropertyMock(return_value=False)
+    pipeline = BridgePipeline(
+        listener,
+        producer,
+        "cdc-topic",
+        MagicMock(),
+        partition_key=b"test-stream",
+        flush_timeout_seconds=4.5,
+    )
+
+    pipeline.step()
+
+    (call,) = producer.flush_or_raise.call_args_list
+    timeout = call.kwargs.get("timeout", call.args[0] if call.args else None)
+    assert timeout == 4.5

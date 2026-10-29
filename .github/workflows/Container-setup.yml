@@ -295,6 +295,7 @@ jobs:
               PYTHONPATH=/workspace:/workspace/protobuf/gen \
               python3 -m pytest \
                 tests/bridge/ \
+                tests/demo/ \
                 -v -m "not integration"
             '
 
