@@ -1,3 +1,7 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "kafka-fdb-streamline"
 version = "0.1.0"
@@ -8,6 +12,25 @@ dependencies = [
     "confluent-kafka>=2.6,<3",
     "protobuf>=7.34,<8",
 ]
+
+[tool.setuptools]
+packages = [
+    "src",
+    "src.bridge",
+    "src.cdc",
+    "src.kafka",
+    "src.serialization",
+    "fdbkafka",
+    "fdbkafka.cdc",
+    "fdbkafka.cdc.v1",
+]
+
+[tool.setuptools.package-dir]
+src = "src"
+fdbkafka = "protobuf/gen/fdbkafka"
+
+[tool.setuptools.package-data]
+"*" = ["*.pyi"]
 
 [tool.black]
 line-length = 88
