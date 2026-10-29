@@ -47,14 +47,24 @@ _DEFAULT_PERFORMANCE_CONFIG: dict[str, Any] = {
 _FORBIDDEN_EXTRA_KEYS = frozenset(_MANDATORY_CONFIG) | {"transactional.id"}
 
 
-def _is_fatal_kafka_error(exc: Exception) -> bool:
-    """Return True if exc represents a fatal Kafka error."""
+def is_fatal_kafka_error(exc: Exception) -> bool:
+    """Return True if exc represents a fatal Kafka error.
+
+    Args:
+        exc: Exception to test.
+
+    Returns:
+        True if exc is a KafkaException whose carried KafkaError reports fatal.
+    """
     if isinstance(exc, KafkaException) and exc.args:
         err = exc.args[0]
         if hasattr(err, "fatal") and callable(err.fatal):
             res = err.fatal()
             return res is True or (isinstance(res, bool) and res)
     return False
+
+
+_is_fatal_kafka_error = is_fatal_kafka_error
 
 
 def _default_error_cb(err: KafkaError) -> None:
