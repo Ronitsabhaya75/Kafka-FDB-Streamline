@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from typing import Any
 
 
@@ -31,6 +31,7 @@ class KafkaConfig:
 
     bootstrap_servers: str = "localhost:9092"
     topic: str = "fdb-cdc"
+    transactional_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,6 +63,13 @@ def _require_dict(section: str, value: Any) -> dict[str, Any]:
     return value
 
 
+def _reject_unknown_keys(section: str, value: dict[str, Any], cls: type) -> None:
+    """Raise if a section carries keys that are not fields of its config class."""
+    unknown = sorted(set(value) - {f.name for f in fields(cls)})
+    if unknown:
+        raise ValueError(f"Unknown key(s) in '{section}': {', '.join(unknown)}")
+
+
 def _parse_key(key: Any, name: str) -> bytes:
     """Parse a key configuration value into bytes."""
     if isinstance(key, str):
@@ -88,18 +96,25 @@ def from_dict(data: dict[str, Any]) -> BridgeConfig:
     Raises:
         TypeError: If data or a sub-configuration section is not a dictionary,
             or if any string or numeric setting has an invalid type.
-        ValueError: If stream_name or topic is empty, a key range is one-sided,
-            a hex string is invalid, or numeric intervals are not positive.
+        ValueError: If any section has an unknown key, stream_name, topic or
+            transactional_id is empty or whitespace-only, a key range is
+            one-sided or has begin_key >= end_key, a hex string is invalid, or
+            numeric intervals are not positive.
     """
     if not isinstance(data, dict):
         raise TypeError(
             f"Configuration must be a dictionary, got {type(data).__name__}"
         )
 
+    _reject_unknown_keys("<root>", data, BridgeConfig)
     fdb_dict = _require_dict("fdb", data.get("fdb"))
     cdc_dict = _require_dict("cdc", data.get("cdc"))
     kafka_dict = _require_dict("kafka", data.get("kafka"))
     pipeline_dict = _require_dict("pipeline", data.get("pipeline"))
+    _reject_unknown_keys("fdb", fdb_dict, FDBConfig)
+    _reject_unknown_keys("cdc", cdc_dict, CDCConfig)
+    _reject_unknown_keys("kafka", kafka_dict, KafkaConfig)
+    _reject_unknown_keys("pipeline", pipeline_dict, PipelineConfig)
 
     # FDB validation
     raw_api_version = fdb_dict.get("api_version", 800)
@@ -116,6 +131,8 @@ def from_dict(data: dict[str, Any]) -> BridgeConfig:
     stream_name = cdc_dict.get("stream_name", "")
     if not isinstance(stream_name, str):
         raise TypeError("cdc.stream_name must be a string")
+    if not stream_name.strip():
+        raise ValueError("cdc.stream_name must be a non-empty string")
 
     raw_begin = cdc_dict.get("begin_key", "")
     raw_end = cdc_dict.get("end_key", "")
@@ -128,6 +145,8 @@ def from_dict(data: dict[str, Any]) -> BridgeConfig:
             "cdc.begin_key and cdc.end_key must either both be specified "
             "or both omitted"
         )
+    if begin_key and begin_key >= end_key:
+        raise ValueError("cdc.begin_key must be less than cdc.end_key")
 
     max_record_bytes = cdc_dict.get("max_record_bytes", 1_000_000)
     if not isinstance(max_record_bytes, int) or isinstance(max_record_bytes, bool):
@@ -147,6 +166,13 @@ def from_dict(data: dict[str, Any]) -> BridgeConfig:
     topic = kafka_dict.get("topic", "fdb-cdc")
     if not isinstance(topic, str) or not topic.strip():
         raise ValueError("kafka.topic must be a non-empty string")
+
+    transactional_id = kafka_dict.get("transactional_id")
+    if transactional_id is not None:
+        if not isinstance(transactional_id, str):
+            raise TypeError("kafka.transactional_id must be a string or None")
+        if not transactional_id.strip():
+            raise ValueError("kafka.transactional_id must be a non-empty string")
 
     # Pipeline validation
     flush_timeout = pipeline_dict.get("flush_timeout_seconds", 10.0)
@@ -196,6 +222,7 @@ def from_dict(data: dict[str, Any]) -> BridgeConfig:
         kafka=KafkaConfig(
             bootstrap_servers=bootstrap_servers,
             topic=topic,
+            transactional_id=transactional_id,
         ),
         pipeline=PipelineConfig(
             flush_timeout_seconds=float(flush_timeout),

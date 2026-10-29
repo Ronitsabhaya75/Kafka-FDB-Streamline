@@ -6,7 +6,7 @@ Demonstrates the Kafka Bridge running as an autonomous streaming daemon:
 3. Upstream application commits representative writes and atomic mutations.
 4. Bridge autonomously captures CDC mutations, serializes them to Protobuf,
    delivers them to Kafka (acks=all), and advances the FDB retention watermark.
-5. Downstream consumers ingest and validate all Protobuf schemas and mutation types.
+5. Downstream consumer verifies every record against the committed workload.
 6. Gracefully terminates the Bridge daemon with queue drainage.
 """
 
@@ -15,16 +15,17 @@ from __future__ import annotations
 import argparse
 import os
 import struct
+import sys
 import threading
 import time
 import uuid
-from collections import defaultdict
 from collections.abc import Sequence
 from typing import Any
 
 import fdb
 from confluent_kafka import Consumer, KafkaException
 
+from demo.workload import verify_workload
 from fdbkafka.cdc.v1 import mutations_pb2
 from src.bridge.config import from_dict
 from src.bridge.pipeline import Bridge
@@ -271,6 +272,29 @@ def _consume_records(
     return records
 
 
+def _stop_bridge(bridge: Bridge | None, thread: threading.Thread | None) -> None:
+    """Best-effort bridge teardown that never raises or blocks on a stuck step.
+
+    Args:
+        bridge: Bridge to stop, if one was created.
+        thread: Thread running `bridge.run()`, if one was started.
+    """
+    if bridge is None:
+        return
+    if thread is not None and thread.is_alive():
+        # stop() would wait on the step lock the stuck thread holds; the daemon
+        # thread dies with the process.
+        print(
+            "      WARNING: bridge thread still running; skipping stop()",
+            file=sys.stderr,
+        )
+        return
+    try:
+        bridge.stop()
+    except Exception as exc:
+        print(f"      WARNING: bridge.stop() failed: {exc!r}", file=sys.stderr)
+
+
 def run_demo(bootstrap_servers: str, timeout: float, count: int) -> None:
     """Run step-by-step FoundationDB CDC to Kafka Bridge demonstration.
 
@@ -425,129 +449,31 @@ def run_demo(bootstrap_servers: str, timeout: float, count: int) -> None:
             f"{consume_duration:.3f}s"
         )
 
-        # 6. Comprehensive Protobuf Schema Audit & Inspection
-        print("\n[6/7] Comprehensive Protobuf Schema Audit & Deserialization")
-        print("      Auditing every Protobuf schema message from mutations.proto:")
-
-        schema_counts: dict[str, int] = defaultdict(int)
-        mutation_audit: dict[str, int] = defaultdict(int)
-        sample_messages: dict[str, Any] = {}
-
-        total_wire_bytes = 0
-        total_deserialized_mutations = 0
-        seen_coordinates: set[tuple[int, int]] = set()
-        duplicate_coordinates: list[tuple[int, int]] = []
-
-        for rec in consumed:
-            total_wire_bytes += rec.ByteSize()
-            schema_counts["FDBMutationRecord (Envelope)"] += 1
-            if "FDBMutationRecord" not in sample_messages:
-                sample_messages["FDBMutationRecord"] = (
-                    f"stream_name='{rec.stream_name}', "
-                    f"timestamp={rec.bridge_timestamp.seconds}s"
-                )
-
-            if rec.HasField("batch"):
-                schema_counts["FDBMutationBatch (Payload)"] += 1
-                if "FDBMutationBatch" not in sample_messages:
-                    sample_messages["FDBMutationBatch"] = (
-                        f"{len(rec.batch.mutations)} batched mutations"
-                    )
-
-                for m in rec.batch.mutations:
-                    schema_counts["FDBMutation (Container)"] += 1
-                    schema_counts["FDBVersionIndex (Coordinate)"] += 1
-                    total_deserialized_mutations += 1
-
-                    v_idx = m.version_index
-                    coord = (v_idx.fdb_version, v_idx.sequence_no)
-                    if coord in seen_coordinates:
-                        duplicate_coordinates.append(coord)
-                    seen_coordinates.add(coord)
-
-                    if "FDBVersionIndex" not in sample_messages:
-                        sample_messages["FDBVersionIndex"] = (
-                            f"fdb_version={v_idx.fdb_version}, "
-                            f"sequence_no={v_idx.sequence_no}"
-                        )
-
-                    which = m.WhichOneof("mutation")
-                    if which == "single_key_mutation":
-                        schema_counts["FDBSingleKeyMutation (SingleKey)"] += 1
-                        skm = m.single_key_mutation
-                        t_code = skm.mutation_type
-                        t_name = MUTATION_TYPE_NAMES.get(t_code, f"TYPE_{t_code}")
-                        mutation_audit[f"{t_name} (code {t_code})"] += 1
-
-                        if "FDBSingleKeyMutation" not in sample_messages:
-                            sample_messages["FDBSingleKeyMutation"] = (
-                                f"type={t_name}, key={skm.key[:30]!r}, "
-                                f"val_len={len(skm.value)}"
-                            )
-
-                    elif which == "clear_range":
-                        schema_counts["FDBClearRange (RangeClear)"] += 1
-                        clr = m.clear_range
-                        mutation_audit["CLEAR_RANGE (code 1)"] += 1
-                        if "FDBClearRange" not in sample_messages:
-                            sample_messages["FDBClearRange"] = (
-                                f"begin={clr.begin_key[:25]!r}, "
-                                f"end={clr.end_key[:25]!r}"
-                            )
-
-            elif rec.HasField("version_end"):
-                schema_counts["VersionEnd (Envelope)"] += 1
-                ve = rec.version_end
-                if "VersionEnd" not in sample_messages:
-                    sample_messages["VersionEnd"] = (
-                        f"fdb_version={ve.fdb_version}, "
-                        f"total_mutations={ve.total_mutations}"
-                    )
-
-            elif rec.HasField("mutation"):
-                schema_counts["FDBMutation (Container)"] += 1
-                total_deserialized_mutations += 1
-
-        print("\n      --- Protobuf Schemas Verified ---")
-        for s_name, s_count in sorted(schema_counts.items()):
-            sample_info = sample_messages.get(s_name.split()[0], "")
-            print(f"      [✓] {s_name:<36} : count = {s_count:,}")
-            if sample_info:
-                print(f"          Sample: {sample_info}")
-
-        print("\n      --- Mutation Types Deserialized & Audited ---")
-        for m_name in sorted(mutation_audit.keys()):
-            print(f"      [✓] {m_name:<36} : count = {mutation_audit[m_name]:,}")
-
-        print(
-            f"\n      Total wire payload: {total_wire_bytes / 1024 / 1024:.2f} MB "
-            f"across {len(consumed):,} Kafka messages"
-        )
-        print(
-            f"      Decoded {total_deserialized_mutations:,} total mutations "
-            f"with 100% schema fidelity."
-        )
-
-        # Workload completeness and uniqueness assertions
-        if duplicate_coordinates:
-            raise AssertionError(
-                f"Workload verification failed: detected {len(duplicate_coordinates)} "
-                f"duplicate mutation coordinates (e.g. {duplicate_coordinates[:3]!r})"
-            )
-        if total_deserialized_mutations != count:
-            raise AssertionError(
-                f"Workload completeness failed: expected {count:,} mutations, but "
-                f"deserialized {total_deserialized_mutations:,}"
-            )
+        # 6. Workload Verification
+        print("\n[6/7] Workload Verification: Kafka Records vs. Committed Writes")
         if bridge.mutations_published != count:
             raise AssertionError(
                 f"Bridge published count mismatch: expected {count:,}, but bridge "
                 f"published {bridge.mutations_published:,}"
             )
-        if schema_counts["VersionEnd (Envelope)"] == 0:
-            raise AssertionError(
-                "Workload completeness failed: no VersionEnd records received"
-            )
+        type_counts = verify_workload(consumed, prefix, count)
+        versions = sum(1 for rec in consumed if rec.HasField("version_end"))
+        total_wire_bytes = sum(rec.ByteSize() for rec in consumed)
+        print(
+            f"      Verified all {count:,} workload mutations byte for byte "
+            "(versionstamped ops on prefix, suffix and length)."
+        )
+        print(
+            f"      Verified {versions:,} VersionEnd boundaries: unique coordinates, "
+            "contiguous sequences, totals sum to the workload."
+        )
+        for code, n in sorted(type_counts.items()):
+            label = f"{MUTATION_TYPE_NAMES.get(code, f'TYPE_{code}')} (code {code})"
+            print(f"      [✓] {label:<36} : count = {n:,}")
+        print(
+            f"      Total wire payload: {total_wire_bytes / 1024 / 1024:.2f} MB "
+            f"across {len(consumed):,} Kafka messages"
+        )
 
         # 7. Graceful Bridge Shutdown
         print("\n[7/7] Bridge Service: Graceful Shutdown & Drain")
@@ -563,8 +489,8 @@ def run_demo(bootstrap_servers: str, timeout: float, count: int) -> None:
 
         print("\n" + "=" * 76)
         print(
-            f"  SUCCESS: {total_deserialized_mutations:,} FDB mutations streamed by "
-            f"Bridge -> Kafka '{topic}' with all Protobuf schemas verified!"
+            f"  SUCCESS: {count:,} FDB mutations streamed by Bridge -> Kafka "
+            f"'{topic}' and verified against the committed workload."
         )
         print("=" * 76 + "\n")
 
@@ -573,8 +499,7 @@ def run_demo(bootstrap_servers: str, timeout: float, count: int) -> None:
             bridge.request_shutdown()
         if bridge_thread is not None and bridge_thread.is_alive():
             bridge_thread.join(timeout=10.0)
-        if bridge is not None:
-            bridge.stop()
+        _stop_bridge(bridge, bridge_thread)
         if database is not None:
             try:
                 del database[prefix : strinc(prefix)]

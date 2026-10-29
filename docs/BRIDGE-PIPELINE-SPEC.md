@@ -57,6 +57,19 @@ A produce failure or non-fatal abort-required commit failure aborts the open tra
 
 If the checkpoint or the acknowledgement budget fails after delivery, the next `step()` retries that phase only (`checkpoint` is not re-invoked on an ack-only retry).
 
+### Caller responsibilities
+
+`Bridge` follows these rules; a caller driving `BridgePipeline` directly must too.
+
+1. Create and start the listener and producer. Call `init_transactions()` once before using a transactional producer.
+2. Pass a checkpoint callback that durably stores the CDC cursor.
+3. Call `step()` in a loop.
+4. After an idempotent delivery failure, replace the closed producer, close the listener, and resume from the last checkpoint.
+5. After a transactional abort, close the listener and resume from the last checkpoint (the transactional producer is reusable; do not close it).
+6. After retriable-commit exhaustion, or a checkpoint/ack failure, call `step()` again.
+7. On shutdown: check `pipeline.commit_outstanding`. If true, continue calling `step()` until the commit succeeds or raises a non-retriable error; do not close the producer while a commit is in progress. Once no commit is outstanding, close the listener and producer.
+8. On a fatal producer error, replace the producer and close the listener.
+
 ---
 
 ## 2. Autonomous Daemon (`Bridge`)
@@ -67,36 +80,53 @@ If the checkpoint or the acknowledgement budget fails after delivery, the next `
 
 Parsed via `from_dict(data)`:
 - `fdb`: `api_version` (default 800), `cluster_file` (optional path).
-- `cdc`: `stream_name` (required non-empty), `begin_key` / `end_key` (paired hex strings or bytes), `max_record_bytes`, `cursor_file` (optional path).
-- `kafka`: `bootstrap_servers`, `topic`.
+- `cdc`: `stream_name` (required; empty or whitespace-only is rejected), `begin_key` / `end_key` (paired hex strings or bytes, `begin_key < end_key`), `max_record_bytes`, `cursor_file` (optional path).
+- `kafka`: `bootstrap_servers`, `topic`, `transactional_id` (optional non-empty string; setting it enables transactional mode).
 - `pipeline`: `flush_timeout_seconds`, `backoff_base_seconds`, `backoff_max_seconds`, `shutdown_timeout_seconds`.
+
+Unknown keys at any level raise `ValueError`, so a typo fails instead of silently falling back to a default.
+
+### Producer wiring
+
+`Bridge(config, *, client=None, listener=None, producer=None, producer_factory=None)`. The first pipeline uses the injected listener/producer if given. Every replacement producer comes from `producer_factory`, defaulting to `MutationProducer(kafka.bootstrap_servers, transactional_id=kafka.transactional_id)`.
+
+- Transactional mode is enabled by `kafka.transactional_id`, or by injecting a transactional producer together with a `producer_factory` that builds transactional replacements. Injecting a transactional producer with neither raises `ValueError` at construction, since a rebuild would otherwise downgrade it to idempotent.
+- `start()` calls `init_transactions()` on a transactional producer, so an injected one must not be pre-initialised.
 
 ### Cursor File Persistence
 
 When `config.cdc.cursor_file` is specified, `Bridge` persists the cursor atomically and durably:
-1. Writes JSON containing `{"stream_id": <int>, "last_consumed_version": <int>}` to a `.tmp` file.
+1. Writes JSON containing `{"stream_id": <int>, "last_consumed_version": <int>, "stream_name": <str>}` to a `.tmp` file.
 2. Calls `f.flush()` and `os.fsync(f.fileno())` to sync data blocks to disk.
 3. Performs atomic rename via `os.replace(tmp_path, cursor_file)`.
-4. Fsyncs the parent directory to guarantee the directory entry update is durable.
-5. Propagates any `OSError` or coordinate `ValueError` directly to prevent acknowledging FoundationDB if the checkpoint cannot be written.
+4. Fsyncs the parent directory to guarantee the directory entry update is durable. Only `EINVAL`/`ENOTSUP`/`EOPNOTSUPP` (filesystems that cannot fsync a directory) are tolerated.
+5. Propagates any other `OSError`, a `None` position, or invalid coordinates (`ValueError`) so FoundationDB is not acknowledged unless the checkpoint is durable.
 
-On startup, if `cursor_file` exists, it is parsed strictly; missing fields or invalid JSON raise `ValueError` to prevent silently running from a fresh consumer.
+On start and on every rebuild, if `cursor_file` exists it is parsed strictly. Invalid JSON, missing or non-integer coordinates, or a `stream_name` other than `cdc.stream_name` (including a file with no `stream_name`) raise `ValueError` rather than silently resuming from a fresh or foreign cursor.
 
 ### Error Classification and Recovery Loop
 
 In `Bridge.run()`:
-- **Terminal Errors** (`CDCTerminalError`, fatal Kafka errors via `is_fatal_kafka_error`): Sets shutdown, logs with `exc_info=True`, and re-raises immediately.
-- **Recoverable Step Failures** (`CDCRetryableError` during acks): Retried on the active pipeline.
-- **Handle Invalidation Failures** (`BufferError`, flush `TimeoutError`, non-fatal `KafkaException` closing the idempotent producer):
-  1. Safely closes the existing invalid producer and listener.
-  2. Reloads the last durable cursor from `config.cdc.cursor_file`.
-  3. Instantiates and starts a new `FDBMutationListener` from that cursor.
-  4. Instantiates a new `MutationProducer` (and calls `init_transactions()` if transactional).
-  5. Binds a new `BridgePipeline` and continues streaming without dropping data.
+- **Terminal errors** (`CDCTerminalError`, fatal Kafka errors via `is_fatal_kafka_error`): sets shutdown, logs with `exc_info=True`, and re-raises.
+- **Permanent errors** (a `ValueError` that is not a `SerializationError`, e.g. invalid checkpoint coordinates or a corrupt or foreign cursor file on rebuild): sets shutdown and re-raises rather than retrying forever.
+- **Retry in place** (e.g. `CDCRetryableError` from poll, checkpoint or ack failure, retriable-commit exhaustion): backs off and calls `step()` again on the same pipeline.
+- **Rebuild** when the failure left state only a resume from checkpoint clears: producer `closed` or `fatal`, listener `delivery_failed` (`SerializationError`/`RecordTooLargeError`), or listener `awaiting_ack` after a non-fatal transactional abort (no `commit_outstanding`). `_rebuild_pipeline()`:
+  1. Does nothing while `commit_outstanding` is set (rule 7); the next `step()` retries the commit.
+  2. Closes the old producer and listener.
+  3. Reloads the last durable cursor from `cdc.cursor_file`.
+  4. Starts a new `FDBMutationListener` from that cursor and builds a producer from `producer_factory` (calling `init_transactions()` if transactional).
+  5. Binds a new `BridgePipeline`.
+
+  A failed rebuild closes whatever it built, leaves the listener, producer and pipeline unset, and raises. `run()` backs off and retries the rebuild. It never exits silently because no pipeline is bound; it returns normally only after shutdown is requested.
+
+A `RecordTooLargeError` caused by the data itself recurs after every rebuild, so the bridge retries it with backoff indefinitely.
 
 ### Thread Safety and Teardown
 
-`Bridge.stop()` sets `request_shutdown()`, acquires an internal step lock to ensure no in-flight delivery is interrupted, and safely closes the producer, listener, and FDB client in order.
+`Bridge.stop()`:
+1. Calls `request_shutdown()` and waits up to `shutdown_timeout_seconds` for the step lock. If a step is still running (typically parked in `consume()` on an idle stream), it closes the listener to unblock it and waits once more, then proceeds regardless.
+2. Only if it holds the step lock, and while `commit_outstanding`, calls `step()` until the commit resolves, an exception is raised, or `shutdown_timeout_seconds` elapses (rule 7). Closing the producer after that is logged as an error, because it aborts a commit that may still complete. FDB was not acknowledged, so the replay duplicates rather than loses data.
+3. Attempts every close (producer, listener, FDB client) and unsets all handles, then re-raises the first close error.
 
 ---
 

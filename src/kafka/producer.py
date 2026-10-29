@@ -197,6 +197,16 @@ class MutationProducer:
         """Whether this producer was created with a transactional id."""
         return self._transactional
 
+    @property
+    def closed(self) -> bool:
+        """Whether :meth:`close` has run; a closed producer must be replaced."""
+        return self._closed
+
+    @property
+    def fatal(self) -> bool:
+        """Whether a fatal error was seen; a fatal producer must be replaced."""
+        return self._fatal
+
     def _require_transactional(self, method: str) -> None:
         """Guard for transaction methods.
 

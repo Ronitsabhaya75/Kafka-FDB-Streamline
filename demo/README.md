@@ -8,7 +8,8 @@ use a browser or a simulator. The script walks through seven visible stages:
 3. Commit 10,000 representative FDB writes and atomic mutations.
 4. Stream CDC mutations through Protobuf into Kafka with durable acknowledgements.
 5. Consume the records from Kafka.
-6. Audit every Protobuf schema and emitted mutation type.
+6. Verify every mutation byte for byte against the committed workload, plus
+   VersionEnd boundaries, sequence numbers and declared totals.
 7. Drain and stop the bridge cleanly, then report final metrics.
 
 ## Prerequisites
