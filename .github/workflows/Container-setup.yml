@@ -263,3 +263,75 @@ jobs:
           . .venv/bin/activate
           pip install -r requirements-dev.txt
           PYTHONPATH=.:protobuf/gen python3 scripts/kafka_producer_smoke.py --bootstrap-servers localhost:9092 --console-bootstrap-servers kafka:19092
+
+  test-bridge:
+    needs: build-and-verify
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download Docker image artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: fdb-cdc-ci-image
+
+      - name: Load Docker image
+        run: |
+          gunzip -c fdb-cdc-ci.tar.gz | docker load
+
+      - name: Run bridge unit tests inside FDB container
+        run: |
+          docker run --rm \
+            -v "${{ github.workspace }}:/workspace" \
+            -w /workspace \
+            -e HYPOTHESIS_PROFILE=ci \
+            fdb-cdc:ci \
+            bash -c '
+              set -e
+              pip3 install --break-system-packages -r requirements-dev.txt
+
+              echo "=== Running Bridge Unit Tests ==="
+              PYTHONPATH=/workspace:/workspace/protobuf/gen \
+              python3 -m pytest \
+                tests/bridge/ \
+                -v -m "not integration"
+            '
+
+      - name: Start Kafka broker
+        run: |
+          docker compose -f .devcontainer/docker-compose.yml up -d kafka
+          echo "Waiting for Kafka broker on localhost:9092..."
+          python3 -c '
+          import socket, time
+          for i in range(30):
+              try:
+                  with socket.create_connection(("localhost", 9092), timeout=1):
+                      print("Kafka is ready on port 9092!")
+                      break
+              except OSError:
+                  time.sleep(1)
+          else:
+              raise SystemExit("Timed out waiting for Kafka broker on localhost:9092")
+          '
+
+      - name: Run bridge partition integration test inside FDB container
+        run: |
+          docker run --rm \
+            --network host \
+            -v "${{ github.workspace }}:/workspace" \
+            -w /workspace \
+            -e HYPOTHESIS_PROFILE=ci \
+            -e KAFKA_INTEGRATION=1 \
+            -e KAFKA_BOOTSTRAP_SERVERS=localhost:9092 \
+            fdb-cdc:ci \
+            bash -c '
+              set -e
+              pip3 install --break-system-packages -r requirements-dev.txt
+
+              echo "=== Running Bridge Live Kafka Tests ==="
+              PYTHONPATH=/workspace:/workspace/protobuf/gen \
+              python3 -m pytest \
+                tests/bridge/test_pipeline_integration.py \
+                -v -m integration
+            '

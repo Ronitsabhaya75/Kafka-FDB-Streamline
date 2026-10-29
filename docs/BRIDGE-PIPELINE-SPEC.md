@@ -1,87 +1,91 @@
 # Bridge pipeline specification
 
-`src.bridge.BridgePipeline` is the single-step CDC-to-Kafka delivery loop.
-Each call to `step()` processes one CDC reply end-to-end: poll, produce,
-flush or commit, then acknowledge.
-
-## Flow
+`src.bridge.BridgePipeline` delivers one CDC reply at a time: poll, produce,
+flush or commit, checkpoint `get_position()`, then acknowledge.
 
 ```
-FDB CDC → poll_records() → produce() × N → flush() / commit_transaction() → acknowledge()
+FDB CDC → poll_records() → produce() × N → flush_or_raise() / commit_transaction()
+        → checkpoint(get_position()) → acknowledge()
 ```
 
-The pipeline does not own the listener or producer lifecycle.  The caller
-creates, starts, and closes them.
+The pipeline does not own the listener or producer lifecycle. The caller
+creates, starts, and closes them, and supplies the checkpoint callback.
+
+## Partition key
+
+Every record in a step uses one non-empty key, so the batch and its
+`VersionEnd` land on a single Kafka partition. Pass `partition_key`, or omit
+it and the pipeline uses the listener's `raw_stream_name` (else
+`stream_name`). An empty or missing key is rejected at construction.
+librdkafka's default partitioner spreads null keys across partitions.
 
 ## Idempotent mode
 
 ```
 produce all records
-flush (timeout: 10 s)
-if remaining > 0 → raise KafkaException, no ack
+flush_or_raise()
+checkpoint(get_position())
 acknowledge FDB
 ```
 
-Delivery errors from `produce()` or `flush()` propagate as the original
-`KafkaException` or `BufferError`.  FDB is never acknowledged.
+`BufferError`, `KafkaException`, or `TimeoutError` closes the producer and
+does not checkpoint or acknowledge. `close()` purges anything still queued,
+so a later flush cannot publish the failed batch. Replace the producer,
+close the listener, and resume from the last checkpoint.
 
 ## Transactional mode
 
 ```
 begin_transaction
 produce all records
-commit_transaction
+commit_transaction   # retried while error.retriable() and not txn_requires_abort()
+checkpoint(get_position())
 acknowledge FDB
 ```
 
-On any failure during produce or commit:
+| Commit error | Action |
+|--------------|--------|
+| `fatal()` | `mark_fatal()`, no abort, no ack. Replace the producer. |
+| `txn_requires_abort()`, or not retriable | `abort_transaction()`, no ack. |
+| `retriable()` within the budget | `commit_transaction()` again. |
+| `retriable()` after the budget | Leave the transaction open and raise. Call `step()` again. Do not `close()` the producer: that aborts a commit which may still be finishing. |
 
-1. If the error is fatal (`error.fatal()`), mark the producer fatal and
-   re-raise.  No abort is attempted.
-2. Otherwise, abort the transaction and re-raise the original exception.
-3. If the abort itself fails, mark the producer fatal and raise the abort
-   failure chained to the original.
+A produce failure aborts the open transaction unless the error is fatal.
+FDB is not acknowledged.
 
-FDB is never acknowledged on failure.
+## Checkpoint and acknowledgement
 
-## Failure handling
+`checkpoint` receives the object returned by `get_position()` and must make
+it durable. It runs only after Kafka delivery succeeds. If it raises, FDB is
+not acknowledged.
 
-| Failure | FDB acked? | Producer state | Caller action |
-|---------|-----------|----------------|---------------|
-| `flush()` timeout (remaining > 0) | No | Usable | Close listener, resume |
-| `KafkaException` from produce/flush | No | Check `fatal()` | Replace producer if fatal; close listener, resume |
-| `BufferError` from produce | No | Usable (idempotent) / aborted (txn) | Close listener, resume |
-| Fatal `KafkaException` | No | Fatal | Replace producer and listener |
-| Abort-required / retriable commit | No | Aborted | Close listener, resume |
-| Abort failure | No | Fatal | Replace producer and listener |
-| `CDCRetryableError` during ack | After retries | Delivered | Close listener if retries exhausted |
-| Process crash after commit | No | N/A | FDB replays; at-least-once duplicates |
+`acknowledge()` is then retried up to `ack_retries` times on
+`CDCRetryableError`, with `ack_retry_delay_seconds` between attempts. Nothing
+is re-polled or re-produced.
 
-## Partition ordering
-
-All records from one `step()` carry the same `partition_key`, so they land
-on a single Kafka partition in produce order.
-
-## Acknowledgement retries
-
-After successful Kafka delivery, `acknowledge()` is retried up to
-`ack_retries` times on `CDCRetryableError`.  No records are re-produced
-during retries, and no new poll is issued.
+If the checkpoint or the acknowledgement budget fails after delivery, the
+next `step()` retries that phase only.
 
 ## Caller responsibilities
 
-1. Create and start the listener and producer.
-2. Call `step()` in a loop.
-3. On any exception, close the listener and resume from the last cursor.
-4. On fatal errors, also replace the producer.
-5. Close both on shutdown.
+1. Create and start the listener and producer. Call `init_transactions()` once
+   before using a transactional producer.
+2. Pass a checkpoint that durably stores the CDC cursor.
+3. Call `step()` in a loop.
+4. After an idempotent delivery failure, replace the closed producer, close
+   the listener, and resume from the last checkpoint.
+5. After retriable-commit exhaustion, or a checkpoint/ack failure, call
+   `step()` again. Do not close the producer while a commit is outstanding.
+6. On a fatal producer error, replace the producer and close the listener.
+7. Close both on shutdown.
 
 ## Guarantees and limitations
 
 | Property | Status |
 |----------|--------|
 | At-least-once (both modes) | Yes |
-| No ack before delivery | Yes |
-| Kafka-side atomicity (txn mode) | Yes |
-| Cross-system exactly-once | No — requires CDC cursor inside txn |
-| Duplicate suppression | No — consumer-side dedup required |
+| No ack before Kafka delivery and a successful checkpoint | Yes |
+| One partition per step | Yes, via a non-empty stable key |
+| Kafka-side atomicity (txn mode) | Yes, for `read_committed` consumers |
+| Cross-system exactly-once | No. The CDC cursor is not inside the Kafka transaction. |
+| Duplicate suppression | No. Consumers dedup on `(stream, version, sequence)`. |
