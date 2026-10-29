@@ -1,6 +1,8 @@
-"""Unit tests for Bridge declarative configuration parsing."""
+"""Unit tests for Bridge declarative configuration parsing and validation."""
 
 from __future__ import annotations
+
+import pytest
 
 from src.bridge.config import (
     BridgeConfig,
@@ -96,3 +98,58 @@ def test_from_dict_raw_bytes_keys() -> None:
     assert cfg.cdc.begin_key == b"\x01\x02"
     assert cfg.cdc.end_key == b"\x01\x03"
 
+
+def test_from_dict_invalid_root_type() -> None:
+    """Verify non-dictionary input raises TypeError."""
+    with pytest.raises(TypeError, match="Configuration must be a dictionary"):
+        from_dict("not-a-dict")  # type: ignore[arg-type]
+
+
+def test_from_dict_invalid_section_type() -> None:
+    """Verify non-dictionary section raises TypeError."""
+    with pytest.raises(TypeError, match="The 'fdb' section must be a dictionary"):
+        from_dict({"fdb": "not-a-dict"})
+
+
+def test_from_dict_invalid_stream_name_type() -> None:
+    """Verify non-string stream name raises TypeError."""
+    with pytest.raises(TypeError, match="cdc.stream_name must be a string"):
+        from_dict({"cdc": {"stream_name": 12345}})
+
+
+def test_from_dict_invalid_hex_keys() -> None:
+    """Verify invalid hex string in key range raises ValueError."""
+    with pytest.raises(ValueError, match="not a valid hex string"):
+        from_dict({"cdc": {"begin_key": "invalid-hex", "end_key": "61"}})
+
+
+def test_from_dict_one_sided_range() -> None:
+    """Verify one-sided key range raises ValueError."""
+    with pytest.raises(ValueError, match="both be specified or both omitted"):
+        from_dict({"cdc": {"begin_key": "6161", "end_key": ""}})
+
+    with pytest.raises(ValueError, match="both be specified or both omitted"):
+        from_dict({"cdc": {"begin_key": "", "end_key": "6161"}})
+
+
+def test_from_dict_invalid_key_type() -> None:
+    """Verify non-hex/bytes key raises TypeError."""
+    with pytest.raises(TypeError, match="must be a hex string or bytes"):
+        from_dict({"cdc": {"begin_key": 123, "end_key": 456}})
+
+
+def test_from_dict_invalid_numeric_values() -> None:
+    """Verify non-positive or invalid numeric values raise errors."""
+    with pytest.raises(ValueError, match="fdb.api_version must be positive"):
+        from_dict({"fdb": {"api_version": 0}})
+
+    with pytest.raises(ValueError, match="cdc.max_record_bytes must be positive"):
+        from_dict({"cdc": {"max_record_bytes": -10}})
+
+    with pytest.raises(
+        ValueError, match="pipeline.flush_timeout_seconds must be a positive number"
+    ):
+        from_dict({"pipeline": {"flush_timeout_seconds": 0}})
+
+    with pytest.raises(ValueError, match="kafka.topic must be a non-empty string"):
+        from_dict({"kafka": {"topic": "   "}})

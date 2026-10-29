@@ -37,7 +37,7 @@ from confluent_kafka import KafkaException
 from fdbkafka.cdc.v1 import mutations_pb2
 from src.bridge.config import BridgeConfig
 from src.cdc.client import FDBClient
-from src.cdc.errors import CDCRetryableError
+from src.cdc.errors import CDCRetryableError, CDCTerminalError
 from src.cdc.listener import FDBMutationListener
 from src.kafka import MutationProducer, is_fatal_kafka_error
 
@@ -47,6 +47,7 @@ DEFAULT_ACK_RETRIES: int = 3
 DEFAULT_ACK_RETRY_DELAY_SECONDS: float = 0.2
 DEFAULT_COMMIT_RETRIES: int = 3
 DEFAULT_COMMIT_RETRY_DELAY_SECONDS: float = 0.2
+DEFAULT_FLUSH_TIMEOUT_SECONDS: float = 10.0
 
 Checkpoint = Callable[[Any], None]
 
@@ -111,6 +112,7 @@ class BridgePipeline:
         ack_retry_delay_seconds: float = DEFAULT_ACK_RETRY_DELAY_SECONDS,
         commit_retries: int = DEFAULT_COMMIT_RETRIES,
         commit_retry_delay_seconds: float = DEFAULT_COMMIT_RETRY_DELAY_SECONDS,
+        flush_timeout_seconds: float = DEFAULT_FLUSH_TIMEOUT_SECONDS,
     ) -> None:
         """Bind a listener and producer to one topic.
 
@@ -129,17 +131,21 @@ class BridgePipeline:
             ack_retry_delay_seconds: Pause between acknowledgement attempts.
             commit_retries: Attempts for a retriable transactional commit.
             commit_retry_delay_seconds: Pause between commit attempts.
+            flush_timeout_seconds: Maximum wait for message delivery during flush.
 
         Raises:
             ValueError: If the partition key is empty, or a retry count is
-                less than 1, or a delay is negative.
-            TypeError: If a delay is not a number, or partition_key is not
-                bytes or None.
+                less than 1, or a delay/timeout is negative or zero.
+            TypeError: If a delay or timeout is not a number, or partition_key
+                is not bytes or None.
         """
         _require_retries("ack_retries", ack_retries)
         _require_retries("commit_retries", commit_retries)
         _require_delay("ack_retry_delay_seconds", ack_retry_delay_seconds)
         _require_delay("commit_retry_delay_seconds", commit_retry_delay_seconds)
+        _require_delay("flush_timeout_seconds", flush_timeout_seconds)
+        if flush_timeout_seconds <= 0:
+            raise ValueError("flush_timeout_seconds must be positive")
 
         self._listener = listener
         self._producer = producer
@@ -150,6 +156,7 @@ class BridgePipeline:
         self._ack_retry_delay_seconds = float(ack_retry_delay_seconds)
         self._commit_retries = commit_retries
         self._commit_retry_delay_seconds = float(commit_retry_delay_seconds)
+        self._flush_timeout_seconds = float(flush_timeout_seconds)
         self._pending_count = 0
         # Kafka has the batch. The cursor is not yet acknowledged.
         self._delivered_unacked = False
@@ -222,7 +229,7 @@ class BridgePipeline:
         """Publish a non-transactional batch, or close the producer and raise."""
         try:
             self._produce_all(records)
-            self._producer.flush_or_raise()
+            self._producer.flush_or_raise(self._flush_timeout_seconds)
         except (KafkaException, BufferError, TimeoutError, RuntimeError):
             self._producer.close()
             raise
@@ -389,11 +396,19 @@ class _PersistedCursor:
 
 
 def _save_cursor_to_file(path: str | None, position: Any) -> None:
-    """Persist current consumer position coordinates to a file atomically.
+    """Persist current consumer position coordinates to a file durably and atomically.
+
+    Flushes and fsyncs the temporary file before atomic rename, and fsyncs the
+    parent directory after rename to guarantee that the cursor is durable on disk
+    before the caller acknowledges the batch in FoundationDB.
 
     Args:
         path: Destination file path, or None to skip persistence.
         position: Native CDC cursor object exposing coordinates.
+
+    Raises:
+        ValueError: If position lacks stream_id or last_consumed_version.
+        OSError: If writing, fsyncing, or replacing the cursor file fails.
     """
     if not path or position is None:
         return
@@ -404,17 +419,38 @@ def _save_cursor_to_file(path: str | None, position: Any) -> None:
         stream_id = position.get("stream_id", stream_id)
         version = position.get("last_consumed_version", version)
 
-    if stream_id is not None and version is not None:
+    if stream_id is None or version is None:
+        raise ValueError(
+            f"Cannot checkpoint cursor: position {position!r} missing "
+            "stream_id or last_consumed_version"
+        )
+    if (
+        not isinstance(stream_id, int)
+        or isinstance(stream_id, bool)
+        or not isinstance(version, int)
+        or isinstance(version, bool)
+    ):
+        raise ValueError("stream_id and last_consumed_version must be integers")
+
+    tmp_path = f"{path}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump({"stream_id": stream_id, "last_consumed_version": version}, f)
+        f.flush()
+        os.fsync(f.fileno())
+
+    os.replace(tmp_path, path)
+
+    # Fsync the parent directory so the rename is made durable on disk.
+    dir_path = os.path.dirname(os.path.abspath(path)) or "."
+    try:
+        dir_flags = os.O_DIRECTORY if hasattr(os, "O_DIRECTORY") else os.O_RDONLY
+        dir_fd = os.open(dir_path, dir_flags)
         try:
-            tmp_path = f"{path}.tmp"
-            with open(tmp_path, "w", encoding="utf-8") as f:
-                json.dump(
-                    {"stream_id": stream_id, "last_consumed_version": version},
-                    f,
-                )
-            os.replace(tmp_path, path)
-        except OSError as exc:
-            logger.warning("Failed to write cursor to %s: %s", path, exc)
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except OSError:
+        pass
 
 
 def _load_cursor_from_file(path: str | None) -> Any | None:
@@ -424,22 +460,42 @@ def _load_cursor_from_file(path: str | None) -> Any | None:
         path: Path to the cursor file, or None.
 
     Returns:
-        A reconstructed cursor instance, or None if unavailable.
+        A reconstructed cursor instance, or None if path is None or file does not exist.
+
+    Raises:
+        ValueError: If the file exists but contains invalid cursor coordinates.
+        OSError: If reading the cursor file fails.
     """
     if not path or not os.path.exists(path):
         return None
 
-    try:
-        with open(path, encoding="utf-8") as f:
-            data = json.load(f)
-        stream_id = int(data["stream_id"])
-        version = int(data["last_consumed_version"])
-        if fdb is not None and hasattr(fdb, "CdcCursor"):
-            return fdb.CdcCursor(stream_id, version)
-        return _PersistedCursor(stream_id=stream_id, last_consumed_version=version)
-    except (OSError, ValueError, KeyError) as exc:
-        logger.warning("Could not read cursor file %s: %s", path, exc)
-        return None
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
+
+    if not isinstance(data, dict):
+        raise ValueError(
+            f"Corrupt cursor file at {path}: expected JSON object, "
+            f"got {type(data).__name__}"
+        )
+
+    if "stream_id" not in data or "last_consumed_version" not in data:
+        raise ValueError(
+            f"Corrupt cursor file at {path}: missing stream_id or last_consumed_version"
+        )
+
+    raw_stream_id = data["stream_id"]
+    raw_version = data["last_consumed_version"]
+    if (
+        not isinstance(raw_stream_id, int)
+        or isinstance(raw_stream_id, bool)
+        or not isinstance(raw_version, int)
+        or isinstance(raw_version, bool)
+    ):
+        raise ValueError(f"Corrupt cursor file at {path}: coordinates must be integers")
+
+    if fdb is not None and hasattr(fdb, "CdcCursor"):
+        return fdb.CdcCursor(raw_stream_id, raw_version)
+    return _PersistedCursor(stream_id=raw_stream_id, last_consumed_version=raw_version)
 
 
 class _RecordCountingListener:
@@ -515,6 +571,7 @@ class Bridge:
         """
         self.config = config
         self._shutdown_requested = threading.Event()
+        self._step_lock = threading.Lock()
         self.metrics = BridgeMetrics()
         self._client: FDBClient | None = client
         self._listener: FDBMutationListener | None = listener
@@ -533,9 +590,16 @@ class Bridge:
         return self.metrics.batches_acked
 
     def start(self) -> None:
-        """Initialize FDB client, register CDC stream, and start listener."""
+        """Initialize FDB client, register CDC stream, and start listener.
+
+        Raises:
+            ValueError: If stream_name is empty or cursor file is corrupt.
+        """
         if self._pipeline is not None:
             return
+
+        if not self.config.cdc.stream_name:
+            raise ValueError("Bridge requires a non-empty cdc.stream_name")
 
         if self._client is None:
             self._client = FDBClient(
@@ -564,6 +628,8 @@ class Bridge:
             self._producer = MutationProducer(
                 self.config.kafka.bootstrap_servers,
             )
+        if self._producer.transactional:
+            self._producer.init_transactions()
 
         self._counting_listener = _RecordCountingListener(self._listener)
         stream_bytes = (
@@ -582,13 +648,90 @@ class Bridge:
             topic=self.config.kafka.topic,
             checkpoint=_checkpoint_callback,
             partition_key=partition_key,
+            flush_timeout_seconds=self.config.pipeline.flush_timeout_seconds,
         )
+
+    def _rebuild_pipeline(self) -> None:
+        """Rebuild listener and producer from the last durable checkpoint.
+
+        Invoked when an error closes or invalidates the active producer or listener.
+        """
+        logger.info("Rebuilding bridge pipeline from checkpoint...")
+        if self._listener is not None:
+            try:
+                self._listener.close()
+            except Exception:
+                logger.exception("Error closing invalid listener during rebuild")
+            self._listener = None
+
+        if self._producer is not None:
+            try:
+                self._producer.close(
+                    timeout=self.config.pipeline.shutdown_timeout_seconds
+                )
+            except Exception:
+                logger.exception("Error closing invalid producer during rebuild")
+            self._producer = None
+
+        self._pipeline = None
+        self._counting_listener = None
+
+        cursor = _load_cursor_from_file(self.config.cdc.cursor_file)
+        key_range = (
+            (self.config.cdc.begin_key, self.config.cdc.end_key)
+            if self.config.cdc.begin_key or self.config.cdc.end_key
+            else None
+        )
+        if self._client is None:
+            self._client = FDBClient(
+                cluster_file=self.config.fdb.cluster_file,
+                api_version=self.config.fdb.api_version,
+            )
+            self._client.open()
+
+        self._listener = FDBMutationListener(
+            self._client,
+            stream_name=self.config.cdc.stream_name,
+            key_range=key_range,
+            cursor=cursor,
+            max_record_bytes=self.config.cdc.max_record_bytes,
+        )
+        self._listener.start()
+
+        self._producer = MutationProducer(
+            self.config.kafka.bootstrap_servers,
+        )
+        if self._producer.transactional:
+            self._producer.init_transactions()
+
+        self._counting_listener = _RecordCountingListener(self._listener)
+        stream_bytes = (
+            self.config.cdc.stream_name.encode("utf-8")
+            if isinstance(self.config.cdc.stream_name, str)
+            else self.config.cdc.stream_name
+        )
+        partition_key = stream_bytes if stream_bytes else None
+
+        def _checkpoint_callback(position: Any) -> None:
+            _save_cursor_to_file(self.config.cdc.cursor_file, position)
+
+        self._pipeline = BridgePipeline(
+            self._counting_listener,  # type: ignore[arg-type]
+            self._producer,
+            topic=self.config.kafka.topic,
+            checkpoint=_checkpoint_callback,
+            partition_key=partition_key,
+            flush_timeout_seconds=self.config.pipeline.flush_timeout_seconds,
+        )
+        logger.info("Bridge pipeline successfully rebuilt from checkpoint.")
 
     def run(self) -> None:
         """Execute continuous streaming run loop until shutdown is requested.
 
         Raises:
             RuntimeError: If called before :meth:`start`.
+            CDCTerminalError: If FDB CDC encounters an unrecoverable stream error.
+            KafkaException: If Kafka encounters a fatal unrecoverable error.
         """
         if (
             self._listener is None
@@ -602,7 +745,15 @@ class Bridge:
 
         while not self._shutdown_requested.is_set():
             try:
-                published = self._pipeline.step()
+                with self._step_lock:
+                    if self._shutdown_requested.is_set() or self._pipeline is None:
+                        break
+                    published = self._pipeline.step()
+                    if published == 0:
+                        records = []
+                    else:
+                        records = self._counting_listener.pop_last_records()
+
                 if published == 0:
                     self._shutdown_requested.wait(timeout=backoff)
                     backoff = min(
@@ -611,7 +762,6 @@ class Bridge:
                     continue
 
                 backoff = self.config.pipeline.backoff_base_seconds
-                records = self._counting_listener.pop_last_records()
                 batch_mutations = 0
                 for record in records:
                     if record.HasField("batch"):
@@ -622,333 +772,79 @@ class Bridge:
                 self.metrics.mutations_published += batch_mutations
                 self.metrics.records_published += len(records) if records else published
                 self.metrics.batches_acked += 1
-            except Exception as exc:
-                logger.warning("Error in bridge run loop: %s", exc)
-                self.metrics.errors_retried += 1
-                if self._shutdown_requested.is_set():
-                    break
-                self._shutdown_requested.wait(timeout=backoff)
 
-    def request_shutdown(self) -> None:
-        """Signal the daemon run loop to stop cleanly."""
-        self._shutdown_requested.set()
-
-    def stop(self) -> None:
-        """Request shutdown and release all handles."""
-        self.request_shutdown()
-        if self._producer is not None:
-            self._producer.close(timeout=self.config.pipeline.shutdown_timeout_seconds)
-            self._producer = None
-        if self._listener is not None:
-            self._listener.close()
-            self._listener = None
-        if self._client is not None:
-            self._client.close()
-            self._client = None
-        self._pipeline = None
-        self._counting_listener = None
-
-
-__all__ = [
-    "Bridge",
-    "BridgeMetrics",
-    "BridgePipeline",
-    "Checkpoint",
-]
-
-
-@dataclass
-class BridgeMetrics:
-    """Runtime metrics for the autonomous bridge loop.
-
-    Attributes:
-        mutations_published: Total count of individual mutations published to Kafka.
-        records_published: Total count of Kafka records published.
-        batches_acked: Total count of CDC batches acknowledged back to FDB.
-        errors_retried: Total count of transient errors caught and retried in the loop.
-    """
-
-    mutations_published: int = 0
-    records_published: int = 0
-    batches_acked: int = 0
-    errors_retried: int = 0
-
-
-@dataclass(frozen=True, slots=True)
-class _PersistedCursor:
-    """Minimal cursor structure exposing stream_id and last_consumed_version."""
-
-    stream_id: int
-    last_consumed_version: int
-
-
-def _save_cursor_to_file(path: str | None, position: Any) -> None:
-    """Persist current consumer position coordinates to a file atomically.
-
-    Args:
-        path: Destination file path, or None to skip persistence.
-        position: Native CDC cursor object exposing coordinates.
-    """
-    if not path or position is None:
-        return
-
-    stream_id = getattr(position, "stream_id", None)
-    version = getattr(position, "last_consumed_version", None)
-    if isinstance(position, dict):
-        stream_id = position.get("stream_id", stream_id)
-        version = position.get("last_consumed_version", version)
-
-    if stream_id is not None and version is not None:
-        try:
-            tmp_path = f"{path}.tmp"
-            with open(tmp_path, "w", encoding="utf-8") as f:
-                json.dump(
-                    {"stream_id": stream_id, "last_consumed_version": version},
-                    f,
+            except CDCTerminalError as exc:
+                logger.error(
+                    "Terminal CDC error in bridge run loop: %s", exc, exc_info=True
                 )
-            os.replace(tmp_path, path)
-        except OSError as exc:
-            logger.warning("Failed to write cursor to %s: %s", path, exc)
-
-
-def _load_cursor_from_file(path: str | None) -> Any | None:
-    """Load persisted cursor coordinates from a file if present.
-
-    Args:
-        path: Path to the cursor file, or None.
-
-    Returns:
-        A reconstructed cursor instance, or None if unavailable.
-    """
-    if not path or not os.path.exists(path):
-        return None
-
-    try:
-        with open(path, encoding="utf-8") as f:
-            data = json.load(f)
-        stream_id = int(data["stream_id"])
-        version = int(data["last_consumed_version"])
-        if fdb is not None and hasattr(fdb, "CdcCursor"):
-            return fdb.CdcCursor(stream_id, version)
-        return _PersistedCursor(
-            stream_id=stream_id, last_consumed_version=version
-        )
-    except (OSError, ValueError, KeyError) as exc:
-        logger.warning("Could not read cursor file %s: %s", path, exc)
-        return None
-
-
-class _RecordCountingListener:
-    """Wrapper around FDBMutationListener to capture published records and counts."""
-
-    def __init__(self, listener: FDBMutationListener) -> None:
-        """Bind the underlying CDC listener.
-
-        Args:
-            listener: Underlying FDBMutationListener instance.
-        """
-        self._listener = listener
-        self._last_records: list[mutations_pb2.FDBMutationRecord] = []
-
-    def poll_records(
-        self, bridge_timestamp_ns: int | None = None
-    ) -> list[mutations_pb2.FDBMutationRecord]:
-        """Poll the underlying listener and buffer records for metric tallying.
-
-        Args:
-            bridge_timestamp_ns: Optional timestamp for record headers.
-
-        Returns:
-            List of polled Protobuf mutation records.
-        """
-        records = self._listener.poll_records(
-            bridge_timestamp_ns=bridge_timestamp_ns
-        )
-        self._last_records = records
-        return records
-
-    def pop_last_records(self) -> list[mutations_pb2.FDBMutationRecord]:
-        """Return and clear the buffered records from the latest poll.
-
-        Returns:
-            List of Protobuf mutation records from the last successful poll.
-        """
-        records = self._last_records
-        self._last_records = []
-        return records
-
-    def __getattr__(self, name: str) -> Any:
-        """Delegate attribute access to the underlying listener."""
-        return getattr(self._listener, name)
-
-
-class Bridge:
-    """Autonomous Bridge daemon managing CDC listener, producer, and run loop.
-
-    Orchestrates FoundationDB CDC polling, Protobuf serialization, durable Kafka
-    publishing, and watermark advancement via :class:`BridgePipeline`.
-
-    Args:
-        config: Declarative configuration for FDB, CDC stream, Kafka, and pipeline.
-        client: Optional pre-configured :class:`FDBClient` (useful for testing).
-        listener: Optional pre-configured :class:`FDBMutationListener`.
-        producer: Optional pre-configured :class:`MutationProducer`.
-    """
-
-    def __init__(
-        self,
-        config: BridgeConfig,
-        *,
-        client: FDBClient | None = None,
-        listener: FDBMutationListener | None = None,
-        producer: MutationProducer | None = None,
-    ) -> None:
-        """Initialize the Bridge with declarative configuration.
-
-        Args:
-            config: Validated BridgeConfig instance.
-            client: Optional injected FDBClient.
-            listener: Optional injected FDBMutationListener.
-            producer: Optional injected MutationProducer.
-        """
-        self.config = config
-        self._shutdown_requested = threading.Event()
-        self.metrics = BridgeMetrics()
-        self._client: FDBClient | None = client
-        self._listener: FDBMutationListener | None = listener
-        self._producer: MutationProducer | None = producer
-        self._pipeline: BridgePipeline | None = None
-        self._counting_listener: _RecordCountingListener | None = None
-
-    @property
-    def mutations_published(self) -> int:
-        """Total count of individual mutations published to Kafka."""
-        return self.metrics.mutations_published
-
-    @property
-    def batches_acked(self) -> int:
-        """Total count of CDC batches acknowledged back to FoundationDB."""
-        return self.metrics.batches_acked
-
-    def start(self) -> None:
-        """Initialize FDB client, register CDC stream, and start listener."""
-        if self._pipeline is not None:
-            return
-
-        if self._client is None:
-            self._client = FDBClient(
-                cluster_file=self.config.fdb.cluster_file,
-                api_version=self.config.fdb.api_version,
-            )
-            self._client.open()
-
-        if self._listener is None:
-            key_range = (
-                (self.config.cdc.begin_key, self.config.cdc.end_key)
-                if self.config.cdc.begin_key or self.config.cdc.end_key
-                else None
-            )
-            cursor = _load_cursor_from_file(self.config.cdc.cursor_file)
-            self._listener = FDBMutationListener(
-                self._client,
-                stream_name=self.config.cdc.stream_name,
-                key_range=key_range,
-                cursor=cursor,
-                max_record_bytes=self.config.cdc.max_record_bytes,
-            )
-            self._listener.start()
-
-        if self._producer is None:
-            self._producer = MutationProducer(
-                self.config.kafka.bootstrap_servers,
-            )
-
-        self._counting_listener = _RecordCountingListener(self._listener)
-        stream_bytes = (
-            self.config.cdc.stream_name.encode("utf-8")
-            if isinstance(self.config.cdc.stream_name, str)
-            else self.config.cdc.stream_name
-        )
-        partition_key = stream_bytes if stream_bytes else None
-
-        def _checkpoint_callback(position: Any) -> None:
-            _save_cursor_to_file(self.config.cdc.cursor_file, position)
-
-        self._pipeline = BridgePipeline(
-            self._counting_listener,  # type: ignore[arg-type]
-            self._producer,
-            topic=self.config.kafka.topic,
-            checkpoint=_checkpoint_callback,
-            partition_key=partition_key,
-        )
-
-    def run(self) -> None:
-        """Execute continuous streaming run loop until shutdown is requested.
-
-        Raises:
-            RuntimeError: If called before :meth:`start`.
-        """
-        if (
-            self._listener is None
-            or self._producer is None
-            or self._pipeline is None
-            or self._counting_listener is None
-        ):
-            raise RuntimeError("Bridge must be started before calling run()")
-
-        backoff = self.config.pipeline.backoff_base_seconds
-
-        while not self._shutdown_requested.is_set():
-            try:
-                published = self._pipeline.step()
-                if published == 0:
-                    self._shutdown_requested.wait(timeout=backoff)
-                    backoff = min(
-                        backoff * 1.5, self.config.pipeline.backoff_max_seconds
+                self.request_shutdown()
+                raise
+            except Exception as exc:
+                if is_fatal_kafka_error(exc):
+                    logger.error(
+                        "Fatal Kafka error in bridge run loop: %s", exc, exc_info=True
                     )
-                    continue
+                    self.request_shutdown()
+                    raise
 
-                backoff = self.config.pipeline.backoff_base_seconds
-                records = self._counting_listener.pop_last_records()
-                batch_mutations = 0
-                for record in records:
-                    if record.HasField("batch"):
-                        batch_mutations += len(record.batch.mutations)
-                    elif record.HasField("mutation"):
-                        batch_mutations += 1
-
-                self.metrics.mutations_published += batch_mutations
-                self.metrics.records_published += (
-                    len(records) if records else published
-                )
-                self.metrics.batches_acked += 1
-            except Exception as exc:
-                logger.warning("Error in bridge run loop: %s", exc)
                 self.metrics.errors_retried += 1
+                logger.warning(
+                    "Recoverable error in bridge loop: %s", exc, exc_info=True
+                )
+
                 if self._shutdown_requested.is_set():
                     break
+
+                # Rebuild if producer is closed/fatal or delivery failed without ack
+                with self._step_lock:
+                    if self._shutdown_requested.is_set():
+                        break
+                    needs_rebuild = (
+                        self._producer is None
+                        or self._producer.closed
+                        or getattr(self._producer, "fatal", False)
+                        or getattr(self._listener, "delivery_failed", False)
+                        or isinstance(exc, (BufferError, TimeoutError))
+                    )
+                    if needs_rebuild:
+                        try:
+                            self._rebuild_pipeline()
+                        except Exception as rebuild_exc:
+                            logger.error(
+                                "Failed to rebuild pipeline: %s",
+                                rebuild_exc,
+                                exc_info=True,
+                            )
+                            if is_fatal_kafka_error(rebuild_exc) or isinstance(
+                                rebuild_exc, CDCTerminalError
+                            ):
+                                self.request_shutdown()
+                                raise rebuild_exc from exc
+
                 self._shutdown_requested.wait(timeout=backoff)
+                backoff = min(backoff * 1.5, self.config.pipeline.backoff_max_seconds)
 
     def request_shutdown(self) -> None:
         """Signal the daemon run loop to stop cleanly."""
         self._shutdown_requested.set()
 
     def stop(self) -> None:
-        """Request shutdown and release all handles."""
+        """Request shutdown and release all handles safely."""
         self.request_shutdown()
-        if self._producer is not None:
-            self._producer.close(
-                timeout=self.config.pipeline.shutdown_timeout_seconds
-            )
-            self._producer = None
-        if self._listener is not None:
-            self._listener.close()
-            self._listener = None
-        if self._client is not None:
-            self._client.close()
-            self._client = None
-        self._pipeline = None
-        self._counting_listener = None
+        with self._step_lock:
+            if self._producer is not None:
+                self._producer.close(
+                    timeout=self.config.pipeline.shutdown_timeout_seconds
+                )
+                self._producer = None
+            if self._listener is not None:
+                self._listener.close()
+                self._listener = None
+            if self._client is not None:
+                self._client.close()
+                self._client = None
+            self._pipeline = None
+            self._counting_listener = None
 
 
 __all__ = [

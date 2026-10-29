@@ -10,6 +10,6 @@ Map of the project's docs. Check here before reading docs wholesale, then open o
 | [`kafka-delivery-guarantees.md`](kafka-delivery-guarantees.md) | Kafka delivery semantics (acks, idempotence), exactly-once transaction strategies, error handling, and Python client (`confluent-kafka` vs `kafka-python`) comparison. |
 | [`KAFKA-PRODUCER-SPEC.md`](KAFKA-PRODUCER-SPEC.md) | `src.kafka.MutationProducer` contract: mandatory durability settings, transactional mode, sticky errors, fatal and closed states, close behaviour (purge and release), flush_or_raise, and local Kafka verification commands. |
 | [`SERIALIZATION-SPEC.md`](SERIALIZATION-SPEC.md) | `src/serialization/` contract: public API, wire mapping, input rules, errors and decode failures, reader contract for a version group |
-| [`BRIDGE-PIPELINE-SPEC.md`](BRIDGE-PIPELINE-SPEC.md) | `src.bridge.BridgePipeline` contract: poll → produce → flush/commit → checkpoint → acknowledge, partition key, retriable commit retries, and caller recovery. |
+| [`BRIDGE-PIPELINE-SPEC.md`](BRIDGE-PIPELINE-SPEC.md) | `src.bridge` contract: `BridgePipeline` single-step coordinator and `Bridge` autonomous daemon (configuration, durable cursor persistence, recovery, and metrics). |
 | [`CDC-CONSUMER-SPEC.md`](CDC-CONSUMER-SPEC.md) | `src/cdc/` contract: FDBClient, stream lifecycle, bounded record polling, safe resume and acknowledgement |
 | [`../demo/README.md`](../demo/README.md) | Live 10,000-mutation bridge demo: prerequisites, Docker Compose setup, CLI flags. |

@@ -295,63 +295,70 @@ def run_demo(bootstrap_servers: str, timeout: float, count: int) -> None:
     database = fdb_client.open()
     read_version = fdb_client.get_read_version()
     print(f"      Connected to cluster. Current read version: {read_version}")
-    _seed_clear_targets(database, prefix, count)
-    print("      Prepared disjoint clear-range targets before CDC registration.")
 
-    # 2. Bridge Service Configuration & Daemon Launch
-    print("\n[2/7] Kafka Bridge Service: Declarative Configuration & Daemon Startup")
-    print(f"      Stream Name       : '{stream_name}'")
-    print(f"      Key Range         : [{prefix!r}, {strinc(prefix)!r})")
-    print(f"      Kafka Target      : '{topic}' on {bootstrap_servers}")
-    print("      Delivery Policy   : acks=all, enable.idempotence=True")
-    print("      Retention Policy  : Advance minVersion only after Kafka ack")
-
-    bridge_cfg = from_dict(
-        {
-            "fdb": {"api_version": 800},
-            "cdc": {
-                "stream_name": stream_name,
-                "begin_key": prefix.hex(),
-                "end_key": strinc(prefix).hex(),
-                "max_record_bytes": 1_000_000,
-                "cursor_file": cursor_file,
-            },
-            "kafka": {
-                "bootstrap_servers": bootstrap_servers,
-                "topic": topic,
-            },
-            "pipeline": {
-                "flush_timeout_seconds": 10.0,
-                "backoff_base_seconds": 0.1,
-                "backoff_max_seconds": 2.0,
-                "shutdown_timeout_seconds": 15.0,
-            },
-        }
-    )
-
-    bridge = Bridge(bridge_cfg)
-    bridge.start()
-    print("      Registered CDC stream in FDB transaction subsystem.")
-
-    # Run the Bridge daemon loop in a background thread
-    bridge_errors: list[BaseException] = []
-
-    def _run_bridge() -> None:
-        try:
-            bridge.run()
-        except BaseException as exc:
-            bridge_errors.append(exc)
-
-    bridge_thread = threading.Thread(
-        target=_run_bridge, daemon=True, name="BridgeDaemon"
-    )
-    bridge_thread.start()
-    print("      Started autonomous Kafka Bridge daemon thread.")
-
-    # Brief warm-up to ensure CDC consumer handle is armed
-    time.sleep(1.0)
+    bridge: Bridge | None = None
+    bridge_thread: threading.Thread | None = None
 
     try:
+        _seed_clear_targets(database, prefix, count)
+        print("      Prepared disjoint clear-range targets before CDC registration.")
+
+        # 2. Bridge Service Configuration & Daemon Launch
+        print(
+            "\n[2/7] Kafka Bridge Service: Declarative Configuration & Daemon Startup"
+        )
+        print(f"      Stream Name       : '{stream_name}'")
+        print(f"      Key Range         : [{prefix!r}, {strinc(prefix)!r})")
+        print(f"      Kafka Target      : '{topic}' on {bootstrap_servers}")
+        print("      Delivery Policy   : acks=all, enable.idempotence=True")
+        print("      Retention Policy  : Advance minVersion only after Kafka ack")
+
+        bridge_cfg = from_dict(
+            {
+                "fdb": {"api_version": 800},
+                "cdc": {
+                    "stream_name": stream_name,
+                    "begin_key": prefix.hex(),
+                    "end_key": strinc(prefix).hex(),
+                    "max_record_bytes": 1_000_000,
+                    "cursor_file": cursor_file,
+                },
+                "kafka": {
+                    "bootstrap_servers": bootstrap_servers,
+                    "topic": topic,
+                },
+                "pipeline": {
+                    "flush_timeout_seconds": 10.0,
+                    "backoff_base_seconds": 0.1,
+                    "backoff_max_seconds": 2.0,
+                    "shutdown_timeout_seconds": 15.0,
+                },
+            }
+        )
+
+        bridge = Bridge(bridge_cfg)
+        bridge.start()
+        print("      Registered CDC stream in FDB transaction subsystem.")
+
+        # Run the Bridge daemon loop in a background thread
+        bridge_errors: list[BaseException] = []
+
+        def _run_bridge() -> None:
+            try:
+                assert bridge is not None
+                bridge.run()
+            except BaseException as exc:
+                bridge_errors.append(exc)
+
+        bridge_thread = threading.Thread(
+            target=_run_bridge, daemon=True, name="BridgeDaemon"
+        )
+        bridge_thread.start()
+        print("      Started autonomous Kafka Bridge daemon thread.")
+
+        # Brief warm-up to ensure CDC consumer handle is armed
+        time.sleep(1.0)
+
         # 3. Transactional Writes to FoundationDB
         print(f"\n[3/7] Upstream Application: Committing {count:,} mutations to FDB")
         print("      Exercising representative writes and atomic operations...")
@@ -428,6 +435,8 @@ def run_demo(bootstrap_servers: str, timeout: float, count: int) -> None:
 
         total_wire_bytes = 0
         total_deserialized_mutations = 0
+        seen_coordinates: set[tuple[int, int]] = set()
+        duplicate_coordinates: list[tuple[int, int]] = []
 
         for rec in consumed:
             total_wire_bytes += rec.ByteSize()
@@ -450,8 +459,13 @@ def run_demo(bootstrap_servers: str, timeout: float, count: int) -> None:
                     schema_counts["FDBVersionIndex (Coordinate)"] += 1
                     total_deserialized_mutations += 1
 
+                    v_idx = m.version_index
+                    coord = (v_idx.fdb_version, v_idx.sequence_no)
+                    if coord in seen_coordinates:
+                        duplicate_coordinates.append(coord)
+                    seen_coordinates.add(coord)
+
                     if "FDBVersionIndex" not in sample_messages:
-                        v_idx = m.version_index
                         sample_messages["FDBVersionIndex"] = (
                             f"fdb_version={v_idx.fdb_version}, "
                             f"sequence_no={v_idx.sequence_no}"
@@ -514,6 +528,27 @@ def run_demo(bootstrap_servers: str, timeout: float, count: int) -> None:
             f"with 100% schema fidelity."
         )
 
+        # Workload completeness and uniqueness assertions
+        if duplicate_coordinates:
+            raise AssertionError(
+                f"Workload verification failed: detected {len(duplicate_coordinates)} "
+                f"duplicate mutation coordinates (e.g. {duplicate_coordinates[:3]!r})"
+            )
+        if total_deserialized_mutations != count:
+            raise AssertionError(
+                f"Workload completeness failed: expected {count:,} mutations, but "
+                f"deserialized {total_deserialized_mutations:,}"
+            )
+        if bridge.mutations_published != count:
+            raise AssertionError(
+                f"Bridge published count mismatch: expected {count:,}, but bridge "
+                f"published {bridge.mutations_published:,}"
+            )
+        if schema_counts["VersionEnd (Envelope)"] == 0:
+            raise AssertionError(
+                "Workload completeness failed: no VersionEnd records received"
+            )
+
         # 7. Graceful Bridge Shutdown
         print("\n[7/7] Bridge Service: Graceful Shutdown & Drain")
         metrics = bridge.metrics
@@ -534,19 +569,27 @@ def run_demo(bootstrap_servers: str, timeout: float, count: int) -> None:
         print("=" * 76 + "\n")
 
     finally:
-        bridge.stop()
-        if bridge_thread.is_alive():
-            bridge_thread.join(timeout=5.0)
-        del database[prefix : strinc(prefix)]
-        try:
-            fdb_client.remove_cdc_stream(stream_name)
-        except Exception:
-            pass
+        if bridge is not None:
+            bridge.request_shutdown()
+        if bridge_thread is not None and bridge_thread.is_alive():
+            bridge_thread.join(timeout=10.0)
+        if bridge is not None:
+            bridge.stop()
+        if database is not None:
+            try:
+                del database[prefix : strinc(prefix)]
+            except Exception:
+                pass
+        if fdb_client is not None:
+            try:
+                fdb_client.remove_cdc_stream(stream_name)
+            except Exception:
+                pass
+            fdb_client.close()
         try:
             os.unlink(cursor_file)
-        except FileNotFoundError:
+        except (FileNotFoundError, OSError):
             pass
-        fdb_client.close()
 
 
 def main(argv: Sequence[str] | None = None) -> int:
