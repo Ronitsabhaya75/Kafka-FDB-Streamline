@@ -203,24 +203,72 @@ class TestTransactionalProducerIntegration:
     """Integration tests for transactional MutationProducer against live Kafka."""
 
     def test_produce_abort_then_clean_flush(self) -> None:
-        """Producing then aborting in a transaction leaves no delivery errors."""
+        """Producing then aborting in a transaction leaves no delivery errors.
+
+        Forces records to remain queued using linger.ms, aborts the transaction
+        while messages are still queued, then verifies the next transaction's
+        produce -> flush -> commit succeeds without stale errors and only the
+        committed record is visible under isolation.level=read_committed.
+        """
+        topic = f"fdb-cdc-txn-{uuid.uuid4().hex[:8]}"
         producer = MutationProducer(
             BOOTSTRAP_SERVERS,
+            extra_config={"linger.ms": 10000},
             transactional_id=f"test-abort-{uuid.uuid4().hex[:8]}",
         )
+        consumer = Consumer(
+            {
+                "bootstrap.servers": BOOTSTRAP_SERVERS,
+                "group.id": f"txn-group-{uuid.uuid4().hex[:8]}",
+                "auto.offset.reset": "earliest",
+                "isolation.level": "read_committed",
+            }
+        )
+        consumer.subscribe([topic])
+
         try:
             producer.init_transactions()
+
+            # 1. First transaction: queue records and abort while still in local buffer
             producer.begin_transaction()
-            record = build_set_mutation_record(
-                stream="abort-stream",
-                version=500_000,
-                seq=0,
-                key=b"abort:1",
-                value=b"v1",
-            )
-            producer.produce(TEST_TOPIC, record, key=b"abort-stream")
+            for i in range(10):
+                aborted_record = build_set_mutation_record(
+                    stream="abort-stream",
+                    version=500_000,
+                    seq=i,
+                    key=f"aborted:{i}".encode(),
+                    value=b"aborted_val",
+                )
+                producer.produce(topic, aborted_record, key=b"abort-stream")
+
+            assert len(producer) > 0
             producer.abort_transaction()
+
+            # 2. Next transaction: produce, flush, commit (must not hit stale error)
+            producer.begin_transaction()
+            committed_record = build_set_mutation_record(
+                stream="commit-stream",
+                version=600_000,
+                seq=0,
+                key=b"committed:1",
+                value=b"committed_val",
+            )
+            producer.produce(topic, committed_record, key=b"commit-stream")
+
             remaining = producer.flush()
             assert remaining == 0
+            producer.commit_transaction()
+
+            # 3. Verify only the committed record arrives under read_committed
+            payloads = _consume_n(consumer, 1)
+            parsed = mutations_pb2.FDBMutationRecord.FromString(payloads[0])
+            assert parsed.stream_name == "commit-stream"
+            assert parsed.mutation.single_key_mutation.key == b"committed:1"
+            assert parsed.mutation.single_key_mutation.value == b"committed_val"
+
+            # No further messages should be received (aborted records are discarded)
+            extra = consumer.poll(timeout=2.0)
+            assert extra is None or extra.value() is None
         finally:
             producer.close()
+            consumer.close()

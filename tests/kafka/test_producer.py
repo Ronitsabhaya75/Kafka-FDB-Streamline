@@ -483,8 +483,11 @@ def test_produce_abort_then_clean_flush(producer_class: MagicMock) -> None:
     producer.abort_transaction()
     assert len(producer._delivery_errors) == 0
 
-    # Next flush should succeed cleanly without raising
+    # Next transaction: produce -> flush -> commit succeeds cleanly without raising
+    producer.begin_transaction()
+    producer.produce("t", mutations_pb2.FDBMutationRecord())
     assert producer.flush() == 0
+    producer.commit_transaction()
 
 
 # ── Fatal and closed states ───────────────────────────────────────
