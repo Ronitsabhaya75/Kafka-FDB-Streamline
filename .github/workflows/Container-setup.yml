@@ -257,6 +257,12 @@ jobs:
                 -v -m integration
             '
 
+      # requirements-dev.txt pins confluent-kafka to a version without wheels for the
+      # runner's default Python, and the host has no librdkafka to build it from source.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
       - name: Run Kafka Producer Console Smoke Script
         run: |
           python3 -m venv .venv
