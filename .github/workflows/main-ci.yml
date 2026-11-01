@@ -53,6 +53,10 @@ jobs:
     needs: signed-commits
     uses: ./.github/workflows/lint.yml
 
+  packaging:
+    needs: signed-commits
+    uses: ./.github/workflows/packaging.yml
+
   buf:
     needs: signed-commits
     uses: ./.github/workflows/buf-ci.yaml

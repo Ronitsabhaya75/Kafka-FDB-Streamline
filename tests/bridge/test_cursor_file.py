@@ -10,7 +10,10 @@ from typing import Any
 
 import pytest
 
-from src.bridge.pipeline import _load_cursor_from_file, _save_cursor_to_file
+from fdb_kafka_bridge.bridge.pipeline import (
+    _load_cursor_from_file,
+    _save_cursor_to_file,
+)
 
 
 class _Pos:

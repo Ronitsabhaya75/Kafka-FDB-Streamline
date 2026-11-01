@@ -12,20 +12,20 @@ import pytest
 from confluent_kafka import KafkaError, KafkaException
 from google.protobuf.timestamp_pb2 import Timestamp
 
-from fdbkafka.cdc.v1 import mutations_pb2
-from src.bridge.config import BridgeConfig, from_dict
-from src.bridge.pipeline import (
+from fdb_kafka_bridge.bridge.config import BridgeConfig, from_dict
+from fdb_kafka_bridge.bridge.pipeline import (
     Bridge,
     BridgeMetrics,
     BridgePipeline,
     _load_cursor_from_file,
     _save_cursor_to_file,
 )
-from src.cdc.client import FDBClient
-from src.cdc.errors import CDCError, CDCRetryableError, CDCTerminalError
-from src.cdc.listener import FDBMutationListener
-from src.kafka.producer import MutationProducer
-from src.serialization.errors import SerializationError
+from fdb_kafka_bridge.cdc.client import FDBClient
+from fdb_kafka_bridge.cdc.errors import CDCError, CDCRetryableError, CDCTerminalError
+from fdb_kafka_bridge.cdc.listener import FDBMutationListener
+from fdb_kafka_bridge.kafka.producer import MutationProducer
+from fdb_kafka_bridge.serialization.errors import SerializationError
+from fdbkafka.cdc.v1 import mutations_pb2
 
 
 def _make_batch_record(mutation_count: int = 5) -> mutations_pb2.FDBMutationRecord:
@@ -428,7 +428,7 @@ def _fake_rebuild(listener: MagicMock) -> MagicMock:
 
 def test_producer_and_listener_expose_sticky_state() -> None:
     """Public state properties track the private flags they guard."""
-    with patch("src.kafka.producer.Producer") as producer_class:
+    with patch("fdb_kafka_bridge.kafka.producer.Producer") as producer_class:
         producer_class.return_value.flush.return_value = 0
         producer = MutationProducer("broker:9092")
         assert (producer.closed, producer.fatal) == (False, False)

@@ -9,8 +9,7 @@ import pytest
 from google.protobuf.message import DecodeError
 from google.protobuf.timestamp_pb2 import Timestamp
 
-from fdbkafka.cdc.v1 import mutations_pb2
-from src.serialization import (
+from fdb_kafka_bridge.serialization import (
     InputTypeError,
     InputValueError,
     Mutation,
@@ -25,6 +24,7 @@ from src.serialization import (
     serialize_mutation,
     serialize_version_end,
 )
+from fdbkafka.cdc.v1 import mutations_pb2
 from tests.serialization import doubles
 from tests.serialization.doubles import ADD, CLEAR, ENV, SET, STREAM, TS, V
 

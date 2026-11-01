@@ -6,7 +6,7 @@ from google.protobuf.timestamp_pb2 import Timestamp
 from hypothesis import given
 from hypothesis import strategies as st
 
-from src.serialization import (
+from fdb_kafka_bridge.serialization import (
     InputTypeError,
     InputValueError,
     Mutation,

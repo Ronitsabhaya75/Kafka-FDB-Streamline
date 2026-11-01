@@ -5,8 +5,7 @@ from google.protobuf.timestamp_pb2 import Timestamp
 from hypothesis import given
 from hypothesis import strategies as st
 
-from fdbkafka.cdc.v1 import mutations_pb2
-from src.serialization import (
+from fdb_kafka_bridge.serialization import (
     DecodeFailure,
     InputTypeError,
     Mutation,
@@ -19,6 +18,7 @@ from src.serialization import (
     deserialize_record,
     serialize_mutation,
 )
+from fdbkafka.cdc.v1 import mutations_pb2
 from tests.serialization.doubles import CLEAR, ENV, SET, STREAM, TS, V
 from tests.serialization.test_golden_bytes import GOLDEN
 

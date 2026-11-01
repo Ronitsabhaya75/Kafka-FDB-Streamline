@@ -8,8 +8,8 @@ their content.
 from collections.abc import Iterable, Iterator
 from typing import Any
 
-from src.serialization.errors import InputTypeError, InputValueError
-from src.serialization.model import (
+from fdb_kafka_bridge.serialization.errors import InputTypeError, InputValueError
+from fdb_kafka_bridge.serialization.model import (
     _MAX_BRIDGE_TIMESTAMP_NS,
     _MAX_SEQUENCE_NO,
     _MAX_TOTAL_MUTATIONS,

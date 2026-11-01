@@ -35,13 +35,13 @@ except ImportError:
 
 from confluent_kafka import KafkaException
 
+from fdb_kafka_bridge.bridge.config import BridgeConfig
+from fdb_kafka_bridge.cdc.client import FDBClient
+from fdb_kafka_bridge.cdc.errors import CDCRetryableError, CDCTerminalError
+from fdb_kafka_bridge.cdc.listener import FDBMutationListener
+from fdb_kafka_bridge.kafka import MutationProducer, is_fatal_kafka_error
+from fdb_kafka_bridge.serialization.errors import SerializationError
 from fdbkafka.cdc.v1 import mutations_pb2
-from src.bridge.config import BridgeConfig
-from src.cdc.client import FDBClient
-from src.cdc.errors import CDCRetryableError, CDCTerminalError
-from src.cdc.listener import FDBMutationListener
-from src.kafka import MutationProducer, is_fatal_kafka_error
-from src.serialization.errors import SerializationError
 
 logger = logging.getLogger(__name__)
 

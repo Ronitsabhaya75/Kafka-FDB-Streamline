@@ -3,30 +3,32 @@ requires = ["setuptools>=68.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "kafka-fdb-streamline"
+name = "fdb-kafka-bridge"
 version = "0.1.0"
 description = "FoundationDB native CDC to Kafka bridge (UNT capstone)."
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "confluent-kafka>=2.6,<3",
+    # Keep the minor in step with FDB_VERSION in the Dockerfile.
+    "foundationdb>=8.0.0,<8.1",
     "protobuf>=7.34,<8",
 ]
 
 [tool.setuptools]
 packages = [
-    "src",
-    "src.bridge",
-    "src.cdc",
-    "src.kafka",
-    "src.serialization",
+    "fdb_kafka_bridge",
+    "fdb_kafka_bridge.bridge",
+    "fdb_kafka_bridge.cdc",
+    "fdb_kafka_bridge.kafka",
+    "fdb_kafka_bridge.serialization",
     "fdbkafka",
     "fdbkafka.cdc",
     "fdbkafka.cdc.v1",
 ]
 
 [tool.setuptools.package-dir]
-src = "src"
+fdb_kafka_bridge = "src/fdb_kafka_bridge"
 fdbkafka = "protobuf/gen/fdbkafka"
 
 [tool.setuptools.package-data]
@@ -70,10 +72,11 @@ convention = "google"
 [tool.pytest.ini_options]
 minversion = "9.0"
 testpaths = ["tests", "protobuf/tests"]
-pythonpath = [".", "protobuf/gen"]
+pythonpath = [".", "src", "protobuf/gen"]
 markers = [
   "slow: builds a ~10 MB version group; deselect with -m 'not slow'",
   "integration: runs against a live local cluster or broker",
+  "packaging: builds the wheel and installs it into a fresh venv (needs network)",
 ]
 addopts = [
   "-ra",

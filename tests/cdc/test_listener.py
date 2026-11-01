@@ -5,16 +5,20 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from src.cdc.client import FDBClient
-from src.cdc.errors import (
+from fdb_kafka_bridge.cdc.client import FDBClient
+from fdb_kafka_bridge.cdc.errors import (
     CDCConsumerClosedError,
     CDCError,
     CDCInvalidCursorError,
     CDCRetryableError,
     CDCTerminalError,
 )
-from src.cdc.listener import FDBMutationListener, strinc, subspace_to_key_range
-from src.serialization.errors import InputTypeError
+from fdb_kafka_bridge.cdc.listener import (
+    FDBMutationListener,
+    strinc,
+    subspace_to_key_range,
+)
+from fdb_kafka_bridge.serialization.errors import InputTypeError
 
 
 class _FakeFDBError(Exception):
@@ -126,7 +130,7 @@ def test_resume_waits_for_read_version_and_restores_ack() -> None:
         resume_poll_interval_seconds=0.001,
     )
 
-    with patch("src.cdc.listener.time.sleep") as sleep:
+    with patch("fdb_kafka_bridge.cdc.listener.time.sleep") as sleep:
         listener.start()
 
     client.resume_cdc_consumer.assert_called_once_with(cursor)
@@ -148,7 +152,7 @@ def test_resume_timeout_closes_partial_consumer() -> None:
     )
 
     with (
-        patch("src.cdc.listener.time.monotonic", side_effect=[0.0, 2.0]),
+        patch("fdb_kafka_bridge.cdc.listener.time.monotonic", side_effect=[0.0, 2.0]),
         pytest.raises(CDCInvalidCursorError, match="Timed out"),
     ):
         listener.start()

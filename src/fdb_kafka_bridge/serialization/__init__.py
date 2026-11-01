@@ -3,8 +3,8 @@
 Public contract: [`docs/SERIALIZATION-SPEC.md`](../../docs/SERIALIZATION-SPEC.md).
 """
 
-from src.serialization.deserializer import deserialize_record
-from src.serialization.errors import (
+from fdb_kafka_bridge.serialization.deserializer import deserialize_record
+from fdb_kafka_bridge.serialization.errors import (
     DecodeFailure,
     InputTypeError,
     InputValueError,
@@ -12,7 +12,7 @@ from src.serialization.errors import (
     RecordTooLargeError,
     SerializationError,
 )
-from src.serialization.model import (
+from fdb_kafka_bridge.serialization.model import (
     Mutation,
     MutationBatch,
     MutationType,
@@ -22,12 +22,12 @@ from src.serialization.model import (
     VersionEnd,
     VersionIndex,
 )
-from src.serialization.serializer import (
+from fdb_kafka_bridge.serialization.serializer import (
     serialize_batch,
     serialize_mutation,
     serialize_version_end,
 )
-from src.serialization.version_group import serialize_version_group
+from fdb_kafka_bridge.serialization.version_group import serialize_version_group
 
 __all__ = [
     "DecodeFailure",
