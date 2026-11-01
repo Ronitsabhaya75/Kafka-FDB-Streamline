@@ -30,7 +30,47 @@ The benchmark harness ([`bench_e2e.py`](bench_e2e.py)) runs a live concurrent wr
 
 ---
 
-## 3. Results Matrix
+## 3. Metrics & Mathematical Formulas
+
+The benchmark harness ([`bench_e2e.py`](bench_e2e.py)) calculates all operational metrics using strict, deterministic formulas:
+
+### 3.1. Backlog Definition
+$$\text{Backlog}(t) = \text{Written}(t) - \text{Acked}(t)$$
+Represents the exact number of committed FoundationDB mutations currently in-flight across the CDC proxy, serializer, Kafka broker queues, or unacknowledged by the bridge.
+
+### 3.2. Backlog Trend Slope (Ordinary Least Squares Regression)
+To determine if the bridge is accumulating lag over time, linear regression is performed over $n$ sampling points $(t_i, B_i)$ within the steady-state evaluation window:
+$$\text{Slope} = \frac{\sum_{i=1}^n (t_i - \bar{t})(B_i - \bar{B})}{\sum_{i=1}^n (t_i - \bar{t})^2}$$
+Where:
+* $t_i$: Timestamp of sample $i$ relative to the start of the measured window.
+* $B_i = \text{Written}(t_i) - \text{Acked}(t_i)$: Backlog at timestamp $t_i$.
+* $\bar{t}$ and $\bar{B}$: Arithmetic means of sample timestamps and backlog counts.
+
+**NF1 Stability Classification:**
+$$\text{Verdict} = \begin{cases} \text{GROWING (Cannot keep up)} & \text{if } \text{Slope} > 0.01 \times \max(\text{WriteRate}, 1.0) \\ \text{Flat (Sustainable)} & \text{if } \text{Slope} \le 0.01 \times \max(\text{WriteRate}, 1.0) \end{cases}$$
+
+### 3.3. Real-Path End-to-End Latency
+The writer thread stamps a 19-digit UNIX nanosecond timestamp $t_{\text{commit\_ns}}$ into the first 19 bytes of the mutation value payload before calling `tr.commit().wait()`. Upon successful Kafka broker delivery (`flush()` completes at $t_{\text{flush\_done\_ns}}$), latency is calculated:
+$$\text{Latency}_{\text{ms}} = \frac{t_{\text{flush\_done\_ns}} - t_{\text{commit\_ns}}}{10^6}$$
+This measures the complete real-world latency chain:
+$$\text{Latency}_{\text{E2E}} = \Delta t_{\text{FDB 2PC Commit}} + \Delta t_{\text{CDC Proxy Delivery}} + \Delta t_{\text{Protobuf Serialize}} + \Delta t_{\text{Kafka Network Transport}} + \Delta t_{\text{Broker Fsync}}$$
+
+### 3.4. CDC Read-Head Version Lag
+FoundationDB version lag measures the distance between the database's latest committed transaction version and the bridge's latest acknowledged consumer position:
+$$\text{Lag}_{\text{versions}} = \text{FDB}_{\text{last\_committed\_version}} - \text{CDC}_{\text{last\_consumed\_version}}$$
+Approximate lag in seconds (based on FoundationDB's default rate of $1{,}000{,}000$ versions/sec):
+$$\text{Lag}_{\text{seconds}} \approx \frac{\text{Lag}_{\text{versions}}}{1{,}000{,}000}$$
+
+### 3.5. Wire Bandwidth
+$$\text{Bandwidth}_{\text{MB/s}} = \frac{\Delta \text{Bytes}_{\text{wire}}}{1024 \times 1024 \times \Delta t}$$
+
+### 3.6. Nearest-Rank Latency Percentiles
+For a sorted list of $N$ latency samples and target percentile $P \in [0, 100]$:
+$$\text{Rank}(P) = \max\left(0, \min\left(N - 1, \left\lceil \frac{P}{100} \times N \right\rceil - 1\right)\right)$$
+
+---
+
+## 4. Results Matrix
 
 | Benchmark Test | Mode | Total Volume | Target Rate | Measured Rate | Wire Bandwidth | Latency (p50 / p90 / p99) | Backlog Trend | Result File |
 |---|---|---|---|---|---|---|---|---|
@@ -44,16 +84,16 @@ The benchmark harness ([`bench_e2e.py`](bench_e2e.py)) runs a live concurrent wr
 
 ---
 
-## 4. Key Engineering Insights
+## 5. Key Engineering Insights
 
-### 4.1. Non-Functional Requirement 1 (NF1 Compliance)
+### 5.1. Non-Functional Requirement 1 (NF1 Compliance)
 NF1 specifies that the bridge must sustain continuous ingestion against foreground writers for at least 10 minutes without accumulating an unacknowledged backlog. 
 
 * Over the **600.0-second steady-state window** (+ 30.0s warmup), the backlog trend was **`+0.008 mut/s`** (linear regression slope over 9.45 million records).
 * Written: `9,450,500` mutations; Acknowledged: `9,450,500` mutations.
 * **Drain time after writes stopped was 0.02 seconds**, verifying zero lag accumulation and preventing FoundationDB Transaction Log (T-log) memory bloat or Ratekeeper throttling.
 
-### 4.2. Atomic Checkpoint Durability Overhead
+### 5.2. Atomic Checkpoint Durability Overhead
 In **Benchmark 2** (`--use-bridge`), every CDC batch was processed through the complete `src.bridge.Bridge` daemon lifecycle:
 ```
 [FDB Poll] ──> [Protobuf Serialize] ──> [Kafka Broker Flush] 
@@ -64,7 +104,7 @@ In **Benchmark 2** (`--use-bridge`), every CDC batch was processed through the c
 * The bridge maintained **14,992 mutations/sec** with **zero errors** and an average version lag of only **1,624 versions (~1.6 ms)**.
 * On disk, `/tmp/bench_cursor_*.json` verified clean JSON persistence with `stream_id` and `last_consumed_version` matching the final committed batch.
 
-### 4.3. Data Integrity and Ordering
+### 5.3. Data Integrity and Ordering
 Under `--verify` mode, the harness tracked sequence numbers and key existence across 1,050,500 mutations:
 * `duplicates`: **0**
 * `missing`: **0**
@@ -73,7 +113,7 @@ Under `--verify` mode, the harness tracked sequence numbers and key existence ac
 
 ---
 
-## 5. How to Reproduce
+## 6. How to Reproduce
 
 All benchmarks run inside the project's devcontainer against live FoundationDB 8.0 and Kafka 3.9.0 containers.
 
@@ -122,7 +162,7 @@ docker compose -f .devcontainer/docker-compose.yml exec app \
 
 ---
 
-## 6. Artifact Files
+## 7. Artifact Files
 
 * [`bench_e2e.py`](bench_e2e.py): Unified benchmark runner supporting pipeline mode, bridge mode, live heartbeat monitoring, and integrity verification.
 * [`results_15k.json`](results_15k.json): 15,000 mut/s 1-minute baseline test.
