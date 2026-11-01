@@ -1,0 +1,44 @@
+{
+  "config": {
+    "duration_s": 600.0,
+    "warmup_s": 30.0,
+    "batch_size": 500,
+    "value_size": 100,
+    "target_rate": 15000.0,
+    "verify": false
+  },
+  "environment": {
+    "platform": "Linux-7.0.14-linuxkit-x86_64-with-glibc2.39",
+    "cpu_count": 8,
+    "python": "3.12.3"
+  },
+  "write_rate_per_s": 15000.0,
+  "writer_behind_batches": 228,
+  "bridge_rate_per_s": 15000.0,
+  "bridge_mb_per_s": 2.1281774759292604,
+  "backlog_slope_per_s": 0.008226754654425718,
+  "backlog_growing": false,
+  "drained": true,
+  "drain_s": 0.02486899599989556,
+  "total_written": 9450500,
+  "total_acked": 9450500,
+  "idle_poll_s_total": 0.0,
+  "stage_mean_ms": {
+    "poll": 0.671408285676199,
+    "produce": 0.021115927672898438,
+    "flush": 0.15193746308496198,
+    "ack": 1.8064853265104377
+  },
+  "latency_ms": {
+    "samples": 17907,
+    "p50": 11.846,
+    "p90": 15.183208,
+    "p99": 46.348583,
+    "max": 504.808583
+  },
+  "lag_versions": {
+    "mean": 861.307327699497,
+    "max": 549611,
+    "approx_max_seconds": 0.549611
+  }
+}
