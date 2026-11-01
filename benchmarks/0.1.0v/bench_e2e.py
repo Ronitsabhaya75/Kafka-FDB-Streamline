@@ -21,7 +21,7 @@ Run inside the dev container, e.g.:
 To find the sustainable rate, sweep --target-rate upward and look for the
 highest value where the backlog stays flat. An unthrottled writer
 (--target-rate 0) will outrun the bridge and pin T-log history, so keep those
-runs short on shared clusters. 
+runs short on shared clusters.
 """
 
 from __future__ import annotations
