@@ -6,13 +6,13 @@ from unittest.mock import MagicMock, patch
 import pytest
 from confluent_kafka import KafkaError, KafkaException
 
+from fdb_kafka_bridge.kafka.producer import MutationProducer
 from fdbkafka.cdc.v1 import mutations_pb2
-from src.kafka.producer import MutationProducer
 
 
 @pytest.fixture
 def producer_class() -> Iterator[MagicMock]:
-    with patch("src.kafka.producer.Producer") as producer_class:
+    with patch("fdb_kafka_bridge.kafka.producer.Producer") as producer_class:
         yield producer_class
 
 

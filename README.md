@@ -14,6 +14,16 @@ Requires Python 3.12. Commits must be signed — see [Signed commits](docs/conve
 Kafka producer behavior and local verification are documented in the
 [`Kafka producer specification`](docs/KAFKA-PRODUCER-SPEC.md).
 
+## Install
+
+```bash
+pip install .
+```
+
+Installs the `fdb-kafka-bridge` distribution, which provides the import packages `fdb_kafka_bridge` (subpackages `bridge`, `cdc`, `kafka`, `serialization`) and `fdbkafka` (generated Protobuf).
+
+`libfdb_c` is a system requirement that pip does not install. The `foundationdb` Python package depends on it at runtime: `import fdb` succeeds without it, but `fdb.api_version()` raises `Unable to locate the FoundationDB API shared library!`. Install the client library from the [FoundationDB release](https://github.com/apple/foundationdb/releases) that matches `FDB_VERSION` in the [`Dockerfile`](Dockerfile), which shows the Linux setup.
+
 ## Contributing
 
 Repo layout, branching, code style and PR workflow: [`docs/conventions.md`](docs/conventions.md). Coding-agent guidance: [`AGENTS.md`](AGENTS.md).

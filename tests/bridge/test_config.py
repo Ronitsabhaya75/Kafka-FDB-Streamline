@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from src.bridge.config import (
+from fdb_kafka_bridge.bridge.config import (
     BridgeConfig,
     CDCConfig,
     FDBConfig,

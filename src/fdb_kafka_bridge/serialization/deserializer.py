@@ -2,10 +2,13 @@
 
 from google.protobuf.message import DecodeError
 
-from fdbkafka.cdc.v1 import mutations_pb2
-from src.serialization import _checks
-from src.serialization.errors import DecodeFailure, InputTypeError, RecordDecodeError
-from src.serialization.model import (
+from fdb_kafka_bridge.serialization import _checks
+from fdb_kafka_bridge.serialization.errors import (
+    DecodeFailure,
+    InputTypeError,
+    RecordDecodeError,
+)
+from fdb_kafka_bridge.serialization.model import (
     _MAX_TYPE_CODE,
     _MAX_VERSION,
     Mutation,
@@ -16,6 +19,7 @@ from src.serialization.model import (
     VersionEnd,
     VersionIndex,
 )
+from fdbkafka.cdc.v1 import mutations_pb2
 
 
 def _check_version(fdb_version: int, index: int | None) -> None:

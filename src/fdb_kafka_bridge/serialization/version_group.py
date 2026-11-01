@@ -4,11 +4,11 @@ from collections.abc import Iterable
 
 from google.protobuf.message import Message
 
+from fdb_kafka_bridge.serialization import _checks, _wire
+from fdb_kafka_bridge.serialization.errors import RecordTooLargeError
+from fdb_kafka_bridge.serialization.model import NativeMutation
+from fdb_kafka_bridge.serialization.serializer import serialize_version_end
 from fdbkafka.cdc.v1 import mutations_pb2
-from src.serialization import _checks, _wire
-from src.serialization.errors import RecordTooLargeError
-from src.serialization.model import NativeMutation
-from src.serialization.serializer import serialize_version_end
 
 
 def _varint_bytes(value: int) -> int:

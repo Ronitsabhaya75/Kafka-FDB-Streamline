@@ -9,7 +9,7 @@ import weakref
 
 from confluent_kafka import KafkaError, Message
 
-from src.kafka.producer import MutationProducer
+from fdb_kafka_bridge.kafka.producer import MutationProducer
 from tests.kafka.utils import build_set_mutation_record
 
 UNREACHABLE = "127.0.0.1:1"

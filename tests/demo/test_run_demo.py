@@ -8,7 +8,7 @@ from unittest.mock import create_autospec
 
 import pytest
 
-from src.bridge.pipeline import Bridge
+from fdb_kafka_bridge.bridge.pipeline import Bridge
 
 
 @pytest.fixture

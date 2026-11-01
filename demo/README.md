@@ -25,7 +25,7 @@ docker compose -f .devcontainer/docker-compose.yml up -d --build
 docker compose -f .devcontainer/docker-compose.yml exec app \
   pip3 install --break-system-packages -r requirements-dev.txt
 docker compose -f .devcontainer/docker-compose.yml exec app \
-  env PYTHONPATH=.:protobuf/gen python3 demo/run_demo.py --count 10000
+  env PYTHONPATH=.:src:protobuf/gen python3 demo/run_demo.py --count 10000
 ```
 
 Use `--kafka-bootstrap-servers` and `--timeout` to override the broker address

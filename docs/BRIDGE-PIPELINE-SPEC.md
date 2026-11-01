@@ -1,8 +1,8 @@
 # Bridge pipeline specification
 
 The bridge module provides two complementary layers:
-1. `src.bridge.BridgePipeline`: A single-step coordinator that processes one CDC reply: poll, produce, flush or commit, checkpoint `get_position()`, then acknowledge.
-2. `src.bridge.Bridge`: An autonomous streaming daemon that manages connection lifecycles, background execution, error recovery, cursor persistence, and metrics collection.
+1. `fdb_kafka_bridge.bridge.BridgePipeline`: A single-step coordinator that processes one CDC reply: poll, produce, flush or commit, checkpoint `get_position()`, then acknowledge.
+2. `fdb_kafka_bridge.bridge.Bridge`: An autonomous streaming daemon that manages connection lifecycles, background execution, error recovery, cursor persistence, and metrics collection.
 
 ```
 FDB CDC → poll_records() → produce() × N → flush_or_raise() / commit_transaction()
@@ -74,7 +74,7 @@ If the checkpoint or the acknowledgement budget fails after delivery, the next `
 
 ## 2. Autonomous Daemon (`Bridge`)
 
-`src.bridge.Bridge` orchestrates continuous streaming with declarative configuration:
+`fdb_kafka_bridge.bridge.Bridge` orchestrates continuous streaming with declarative configuration:
 
 ### Configuration (`BridgeConfig`)
 

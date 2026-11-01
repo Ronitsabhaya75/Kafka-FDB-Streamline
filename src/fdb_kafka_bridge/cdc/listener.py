@@ -3,11 +3,18 @@
 import time
 from typing import Any, Final, Self
 
+from fdb_kafka_bridge.cdc.client import FDBClient, _raise_consume_failure, _to_bytes
+from fdb_kafka_bridge.cdc.errors import (
+    CDCConsumerClosedError,
+    CDCError,
+    CDCInvalidCursorError,
+)
+from fdb_kafka_bridge.serialization import (
+    serialize_version_end,
+    serialize_version_group,
+)
+from fdb_kafka_bridge.serialization.errors import RecordTooLargeError
 from fdbkafka.cdc.v1 import mutations_pb2
-from src.cdc.client import FDBClient, _raise_consume_failure, _to_bytes
-from src.cdc.errors import CDCConsumerClosedError, CDCError, CDCInvalidCursorError
-from src.serialization import serialize_version_end, serialize_version_group
-from src.serialization.errors import RecordTooLargeError
 
 DEFAULT_MAX_RECORD_BYTES: Final[int] = 1_000_000
 DEFAULT_RESUME_TIMEOUT_SECONDS: Final[float] = 10.0
