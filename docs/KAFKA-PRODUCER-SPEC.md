@@ -1,6 +1,6 @@
 # Kafka producer specification
 
-`src.kafka.MutationProducer` is the publishing boundary for serialized CDC
+`fdb_kafka_bridge.kafka.MutationProducer` is the publishing boundary for serialized CDC
 records. It accepts an `FDBMutationRecord`, serializes it to Protobuf wire bytes,
 and enqueues it with `confluent-kafka`.
 
@@ -141,7 +141,7 @@ verify its key and that its value decodes back to the record sent:
 
 ```bash
 docker compose -f .devcontainer/docker-compose.yml up -d kafka
-PYTHONPATH=.:protobuf/gen \
+PYTHONPATH=.:src:protobuf/gen \
   .venv/bin/python scripts/kafka_producer_smoke.py
 ```
 

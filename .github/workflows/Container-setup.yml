@@ -105,7 +105,7 @@ jobs:
               pip3 install --break-system-packages -r requirements-dev.txt
 
               echo "=== Running Protobuf Unit and Simulation Tests ==="
-              PYTHONPATH=/workspace:/workspace/protobuf/gen \
+              PYTHONPATH=/workspace:/workspace/src:/workspace/protobuf/gen \
               python3 -m pytest \
                 protobuf/tests/test_mutations_proto.py \
                 protobuf/tests/test_pipeline_simulation.py \
@@ -140,9 +140,9 @@ jobs:
               pip3 install --break-system-packages -r requirements-dev.txt
 
               echo "=== Running Serialization Tests with Coverage ==="
-              PYTHONPATH=/workspace:/workspace/protobuf/gen \
+              PYTHONPATH=/workspace:/workspace/src:/workspace/protobuf/gen \
               python3 -m pytest \
-                --cov=src/serialization \
+                --cov=src/fdb_kafka_bridge/serialization \
                 --cov-report=term-missing \
                 tests/serialization/ \
                 -v
@@ -177,9 +177,9 @@ jobs:
               pip3 install --break-system-packages -r requirements-dev.txt
 
               echo "=== Running CDC Mutation Tests with Coverage ==="
-              PYTHONPATH=/workspace:/workspace/protobuf/gen \
+              PYTHONPATH=/workspace:/workspace/src:/workspace/protobuf/gen \
               python3 -m pytest \
-                --cov=src/cdc \
+                --cov=src/fdb_kafka_bridge/cdc \
                 --cov-report=term-missing \
                 tests/cdc/ \
                 -v
@@ -213,7 +213,7 @@ jobs:
               pip3 install --break-system-packages -r requirements-dev.txt
 
               echo "=== Running Kafka Producer Unit Tests ==="
-              PYTHONPATH=/workspace:/workspace/protobuf/gen \
+              PYTHONPATH=/workspace:/workspace/src:/workspace/protobuf/gen \
               python3 -m pytest \
                 tests/kafka/ \
                 -v
@@ -251,7 +251,7 @@ jobs:
               pip3 install --break-system-packages -r requirements-dev.txt
 
               echo "=== Running Kafka Live Integration Tests ==="
-              PYTHONPATH=/workspace:/workspace/protobuf/gen \
+              PYTHONPATH=/workspace:/workspace/src:/workspace/protobuf/gen \
               python3 -m pytest \
                 tests/kafka/test_producer_integration.py \
                 -v -m integration
@@ -262,7 +262,7 @@ jobs:
           python3 -m venv .venv
           . .venv/bin/activate
           pip install -r requirements-dev.txt
-          PYTHONPATH=.:protobuf/gen python3 scripts/kafka_producer_smoke.py --bootstrap-servers localhost:9092 --console-bootstrap-servers kafka:19092
+          PYTHONPATH=.:src:protobuf/gen python3 scripts/kafka_producer_smoke.py --bootstrap-servers localhost:9092 --console-bootstrap-servers kafka:19092
 
   test-bridge:
     needs: build-and-verify
@@ -292,7 +292,7 @@ jobs:
               pip3 install --break-system-packages -r requirements-dev.txt
 
               echo "=== Running Bridge Unit Tests ==="
-              PYTHONPATH=/workspace:/workspace/protobuf/gen \
+              PYTHONPATH=/workspace:/workspace/src:/workspace/protobuf/gen \
               python3 -m pytest \
                 tests/bridge/ \
                 tests/demo/ \
@@ -331,7 +331,7 @@ jobs:
               pip3 install --break-system-packages -r requirements-dev.txt
 
               echo "=== Running Bridge Live Kafka Tests ==="
-              PYTHONPATH=/workspace:/workspace/protobuf/gen \
+              PYTHONPATH=/workspace:/workspace/src:/workspace/protobuf/gen \
               python3 -m pytest \
                 tests/bridge/test_pipeline_integration.py \
                 -v -m integration

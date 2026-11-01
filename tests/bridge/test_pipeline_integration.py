@@ -16,9 +16,9 @@ import pytest
 from confluent_kafka import Consumer, KafkaException, TopicPartition
 from confluent_kafka.admin import AdminClient, NewTopic
 
+from fdb_kafka_bridge.bridge.pipeline import BridgePipeline
+from fdb_kafka_bridge.kafka.producer import MutationProducer
 from fdbkafka.cdc.v1 import mutations_pb2
-from src.bridge.pipeline import BridgePipeline
-from src.kafka.producer import MutationProducer
 
 BOOTSTRAP_SERVERS = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
 PARTITIONS = 4

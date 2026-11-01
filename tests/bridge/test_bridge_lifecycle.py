@@ -10,11 +10,15 @@ from unittest.mock import MagicMock, create_autospec, patch
 
 import pytest
 
-from src.bridge.config import BridgeConfig, from_dict
-from src.bridge.pipeline import Bridge, BridgePipeline, _load_cursor_from_file
-from src.cdc.client import FDBClient
-from src.cdc.listener import FDBMutationListener
-from src.kafka.producer import MutationProducer
+from fdb_kafka_bridge.bridge.config import BridgeConfig, from_dict
+from fdb_kafka_bridge.bridge.pipeline import (
+    Bridge,
+    BridgePipeline,
+    _load_cursor_from_file,
+)
+from fdb_kafka_bridge.cdc.client import FDBClient
+from fdb_kafka_bridge.cdc.listener import FDBMutationListener
+from fdb_kafka_bridge.kafka.producer import MutationProducer
 
 
 def _config(**kafka: Any) -> BridgeConfig:
@@ -43,10 +47,10 @@ def _listener() -> MagicMock:
 def wiring() -> Iterator[dict[str, MagicMock]]:
     """Patch the classes Bridge builds from config."""
     with (
-        patch("src.bridge.pipeline.FDBClient") as client_cls,
-        patch("src.bridge.pipeline.FDBMutationListener") as listener_cls,
-        patch("src.bridge.pipeline.MutationProducer") as producer_cls,
-        patch("src.bridge.pipeline._load_cursor_from_file") as load_cursor,
+        patch("fdb_kafka_bridge.bridge.pipeline.FDBClient") as client_cls,
+        patch("fdb_kafka_bridge.bridge.pipeline.FDBMutationListener") as listener_cls,
+        patch("fdb_kafka_bridge.bridge.pipeline.MutationProducer") as producer_cls,
+        patch("fdb_kafka_bridge.bridge.pipeline._load_cursor_from_file") as load_cursor,
     ):
         client_cls.return_value = create_autospec(FDBClient, instance=True)
         listener_cls.side_effect = lambda *a, **k: _listener()

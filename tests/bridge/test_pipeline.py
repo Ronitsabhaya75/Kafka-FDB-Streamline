@@ -6,11 +6,11 @@ from unittest.mock import MagicMock, PropertyMock, create_autospec
 import pytest
 from confluent_kafka import KafkaError, KafkaException
 
+from fdb_kafka_bridge.bridge.pipeline import BridgePipeline
+from fdb_kafka_bridge.cdc.errors import CDCRetryableError, CDCTerminalError
+from fdb_kafka_bridge.cdc.listener import FDBMutationListener
+from fdb_kafka_bridge.kafka.producer import MutationProducer
 from fdbkafka.cdc.v1 import mutations_pb2
-from src.bridge.pipeline import BridgePipeline
-from src.cdc.errors import CDCRetryableError, CDCTerminalError
-from src.cdc.listener import FDBMutationListener
-from src.kafka.producer import MutationProducer
 
 
 def _make_record(stream: str = "test") -> mutations_pb2.FDBMutationRecord:
@@ -498,7 +498,8 @@ class TestAckRetry:
     def test_ack_retry_backs_off(self, monkeypatch: pytest.MonkeyPatch) -> None:
         slept: list[float] = []
         monkeypatch.setattr(
-            "src.bridge.pipeline.time.sleep", lambda delay: slept.append(delay)
+            "fdb_kafka_bridge.bridge.pipeline.time.sleep",
+            lambda delay: slept.append(delay),
         )
         pipeline, _producer, listener, _checkpoint, _cursor = _make_pipeline(
             records=[_make_record()],
@@ -518,7 +519,8 @@ class TestAckRetry:
     def test_commit_retry_backs_off(self, monkeypatch: pytest.MonkeyPatch) -> None:
         slept: list[float] = []
         monkeypatch.setattr(
-            "src.bridge.pipeline.time.sleep", lambda delay: slept.append(delay)
+            "fdb_kafka_bridge.bridge.pipeline.time.sleep",
+            lambda delay: slept.append(delay),
         )
         pipeline, producer, _listener, _checkpoint, _cursor = _make_pipeline(
             transactional=True,

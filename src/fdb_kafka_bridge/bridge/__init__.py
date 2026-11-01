@@ -5,7 +5,7 @@ to Kafka, checkpointed, then acknowledged back to FDB. Both modes provide
 at-least-once delivery; neither provides cross-system exactly-once.
 """
 
-from src.bridge.config import (
+from fdb_kafka_bridge.bridge.config import (
     BridgeConfig,
     CDCConfig,
     FDBConfig,
@@ -13,7 +13,12 @@ from src.bridge.config import (
     PipelineConfig,
     from_dict,
 )
-from src.bridge.pipeline import Bridge, BridgeMetrics, BridgePipeline, Checkpoint
+from fdb_kafka_bridge.bridge.pipeline import (
+    Bridge,
+    BridgeMetrics,
+    BridgePipeline,
+    Checkpoint,
+)
 
 __all__ = [
     "Bridge",

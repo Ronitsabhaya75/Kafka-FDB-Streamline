@@ -7,8 +7,8 @@ protobuf swallows a `None` kwarg instead of raising.
 from google.protobuf.message import Message
 from google.protobuf.timestamp_pb2 import Timestamp
 
+from fdb_kafka_bridge.serialization.model import MutationType
 from fdbkafka.cdc.v1 import mutations_pb2
-from src.serialization.model import MutationType
 
 
 def timestamp(bridge_timestamp_ns: int) -> Timestamp:

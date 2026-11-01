@@ -8,8 +8,8 @@ import time
 import uuid
 from collections.abc import Sequence
 
+from fdb_kafka_bridge.kafka import MutationProducer
 from fdbkafka.cdc.v1 import mutations_pb2
-from src.kafka import MutationProducer
 from tests.kafka.utils import build_set_mutation_record
 
 

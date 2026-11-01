@@ -16,8 +16,8 @@ from collections.abc import Iterator
 import pytest
 from confluent_kafka import Consumer, KafkaError, KafkaException
 
+from fdb_kafka_bridge.kafka.producer import MutationProducer
 from fdbkafka.cdc.v1 import mutations_pb2
-from src.kafka.producer import MutationProducer
 from tests.kafka.utils import (
     build_batch_record,
     build_set_mutation_record,

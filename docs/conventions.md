@@ -7,10 +7,11 @@ How the team lays out the repo, branches, writes Python, and merges. Tooling enf
 ```
 .
 ├── src/
-│   ├── bridge/           # Core bridge pipeline (CDC → Kafka)
-│   ├── cdc/              # FDB CDC consumer wrapper
-│   ├── kafka/            # Kafka producer module
-│   └── serialization/    # Protobuf serialization
+│   └── fdb_kafka_bridge/     # Import package (distribution: fdb-kafka-bridge)
+│       ├── bridge/           # Core bridge pipeline (CDC → Kafka)
+│       ├── cdc/              # FDB CDC consumer wrapper
+│       ├── kafka/            # Kafka producer module
+│       └── serialization/    # Protobuf serialization
 ├── protobuf/
 │   ├── proto/            # .proto schema definitions
 │   ├── gen/              # buf generate output (committed)
@@ -31,7 +32,8 @@ How the team lays out the repo, branches, writes Python, and merges. Tooling enf
 
 - Empty directories hold a `.gitkeep` until real files land.
 - `.devcontainer/` and `Dockerfile` land with PR #2; `protobuf/` and `buf*.yaml` with PR #6.
-- Generated code (`buf generate` → `protobuf/gen/`) is committed but excluded from ruff and black.
+- Generated code (`buf generate` → `protobuf/gen/`) is committed but excluded from ruff and black. It ships in the wheel as the separate top-level package `fdbkafka`.
+- Running from a checkout needs the repo root, `src` and `protobuf/gen` on the import path (`PYTHONPATH=.:src:protobuf/gen`); pytest configures this itself.
 
 ## Branching
 
@@ -90,6 +92,7 @@ source .venv/bin/activate
 make lint                     # ruff + black, check-only
 make format                   # apply fixes
 make test                     # pytest: tests/ + protobuf/tests/ (no FDB or Kafka needed)
+make test-packaging           # build the wheel, install into a fresh venv, check imports (network)
 ```
 
 `make setup` installs a pre-commit hook that runs ruff + black on every commit; `pre-commit run --all-files` runs it by hand. Tool versions are pinned in `requirements-dev.txt`; keep them in sync with the `rev`s in `.pre-commit-config.yaml`.

@@ -1,4 +1,4 @@
-.PHONY: setup lint format test
+.PHONY: setup lint format test test-packaging
 
 PYTHON ?= python3.12
 VENV := .venv
@@ -18,3 +18,6 @@ format:
 
 test:
 	$(VENV)/bin/pytest
+
+test-packaging:
+	PACKAGING_INTEGRATION=1 $(VENV)/bin/pytest tests/test_packaging.py

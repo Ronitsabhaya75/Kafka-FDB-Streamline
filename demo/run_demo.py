@@ -26,11 +26,11 @@ import fdb
 from confluent_kafka import Consumer, KafkaException
 
 from demo.workload import verify_workload
+from fdb_kafka_bridge.bridge.config import from_dict
+from fdb_kafka_bridge.bridge.pipeline import Bridge
+from fdb_kafka_bridge.cdc.client import FDBClient
+from fdb_kafka_bridge.cdc.listener import strinc
 from fdbkafka.cdc.v1 import mutations_pb2
-from src.bridge.config import from_dict
-from src.bridge.pipeline import Bridge
-from src.cdc.client import FDBClient
-from src.cdc.listener import strinc
 
 DEFAULT_KAFKA_BOOTSTRAP_SERVERS = "kafka:19092"
 DEFAULT_SAMPLE_COUNT = 10000

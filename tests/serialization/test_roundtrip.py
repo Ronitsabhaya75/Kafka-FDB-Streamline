@@ -5,7 +5,7 @@ import pytest
 from hypothesis import given
 from hypothesis import strategies as st
 
-from src.serialization import (
+from fdb_kafka_bridge.serialization import (
     InputValueError,
     Mutation,
     MutationBatch,
