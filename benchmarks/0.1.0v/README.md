@@ -32,41 +32,79 @@ The benchmark harness ([`bench_e2e.py`](bench_e2e.py)) runs a live concurrent wr
 
 ## 3. Metrics & Mathematical Formulas
 
-The benchmark harness ([`bench_e2e.py`](bench_e2e.py)) calculates all operational metrics using strict, deterministic formulas:
+The benchmark harness ([`bench_e2e.py`](bench_e2e.py)) calculates all operational metrics using deterministic mathematical formulas:
 
 ### 3.1. Backlog Definition
-$$\text{Backlog}(t) = \text{Written}(t) - \text{Acked}(t)$$
-Represents the exact number of committed FoundationDB mutations currently in-flight across the CDC proxy, serializer, Kafka broker queues, or unacknowledged by the bridge.
+
+$$
+\text{Backlog}(t) = \text{Written}(t) - \text{Acked}(t)
+$$
+
+Represents the exact count of committed FoundationDB mutations currently in-flight across the CDC proxy, serializer, Kafka broker queues, or unacknowledged by the bridge.
 
 ### 3.2. Backlog Trend Slope (Ordinary Least Squares Regression)
-To determine if the bridge is accumulating lag over time, linear regression is performed over $n$ sampling points $(t_i, B_i)$ within the steady-state evaluation window:
-$$\text{Slope} = \frac{\sum_{i=1}^n (t_i - \bar{t})(B_i - \bar{B})}{\sum_{i=1}^n (t_i - \bar{t})^2}$$
+
+To determine whether the bridge is accumulating lag over time, linear regression is performed over $n$ sampling points $(t_i, B_i)$ within the steady-state evaluation window:
+
+$$
+\text{Slope} = \frac{\sum_{i=1}^n (t_i - \bar{t})(B_i - \bar{B})}{\sum_{i=1}^n (t_i - \bar{t})^2}
+$$
+
 Where:
 * $t_i$: Timestamp of sample $i$ relative to the start of the measured window.
-* $B_i = \text{Written}(t_i) - \text{Acked}(t_i)$: Backlog at timestamp $t_i$.
+* $B_i = \text{Written}(t_i) - \text{Acked}(t_i)$: Backlog count at timestamp $t_i$.
 * $\bar{t}$ and $\bar{B}$: Arithmetic means of sample timestamps and backlog counts.
 
 **NF1 Stability Classification:**
-$$\text{Verdict} = \begin{cases} \text{GROWING (Cannot keep up)} & \text{if } \text{Slope} > 0.01 \times \max(\text{WriteRate}, 1.0) \\ \text{Flat (Sustainable)} & \text{if } \text{Slope} \le 0.01 \times \max(\text{WriteRate}, 1.0) \end{cases}$$
+
+$$
+\text{Verdict} = \begin{cases}
+\text{GROWING (Cannot keep up)} & \text{if } \text{Slope} > 0.01 \times \max(\text{WriteRate}, 1.0) \\
+\text{Flat (Sustainable)} & \text{if } \text{Slope} \le 0.01 \times \max(\text{WriteRate}, 1.0)
+\end{cases}
+$$
 
 ### 3.3. Real-Path End-to-End Latency
-The writer thread stamps a 19-digit UNIX nanosecond timestamp $t_{\text{commit\_ns}}$ into the first 19 bytes of the mutation value payload before calling `tr.commit().wait()`. Upon successful Kafka broker delivery (`flush()` completes at $t_{\text{flush\_done\_ns}}$), latency is calculated:
-$$\text{Latency}_{\text{ms}} = \frac{t_{\text{flush\_done\_ns}} - t_{\text{commit\_ns}}}{10^6}$$
+
+The writer thread stamps a 19-digit UNIX nanosecond timestamp $t_{\text{commit}}$ into the first 19 bytes of the mutation value payload before calling `tr.commit().wait()`. Upon successful Kafka broker delivery (`flush()` completes at $t_{\text{flush}}$), latency is calculated:
+
+$$
+\text{Latency}_{\text{ms}} = \frac{t_{\text{flush}} - t_{\text{commit}}}{10^6}
+$$
+
 This measures the complete real-world latency chain:
-$$\text{Latency}_{\text{E2E}} = \Delta t_{\text{FDB 2PC Commit}} + \Delta t_{\text{CDC Proxy Delivery}} + \Delta t_{\text{Protobuf Serialize}} + \Delta t_{\text{Kafka Network Transport}} + \Delta t_{\text{Broker Fsync}}$$
+
+$$
+\text{Latency}_{\text{E2E}} = \Delta t_{\text{FDB}} + \Delta t_{\text{CDC}} + \Delta t_{\text{Serialize}} + \Delta t_{\text{Kafka}} + \Delta t_{\text{Fsync}}
+$$
 
 ### 3.4. CDC Read-Head Version Lag
-FoundationDB version lag measures the distance between the database's latest committed transaction version and the bridge's latest acknowledged consumer position:
-$$\text{Lag}_{\text{versions}} = \text{FDB}_{\text{last\_committed\_version}} - \text{CDC}_{\text{last\_consumed\_version}}$$
-Approximate lag in seconds (based on FoundationDB's default rate of $1{,}000{,}000$ versions/sec):
-$$\text{Lag}_{\text{seconds}} \approx \frac{\text{Lag}_{\text{versions}}}{1{,}000{,}000}$$
+
+FoundationDB version lag measures the distance between the database's latest committed transaction version ($V_{\text{committed}}$) and the bridge's latest acknowledged consumer position ($V_{\text{consumed}}$):
+
+$$
+\text{Lag}_{\text{versions}} = V_{\text{committed}} - V_{\text{consumed}}
+$$
+
+Approximate lag in seconds (based on FoundationDB's default rate of $10^6$ versions/sec):
+
+$$
+\text{Lag}_{\text{seconds}} \approx \frac{\text{Lag}_{\text{versions}}}{10^6}
+$$
 
 ### 3.5. Wire Bandwidth
-$$\text{Bandwidth}_{\text{MB/s}} = \frac{\Delta \text{Bytes}_{\text{wire}}}{1024 \times 1024 \times \Delta t}$$
+
+$$
+\text{Bandwidth}_{\text{MB/s}} = \frac{\Delta \text{Bytes}}{1024 \times 1024 \times \Delta t}
+$$
 
 ### 3.6. Nearest-Rank Latency Percentiles
+
 For a sorted list of $N$ latency samples and target percentile $P \in [0, 100]$:
-$$\text{Rank}(P) = \max\left(0, \min\left(N - 1, \left\lceil \frac{P}{100} \times N \right\rceil - 1\right)\right)$$
+
+$$
+\text{Rank}(P) = \max\left(0, \min\left(N - 1, \left\lceil \frac{P}{100} \times N \right\rceil - 1\right)\right)
+$$
 
 ---
 
