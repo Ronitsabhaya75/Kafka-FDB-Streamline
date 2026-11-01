@@ -14,7 +14,7 @@ What it measures, over a steady-state window (after warm-up):
   * Optional integrity check (--verify): duplicates, gaps, ordering.
 
 Run inside the dev container, e.g.:
-    PYTHONPATH=/workspace:/workspace/protobuf/gen python3 benchmarks/bench_e2e.py \
+    python3 benchmarks/0.1.0v/bench_e2e.py \
         --kafka-bootstrap-servers kafka:19092 --duration 60 --warmup 10 \
         --target-rate 20000 --output results_20000.json
 
@@ -50,6 +50,26 @@ for _p in (_ROOT, _SRC_DIR, _PROTO_DIR):
 DEFAULT_BOOTSTRAP = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "kafka:19092")
 TS_WIDTH = 19  # digits of time.time_ns() embedded in each value
 VERSIONS_PER_SECOND = 1_000_000  # FDB default; used only for approximate lag
+
+
+def _git_sha() -> str:
+    """Return the current short git SHA, or 'unknown' if unavailable.
+
+    Returns:
+        Git commit hash string or 'unknown'.
+    """
+    try:
+        import subprocess
+
+        res = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        return res.stdout.strip() or "unknown"
+    except Exception:
+        return "unknown"
 
 
 def percentile(sorted_values: list[float], pct: float) -> float:
@@ -285,6 +305,9 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             p1 = time.perf_counter()
             if not records:
                 idle_poll_s += p1 - p0
+                step_t.append(now)
+                step_acked.append(acked)
+                time.sleep(0.005)
                 continue
 
             for record in records:
@@ -368,7 +391,10 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         backlog_slope = slope(backlog_x, backlog_y)
         write_rate = written_in / window_s
         bridge_rate = acked_in / window_s
-        backlog_growing = backlog_slope > 0.01 * max(write_rate, 1.0)
+        if bridge_rate <= 0.0 and write_rate > 0.0:
+            backlog_growing = True
+        else:
+            backlog_growing = backlog_slope > 0.01 * max(write_rate, 1.0)
 
         def window_vals(ts: list[float], vals: list[float]) -> list[float]:
             return [
@@ -392,12 +418,14 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
                 "batch_size": args.batch_size,
                 "value_size": args.value_size,
                 "target_rate": args.target_rate,
+                "key_pool": args.key_pool,
                 "verify": args.verify,
             },
             "environment": {
                 "platform": platform.platform(),
                 "cpu_count": os.cpu_count(),
                 "python": platform.python_version(),
+                "git_sha": _git_sha(),
             },
             "write_rate_per_s": write_rate,
             "writer_behind_batches": writer.behind_batches,
@@ -433,13 +461,11 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
                 "missing": max(0, writer.written - len(seen)) if drained else None,
                 "order_violations": order_violations,
             }
-        if args.output:
-            with open(args.output, "w", encoding="utf-8") as fh:
-                json.dump(results, fh, indent=2)
         return results
     finally:
         writer.stop_event.set()
         listener.close()
+        producer.close()
         try:
             tr = database.create_transaction()
             if hasattr(tr, "options") and hasattr(tr.options, "set_timeout"):
@@ -516,7 +542,15 @@ def run_bridge_benchmark(args: argparse.Namespace) -> dict[str, Any]:
     drained = False
     drain_s: float | None = None
     registered = True
-    bridge_thread = threading.Thread(target=bridge.run, daemon=True)
+    bridge_errors: list[Exception] = []
+
+    def _bridge_worker() -> None:
+        try:
+            bridge.run()
+        except Exception as exc:
+            bridge_errors.append(exc)
+
+    bridge_thread = threading.Thread(target=_bridge_worker, daemon=True)
 
     try:
         t0 = time.monotonic()
@@ -533,6 +567,11 @@ def run_bridge_benchmark(args: argparse.Namespace) -> dict[str, Any]:
 
         while True:
             now = time.monotonic()
+            if not bridge_thread.is_alive() and not stop_requested:
+                if bridge_errors:
+                    raise RuntimeError("Bridge thread crashed") from bridge_errors[0]
+                raise RuntimeError("Bridge thread exited unexpectedly")
+
             acked = bridge.metrics.mutations_published
             step_t.append(now)
             step_acked.append(acked)
@@ -612,7 +651,10 @@ def run_bridge_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         backlog_slope = slope(backlog_x, backlog_y)
         write_rate = written_in / window_s
         bridge_rate = acked_in / window_s
-        backlog_growing = backlog_slope > 0.01 * max(write_rate, 1.0)
+        if bridge_rate <= 0.0 and write_rate > 0.0:
+            backlog_growing = True
+        else:
+            backlog_growing = backlog_slope > 0.01 * max(write_rate, 1.0)
 
         def window_vals(ts: list[float], vals: list[float]) -> list[float]:
             return [
@@ -629,12 +671,14 @@ def run_bridge_benchmark(args: argparse.Namespace) -> dict[str, Any]:
                 "batch_size": args.batch_size,
                 "value_size": args.value_size,
                 "target_rate": args.target_rate,
+                "key_pool": args.key_pool,
                 "cursor_file": cursor_file,
             },
             "environment": {
                 "platform": platform.platform(),
                 "cpu_count": os.cpu_count(),
                 "python": platform.python_version(),
+                "git_sha": _git_sha(),
             },
             "write_rate_per_s": write_rate,
             "bridge_rate_per_s": bridge_rate,
@@ -655,9 +699,6 @@ def run_bridge_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             },
             "cursor_checkpoint": cursor_data,
         }
-        if args.output:
-            with open(args.output, "w", encoding="utf-8") as fh:
-                json.dump(results, fh, indent=2)
         return results
     finally:
         writer.stop_event.set()
@@ -808,6 +849,11 @@ def main() -> int:
     p.add_argument("--output", help="write results JSON to this path")
     args = p.parse_args()
 
+    if args.use_bridge and args.verify:
+        p.error("--verify is not supported with --use-bridge")
+    if args.verify and args.key_pool != 0:
+        p.error("--verify requires unique keys; pass --key-pool 0")
+
     if args.use_bridge:
         results = run_bridge_benchmark(args)
     else:
@@ -817,7 +863,29 @@ def main() -> int:
         with open(args.output, "w", encoding="utf-8") as fh:
             json.dump(results, fh, indent=2)
         print(f"Results written to {args.output}")
-    return 0
+
+    if results.get("backlog_growing"):
+        print("ERROR: Benchmark failed - backlog was growing.", file=sys.stderr)
+        return 1
+    if not results.get("drained", True):
+        print(
+            "ERROR: Benchmark failed - did not drain remaining writes within deadline.",
+            file=sys.stderr,
+        )
+        return 1
+    if "integrity" in results:
+        integ = results["integrity"]
+        if (
+            integ.get("duplicates", 0) > 0
+            or (integ.get("missing") is not None and integ.get("missing", 0) > 0)
+            or integ.get("order_violations", 0) > 0
+        ):
+            print(
+                "ERROR: Benchmark failed - data integrity check failed.",
+                file=sys.stderr,
+            )
+            return 1
+
     return 0
 
 

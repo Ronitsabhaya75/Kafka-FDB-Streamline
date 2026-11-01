@@ -5,44 +5,46 @@
     "batch_size": 500,
     "value_size": 100,
     "target_rate": 15000.0,
+    "key_pool": 0,
     "verify": true
   },
   "environment": {
     "platform": "Linux-7.0.14-linuxkit-x86_64-with-glibc2.39",
     "cpu_count": 8,
-    "python": "3.12.3"
+    "python": "3.12.3",
+    "git_sha": "fefc3e5"
   },
   "write_rate_per_s": 15000.0,
-  "writer_behind_batches": 197,
+  "writer_behind_batches": 8,
   "bridge_rate_per_s": 15000.0,
-  "bridge_mb_per_s": 2.129674530029297,
-  "backlog_slope_per_s": -2.058465574993201,
+  "bridge_mb_per_s": 2.132479508717855,
+  "backlog_slope_per_s": -0.3401152904449198,
   "backlog_growing": false,
   "drained": true,
-  "drain_s": 0.016727239999909216,
-  "total_written": 1050500,
-  "total_acked": 1050500,
+  "drain_s": 0.0020549479999942832,
+  "total_written": 1050000,
+  "total_acked": 1050000,
   "idle_poll_s_total": 0.0,
   "stage_mean_ms": {
-    "poll": 0.909127045452514,
-    "produce": 0.028921279204621824,
-    "flush": 0.1943905583528191,
-    "ack": 2.1834341891547706
+    "poll": 0.7168628806133953,
+    "produce": 0.024847892804381343,
+    "flush": 0.1735801236249597,
+    "ack": 1.8605447042716392
   },
   "latency_ms": {
-    "samples": 1688,
-    "p50": 12.63125,
-    "p90": 33.004875,
-    "p99": 197.131,
-    "max": 803.739
+    "samples": 1798,
+    "p50": 12.010625,
+    "p90": 15.412833,
+    "p99": 39.405292,
+    "max": 110.066125
   },
   "lag_versions": {
-    "mean": 1992.012359742553,
-    "max": 759452,
-    "approx_max_seconds": 0.759452
+    "mean": 926.5416924615458,
+    "max": 134152,
+    "approx_max_seconds": 0.134152
   },
   "integrity": {
-    "unique_keys_seen": 1050500,
+    "unique_keys_seen": 1050000,
     "duplicates": 0,
     "missing": 0,
     "order_violations": 0
