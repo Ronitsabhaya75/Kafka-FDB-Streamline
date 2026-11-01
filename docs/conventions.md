@@ -151,6 +151,7 @@ Then add the same public key on GitHub under Settings → SSH and GPG keys → N
 - At least 1 approval required.
 - CI must pass: the [`Lint`](../.github/workflows/lint.yml) workflow runs `ruff check` and `black --check` on every PR. It is check-only — it never edits files or pushes commits.
 - CI must pass: the [`Tests`](../.github/workflows/tests.yml) workflow runs `pytest` on every PR.
+- CI must pass: the [`Packaging`](../.github/workflows/packaging.yml) workflow runs `tests/test_packaging.py` on every PR with `PACKAGING_INTEGRATION=1`: it builds the wheel, installs it into a fresh venv from the network, and needs no `libfdb_c`. The job fails if any test skips or none run.
 
 ## Enforcement
 
@@ -158,5 +159,6 @@ Then add the same public key on GitHub under Settings → SSH and GPG keys → N
 |------------|-------------|
 | Formatting, lint, naming, type hints, docstrings | pre-commit locally; `Lint` workflow on PRs |
 | Tests pass | `make test` locally; `Tests` workflow on PRs |
+| Wheel builds, installs and imports | `make test-packaging` locally; `Packaging` workflow on PRs, which fails on skipped or missing tests |
 | `main`/`develop` protected, PR required, 1 approval, CI green, signed commits | GitHub branch protection — a repo admin enables it under Settings → Branches |
 | Branch naming, Trello link | PR template + review |
