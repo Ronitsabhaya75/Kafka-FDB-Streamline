@@ -39,13 +39,13 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-# Ensure repo root and protobuf/gen are discoverable
-_ROOT = Path(__file__).resolve().parent.parent
+# Ensure repo root, src/, and protobuf/gen are discoverable
+_ROOT = Path(__file__).resolve().parents[2]
+_SRC_DIR = _ROOT / "src"
 _PROTO_DIR = _ROOT / "protobuf" / "gen"
-if str(_ROOT) not in sys.path:
-    sys.path.insert(0, str(_ROOT))
-if str(_PROTO_DIR) not in sys.path:
-    sys.path.insert(0, str(_PROTO_DIR))
+for _p in (_ROOT, _SRC_DIR, _PROTO_DIR):
+    if str(_p) not in sys.path:
+        sys.path.insert(0, str(_p))
 
 DEFAULT_BOOTSTRAP = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "kafka:19092")
 TS_WIDTH = 19  # digits of time.time_ns() embedded in each value
@@ -187,9 +187,9 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         Structured dictionary containing benchmark metrics and environment info.
     """
     # Imported lazily so the helpers above can be unit tested without FDB.
+    from fdb_kafka_bridge.cdc import FDBClient, FDBMutationListener, strinc
+    from fdb_kafka_bridge.kafka import MutationProducer
     from fdbkafka.cdc.v1 import mutations_pb2  # noqa: F401
-    from src.cdc import FDBClient, FDBMutationListener, strinc
-    from src.kafka import MutationProducer
 
     run_id = uuid.uuid4().hex[:10]
     stream_name = f"bench-{run_id}"
@@ -465,9 +465,9 @@ def run_bridge_benchmark(args: argparse.Namespace) -> dict[str, Any]:
     Returns:
         Structured dictionary containing benchmark metrics and environment info.
     """
-    from src.bridge.config import from_dict
-    from src.bridge.pipeline import Bridge
-    from src.cdc import FDBClient, strinc
+    from fdb_kafka_bridge.bridge.config import from_dict
+    from fdb_kafka_bridge.bridge.pipeline import Bridge
+    from fdb_kafka_bridge.cdc import FDBClient, strinc
 
     run_id = uuid.uuid4().hex[:10]
     stream_name = f"bench-{run_id}"
