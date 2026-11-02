@@ -17,10 +17,10 @@ flowchart LR
     end
 
     subgraph Bridge ["Bridge Daemon (fdb-kafka-bridge)"]
-        Listener["FDBMutationListener<br/><i>(Polls CDC & reconciles cursor)</i>"]
-        Serializer["Protobuf Serializer<br/><i>(Slices batches & adds VersionEnd)</i>"]
-        Producer["MutationProducer<br/><i>(acks=all, idempotent / transactional)</i>"]
-        Cursor["Cursor Checkpoint<br/><i>(Atomic disk fsync)</i>"]
+        Listener["FDBMutationListener<br/>Polls CDC and reconciles cursor"]
+        Serializer["Protobuf Serializer<br/>Slices batches and adds VersionEnd"]
+        Producer["MutationProducer<br/>acks=all, idempotent or transactional"]
+        Cursor["Cursor Checkpoint<br/>Atomic disk fsync"]
 
         Listener --> Serializer
         Serializer --> Producer
@@ -29,12 +29,12 @@ flowchart LR
     end
 
     subgraph Kafka ["Apache Kafka"]
-        Topic["Directory Topic<br/><i>(Partitioned by stream)</i>"]
+        Topic["Directory Topic<br/>Partitioned by stream"]
     end
 
-    TLog -->|consume()| Listener
+    TLog -->|consume mutations| Listener
     Producer -->|publish| Topic
-    Listener -.->|acknowledge() advances watermark| TLog
+    Listener -.->|advance retention watermark| TLog
 ```
 
 ### The Invariant Pipeline Step
