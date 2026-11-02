@@ -13,4 +13,4 @@ Map of the project's docs. Check here before reading docs wholesale, then open o
 | [`SERIALIZATION-SPEC.md`](SERIALIZATION-SPEC.md) | `src/fdb_kafka_bridge/serialization/` contract: public API, wire mapping, input rules, errors and decode failures, reader contract for a version group |
 | [`BRIDGE-PIPELINE-SPEC.md`](BRIDGE-PIPELINE-SPEC.md) | `fdb_kafka_bridge.bridge` contract: `BridgePipeline` single-step coordinator and `Bridge` autonomous daemon (strict configuration incl. `transactional_id`, producer wiring, durable stream-checked cursor persistence, recovery and rebuild retry, bounded shutdown, caller checklist incl. the `commit_outstanding` rule). |
 | [`CDC-CONSUMER-SPEC.md`](CDC-CONSUMER-SPEC.md) | `src/fdb_kafka_bridge/cdc/` contract: FDBClient, stream lifecycle, bounded record polling, safe resume and acknowledgement |
-| [`../demo/README.md`](../demo/README.md) | Live 10,000-mutation bridge demo: prerequisites, Docker Compose setup, CLI flags. |
+| [`../demo/README.md`](../demo/README.md) | Live 10,000-mutation bridge demo: prerequisites, Docker Compose setup, CLI flags.
