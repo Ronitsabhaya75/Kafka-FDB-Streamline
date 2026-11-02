@@ -25,7 +25,10 @@ from typing import Any
 import fdb
 from confluent_kafka import Consumer, KafkaException
 
-from demo.workload import verify_workload
+try:
+    from demo.workload import verify_workload
+except ModuleNotFoundError:
+    from workload import verify_workload  # type: ignore[no-redef]
 from fdb_kafka_bridge.bridge.config import from_dict
 from fdb_kafka_bridge.bridge.pipeline import Bridge
 from fdb_kafka_bridge.cdc.client import FDBClient
