@@ -4,6 +4,8 @@ This directory contains the complete end-to-end performance, endurance, and dura
 
 The benchmark harness ([`bench_e2e.py`](bench_e2e.py)) runs a live concurrent writer workload against the FoundationDB CDC stream and the Kafka bridge pipeline, measuring real-path throughput, commit-to-ack latencies, CDC read-head lag, and disk checkpoint durability without simulated delays or mocked network calls.
 
+Each results JSON is a **single run** on the environment below. Latency and lag vary across runs at the same target rate; the tables quote the committed artifact for that cell, not a multi-run aggregate.
+
 ---
 
 ## 1. Executive Summary
@@ -11,19 +13,19 @@ The benchmark harness ([`bench_e2e.py`](bench_e2e.py)) runs a live concurrent wr
 | Category | Result | Significance |
 |---|---|---|
 | **Peak Unthrottled Throughput** | **56,683 mutations/sec** (8.00 MB/s) | Achieved by a single writer thread without pipeline saturation (backlog slope -52 mut/s). |
-| **10-Min Sustained Run** | **9,450,500 mutations** (15,000 mut/s) | 600s steady-state window with **`+0 mut/s`** backlog slope in core pipeline loop. |
-| **End-to-End Latency** | **p50 = 11.8 ms**, **p90 = 15.2 ms**, **p99 = 46.3 ms** | Client `tr.commit()` in FDB to Kafka broker ACK (`acks=all`). |
-| **CDC Read-Head Lag** | **861 versions (~0.86 ms)** mean, **0.55s** max | Polling loop trails cluster commit head closely during continuous ingestion. |
-| **Full Bridge Checkpointing** | **15,917 atomic disk fsyncs** | Maintained 15k mut/s with zero errors while fsyncing cursor on every batch. |
-| **CDC Stream Ordering (`--verify`)** | **0 duplicates, 0 missing, 0 order violations** | Monotonic ordering verified across 1,050,500 polled mutations (`--key-pool 0`). |
+| **10-Min Sustained Run** | **9,450,500 mutations total** (15,000 mut/s) | 600s steady-state window with flat backlog (+0.016 mut/s) in the core pipeline loop. Includes 30s warm-up in the total. |
+| **End-to-End Latency (10-min)** | **p50 = 12.2 ms**, **p90 = 26.1 ms**, **p99 = 115.5 ms** | Client `tr.commit()` in FDB to Kafka broker ACK (`acks=all`). Max ≈ 0.99 s. |
+| **CDC Read-Head Lag (10-min)** | **1,571 versions (~1.6 ms)** mean, **0.98 s** max | Polling loop trails the writer's last commit version during continuous ingestion. |
+| **Full Bridge Checkpointing** | **15,917 atomic disk fsyncs** | Maintained ~15k mut/s with zero errors while fsyncing cursor on every batch. |
+| **CDC Stream Ordering (`--verify`)** | **0 duplicates, 0 missing, 0 order violations** | Monotonic ordering verified across 1,050,000 polled mutations (`--key-pool 0`). |
 
 ---
 
 ## 2. Test Environment
 
-* **Platform**: Linux x86_64 (`ubuntu:24.04` on Docker container runtime), 8 CPU Cores.
+* **Platform**: Linux x86_64 (`ubuntu:24.04` on Docker Desktop / linuxkit), 8 CPU Cores.
 * **FoundationDB**: Version **8.0.0** (API version 800) with native CDC enabled (`--knob_enable_native_cdc=1`).
-* **Apache Kafka**: Version **3.9.0** (`apache/kafka:3.9.0`), KRaft controller, single partition topic (single broker, `acks=all`).
+* **Apache Kafka**: Version **3.9.0** (`apache/kafka:3.9.0`), KRaft controller, single partition topic (single broker, `acks=all` — no multi-replica ISR).
 * **Producer Durability**: `acks=all`, `enable.idempotence=true`, `enable.gapless.guarantee=true`, `compression.type=lz4`, `linger.ms=5`.
 * **Payload Size**: 100-byte mutation values (stamping 19-digit UNIX nanosecond commit timestamp) + 27-byte keys (17-byte prefix + 10-byte index). Wire bandwidth is measured pre-compression.
 * **Batch Size**: 500 mutations per FoundationDB transaction.
@@ -66,7 +68,7 @@ $$
 
 ### 3.3. Real-Path End-to-End Latency
 
-The writer thread stamps a 19-digit UNIX nanosecond timestamp $t_{\text{commit}}$ into the first 19 bytes of the mutation value payload before calling `tr.commit().wait()`. Upon successful Kafka broker delivery (`flush()` completes at $t_{\text{flush}}$), latency is calculated:
+The writer thread stamps a 19-digit UNIX nanosecond timestamp $t_{\text{commit}}$ into the first 19 bytes of the mutation value payload before calling `tr.commit().wait()`. Upon successful Kafka broker delivery (`flush()` completes at $t_{\text{flush}}`), latency is calculated:
 
 $$
 \text{Latency}_{\text{ms}} = \frac{t_{\text{flush}} - t_{\text{commit}}}{10^6}
@@ -80,7 +82,7 @@ $$
 
 ### 3.4. CDC Read-Head Version Lag
 
-FoundationDB version lag measures the distance between the database's latest committed transaction version ($V_{\text{committed}}$) and the bridge's latest acknowledged consumer position ($V_{\text{consumed}}$):
+FoundationDB version lag measures the distance between the writer's latest committed transaction version ($V_{\text{committed}}$) and the bridge's latest acknowledged consumer position ($V_{\text{consumed}}$):
 
 $$
 \text{Lag}_{\text{versions}} = V_{\text{committed}} - V_{\text{consumed}}
@@ -104,6 +106,7 @@ For a sorted list of $N$ latency samples and target percentile $P \in [0, 100]$:
 
 $$
 \text{Rank}(P) = \max\left(0, \min\left(N - 1, \left\lceil \frac{P}{100} \times N \right\rceil - 1\right)\right)
+$$
 
 ---
 
@@ -116,7 +119,7 @@ $$
 | **25k Baseline** | Core Pipeline | 1,750,500 | 25,000 mut/s | 25,000 mut/s | 3.54 MB/s | 12.1ms / 24.1ms / 59.3ms | Flat (+1 mut/s) | [`results_25k.json`](results_25k.json) |
 | **Unthrottled Peak** | Core Pipeline (Single Writer) | 2,077,500 | Unthrottled | **56,683 mut/s** | **8.00 MB/s** | 36.7ms / 62.4ms / 116.6ms | Flat (-52 mut/s) | [`results_unthrottled.json`](results_unthrottled.json) |
 | **Stream Verification** | Core Pipeline (`--verify --key-pool 0`) | 1,050,000 | 15,000 mut/s | 15,000 mut/s | 2.13 MB/s | 12.0ms / 15.4ms / 39.4ms | Flat (-0 mut/s) | [`results_15k_verified.json`](results_15k_verified.json) |
-| **10-Min Sustained Run** | Core Pipeline (Loop only) | **9,450,500** | 15,000 mut/s | **15,000 mut/s** | **2.13 MB/s** | **11.8ms / 15.2ms / 46.3ms** | **Flat (+0 mut/s)** | [`results_10min_sustained.json`](results_10min_sustained.json) |
+| **10-Min Sustained Run** | Core Pipeline (Loop only) | **9,450,500** | 15,000 mut/s | **15,000 mut/s** | **2.13 MB/s** | **12.2ms / 26.1ms / 115.5ms** | **Flat (+0.016 mut/s)** | [`results_10min_sustained.json`](results_10min_sustained.json) |
 | **Autonomous Bridge** | Full Daemon (`--use-bridge`) | 1,050,500 | 15,000 mut/s | 14,992 mut/s | n/a | n/a | Flat (+1 mut/s) | [`results_bridge_15k.json`](results_bridge_15k.json) |
 
 ---
@@ -126,9 +129,10 @@ $$
 ### 5.1. 10-Minute Sustained Ingestion (Core Pipeline Loop)
 Evaluates the core ingestion loop without cursor disk persistence against continuous foreground writers for 10 minutes (600.0s steady-state window + 30.0s warmup) at 15,000 mut/s:
 
-* Over the 600.0-second window, the backlog trend slope was **`+0.008 mut/s`** (linear regression over 9.45 million records).
-* Written: `9,450,500` mutations; Acknowledged: `9,450,500` mutations.
-* **Drain time after writes stopped was 0.02 seconds**, confirming that the core ingestion loop maintained steady pace with the foreground writers throughout the 10-minute window.
+* Over the 600.0-second window, the backlog trend slope was **`+0.016 mut/s`** (linear regression; treated as flat by the 1% write-rate threshold).
+* Totals for the whole run (warmup included): written `9,450,500`; acknowledged `9,450,500`. The 600s measured window alone is about 9.0M mutations at 15k/s.
+* **Drain time after writes stopped was 0.059 seconds**, confirming that the core ingestion loop kept pace with the foreground writers through the 10-minute window.
+* Latency in this artifact: p50 **12.2 ms**, p90 **26.1 ms**, p99 **115.5 ms**, max **990 ms**. Mean CDC lag **1,571 versions** (~1.6 ms); max lag ≈ **0.98 s**.
 
 ### 5.2. Atomic Checkpoint Durability Overhead
 In **Benchmark 2** (`--use-bridge`), every CDC batch was processed through the complete `fdb_kafka_bridge.bridge.Bridge` daemon lifecycle:
@@ -137,16 +141,16 @@ In **Benchmark 2** (`--use-bridge`), every CDC batch was processed through the c
            ──> [f.flush() + os.fsync(cursor_file)] ──> [atomic os.replace()] 
            ──> [os.fsync(parent_dir)] ──> [FDB acknowledge()]
 ```
-* **15,917 discrete synchronous disk fsync operations** were completed before advancing the FDB watermark.
+* **15,917 discrete synchronous disk fsync operations** were completed before advancing the FDB watermark (`batches_acked`; watermark-only replies also count).
 * The bridge maintained **14,992 mutations/sec** with **zero errors** and an average version lag of **1,624 versions (~1.6 ms)**.
-* On disk, `/tmp/bench_cursor_*.json` verified clean JSON persistence with `stream_id` and `last_consumed_version` matching the committed batch watermark.
+* The committed cursor file recorded `stream_id` and `last_consumed_version`. The harness now compares that version to the listener position before teardown (`cursor_matches_listener` in new runs).
 
 ### 5.3. CDC Stream Sequence and Key Monotonicity
-Under `--verify` mode with an unbounded key pool (`--key-pool 0`), the harness tracked sequence numbers and key existence across 1,050,500 mutations polled from the CDC stream:
+Under `--verify` mode with an unbounded key pool (`--key-pool 0`), the harness tracked sequence numbers and key existence across **1,050,000** mutations polled from the CDC stream:
 * `duplicates`: **0**
 * `missing`: **0**
 * `order_violations`: **0**
-* Verifies monotonic key and version sequence continuity at the CDC listener interface. (Full end-to-end downstream Kafka consumer payload verification is demonstrated in `demo/run_demo.py` via `verify_workload`).
+* Verifies monotonic key and version sequence continuity at the CDC listener interface. Full end-to-end downstream Kafka consumer payload verification is demonstrated in `demo/run_demo.py` via `verify_workload`.
 
 ---
 
@@ -156,9 +160,12 @@ All benchmarks run inside the project's devcontainer against live FoundationDB 8
 
 ### Start the Stack
 ```bash
-docker compose -f .devcontainer/docker-compose.yml up -d
-docker compose -f .devcontainer/docker-compose.yml exec app pip install --break-system-packages -e .
+docker compose -f .devcontainer/docker-compose.yml up -d --build
+docker compose -f .devcontainer/docker-compose.yml exec app \
+  pip install --break-system-packages -e .
 ```
+
+Wait until FDB and Kafka are accepting connections before running benchmarks.
 
 ### 1. Run the 10-Minute Sustained Benchmark
 ```bash
@@ -189,16 +196,7 @@ docker compose -f .devcontainer/docker-compose.yml exec app \
         --output benchmarks/0.1.0v/results_15k_verified.json
 ```
 
-### 4. Run Unthrottled Saturation Test
-```bash
-docker compose -f .devcontainer/docker-compose.yml exec app \
-    python3 benchmarks/0.1.0v/bench_e2e.py \
-        --kafka-bootstrap-servers kafka:19092 \
-        --duration 30 --warmup 5 --target-rate 0 \
-        --output benchmarks/0.1.0v/results_unthrottled.json
-```
-
-### 4. Run Unthrottled Saturation Test
+### 4. Run Unthrottled Throughput Test
 ```bash
 docker compose -f .devcontainer/docker-compose.yml exec app \
     python3 benchmarks/0.1.0v/bench_e2e.py \
@@ -215,8 +213,7 @@ docker compose -f .devcontainer/docker-compose.yml exec app \
 * [`results_15k.json`](results_15k.json): 15,000 mut/s 1-minute baseline test.
 * [`results_20k.json`](results_20k.json): 20,000 mut/s 1-minute baseline test.
 * [`results_25k.json`](results_25k.json): 25,000 mut/s 1-minute baseline test.
-* [`results_unthrottled.json`](results_unthrottled.json): 56,683 mut/s saturation test.
-* [`results_15k_verified.json`](results_15k_verified.json): 1,050,500 mutation integrity verification run.
-* [`results_10min_sustained.json`](results_10min_sustained.json): 9,450,500 mutation 10-minute NF1 compliance run.
+* [`results_unthrottled.json`](results_unthrottled.json): 56,683 mut/s unthrottled single-writer run.
+* [`results_15k_verified.json`](results_15k_verified.json): 1,050,000 mutation CDC ordering verification run.
+* [`results_10min_sustained.json`](results_10min_sustained.json): 9,450,500 mutation 10-minute sustained core-loop run.
 * [`results_bridge_15k.json`](results_bridge_15k.json): 15,917 disk fsync autonomous daemon run.
-

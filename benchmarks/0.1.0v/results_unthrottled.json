@@ -5,7 +5,8 @@
     "batch_size": 500,
     "value_size": 100,
     "target_rate": 0.0,
-    "verify": false
+    "verify": false,
+    "key_pool": 500000
   },
   "environment": {
     "platform": "Linux-7.0.14-linuxkit-x86_64-with-glibc2.39",

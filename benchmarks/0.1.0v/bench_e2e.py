@@ -50,6 +50,7 @@ for _p in (_ROOT, _SRC_DIR, _PROTO_DIR):
 DEFAULT_BOOTSTRAP = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "kafka:19092")
 TS_WIDTH = 19  # digits of time.time_ns() embedded in each value
 VERSIONS_PER_SECOND = 1_000_000  # FDB default; used only for approximate lag
+WRITER_JOIN_TIMEOUT_S = 60.0
 
 
 def _git_sha() -> str:
@@ -113,7 +114,7 @@ def slope(xs: list[float], ys: list[float]) -> float:
 
 
 def value_at(times: list[float], values: list[float], t: float) -> float:
-    """Value of a cumulative series at time t (last sample at or before t).
+    """Step-lookup of a cumulative series at time t (last sample at or before t).
 
     Args:
         times: Monotonically increasing list of timestamps.
@@ -121,10 +122,64 @@ def value_at(times: list[float], values: list[float], t: float) -> float:
         t: Target lookup timestamp.
 
     Returns:
-        Interpolated cumulative value at time t.
+        Last sampled cumulative value at or before t, or 0 if none.
     """
     i = bisect.bisect_right(times, t) - 1
     return values[i] if i >= 0 else 0
+
+
+def append_step_sample(
+    step_t: list[float],
+    step_acked: list[float],
+    step_bytes: list[float],
+    *,
+    t: float,
+    acked: float,
+    wire_bytes: float,
+) -> None:
+    """Append one aligned backlog/bandwidth sample.
+
+    ``step_t``, ``step_acked``, and ``step_bytes`` must stay the same length so
+    ``value_at`` can index them together.
+
+    Args:
+        step_t: Sample timestamps.
+        step_acked: Cumulative acknowledged mutation counts.
+        step_bytes: Cumulative wire-byte counts.
+        t: Sample timestamp.
+        acked: Cumulative acked mutations at ``t``.
+        wire_bytes: Cumulative wire bytes at ``t``.
+    """
+    step_t.append(t)
+    step_acked.append(acked)
+    step_bytes.append(wire_bytes)
+
+
+def exit_code_for_results(results: dict[str, Any]) -> int:
+    """Map a results dict to a process exit code.
+
+    Args:
+        results: Benchmark results from a completed run.
+
+    Returns:
+        ``0`` on success, ``1`` when backlog grew, drain failed, integrity
+        failed, or the durable cursor disagrees with the listener.
+    """
+    if results.get("backlog_growing"):
+        return 1
+    if not results.get("drained", True):
+        return 1
+    if results.get("cursor_matches_listener") is False:
+        return 1
+    if "integrity" in results:
+        integ = results["integrity"]
+        if (
+            integ.get("duplicates", 0) > 0
+            or (integ.get("missing") is not None and integ.get("missing", 0) > 0)
+            or integ.get("order_violations", 0) > 0
+        ):
+            return 1
+    return 0
 
 
 class Writer(threading.Thread):
@@ -195,6 +250,25 @@ class Writer(threading.Thread):
                         self.behind_batches += 1
         except BaseException as exc:  # noqa: BLE001 - surfaced by main thread
             self.error = exc
+
+
+def stop_writer(writer: Writer, timeout: float = WRITER_JOIN_TIMEOUT_S) -> None:
+    """Signal the writer and wait for it to exit.
+
+    Args:
+        writer: Background writer thread.
+        timeout: Seconds to wait for ``join``.
+
+    Raises:
+        TimeoutError: If the writer is still alive after ``timeout``.
+        RuntimeError: If the writer stored an exception.
+    """
+    writer.stop_event.set()
+    writer.join(timeout=timeout)
+    if writer.is_alive():
+        raise TimeoutError(f"writer did not stop within {timeout}s")
+    if writer.error is not None:
+        raise RuntimeError(f"writer failed: {writer.error!r}")
 
 
 def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
@@ -287,8 +361,7 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             if writer.error is not None:
                 raise RuntimeError(f"writer failed: {writer.error!r}")
             if not stop_requested and now >= write_end:
-                writer.stop_event.set()
-                writer.join(timeout=60)
+                stop_writer(writer)
                 drain_target = writer.written
                 drain_deadline = time.monotonic() + args.drain_timeout
                 stop_requested = True
@@ -305,8 +378,14 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             p1 = time.perf_counter()
             if not records:
                 idle_poll_s += p1 - p0
-                step_t.append(now)
-                step_acked.append(acked)
+                append_step_sample(
+                    step_t,
+                    step_acked,
+                    step_bytes,
+                    t=now,
+                    acked=acked,
+                    wire_bytes=wire_bytes,
+                )
                 time.sleep(0.005)
                 continue
 
@@ -352,9 +431,14 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             acked += batch_mutations
 
             t_now = time.monotonic()
-            step_t.append(t_now)
-            step_acked.append(acked)
-            step_bytes.append(wire_bytes)
+            append_step_sample(
+                step_t,
+                step_acked,
+                step_bytes,
+                t=t_now,
+                acked=acked,
+                wire_bytes=wire_bytes,
+            )
             stage_t.append(t_now)
             stage["poll"].append((p1 - p0) * 1e3)
             stage["produce"].append((p2 - p1) * 1e3)
@@ -567,7 +651,7 @@ def run_bridge_benchmark(args: argparse.Namespace) -> dict[str, Any]:
 
         while True:
             now = time.monotonic()
-            if not bridge_thread.is_alive() and not stop_requested:
+            if not bridge_thread.is_alive():
                 if bridge_errors:
                     raise RuntimeError("Bridge thread crashed") from bridge_errors[0]
                 raise RuntimeError("Bridge thread exited unexpectedly")
@@ -576,15 +660,16 @@ def run_bridge_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             step_t.append(now)
             step_acked.append(acked)
 
-            try:
-                if bridge._listener is not None:
+            if bridge._listener is not None:
+                try:
                     consumed = bridge._listener.get_position().last_consumed_version
+                except AttributeError:
+                    pass
+                else:
                     lag_t.append(now)
                     lag_versions.append(
                         max(0, writer.last_committed_version - consumed)
                     )
-            except Exception:
-                pass
 
             if now - last_heartbeat >= 15.0:
                 elapsed = now - t0
@@ -607,8 +692,7 @@ def run_bridge_benchmark(args: argparse.Namespace) -> dict[str, Any]:
                 raise RuntimeError(f"writer failed: {writer.error!r}")
 
             if not stop_requested and now >= write_end:
-                writer.stop_event.set()
-                writer.join(timeout=10)
+                stop_writer(writer)
                 drain_target = writer.written
                 drain_deadline = time.monotonic() + args.drain_timeout
                 stop_requested = True
@@ -623,16 +707,30 @@ def run_bridge_benchmark(args: argparse.Namespace) -> dict[str, Any]:
 
             time.sleep(0.05)
 
+        listener_version: int | None = None
+        if bridge._listener is not None:
+            try:
+                listener_version = bridge._listener.get_position().last_consumed_version
+            except AttributeError:
+                listener_version = None
+
         bridge.stop()
         bridge_thread.join(timeout=15)
+        if bridge_thread.is_alive():
+            raise TimeoutError("bridge thread did not stop within 15s")
+        if bridge_errors:
+            raise RuntimeError("Bridge thread crashed") from bridge_errors[0]
 
         cursor_data: dict[str, Any] = {}
         if os.path.exists(cursor_file):
-            try:
-                with open(cursor_file, encoding="utf-8") as f:
-                    cursor_data = json.load(f)
-            except Exception:
-                pass
+            with open(cursor_file, encoding="utf-8") as f:
+                cursor_data = json.load(f)
+
+        cursor_matches_listener: bool | None = None
+        if cursor_data and listener_version is not None:
+            cursor_matches_listener = listener_version == cursor_data.get(
+                "last_consumed_version"
+            )
 
         win_start, win_end = warm_end, write_end
         window_s = win_end - win_start
@@ -698,6 +796,7 @@ def run_bridge_benchmark(args: argparse.Namespace) -> dict[str, Any]:
                 ),
             },
             "cursor_checkpoint": cursor_data,
+            "cursor_matches_listener": cursor_matches_listener,
         }
         return results
     finally:
@@ -751,6 +850,9 @@ def print_report(r: dict[str, Any]) -> None:
         print(f"Cursor checkpoint file  : {c.get('cursor_file')}")
         print(f"Batches fsynced to disk : {r.get('batches_fsynced_to_disk', 0):,}")
         print(f"Final durable checkpoint: {r.get('cursor_checkpoint')}")
+        match = r.get("cursor_matches_listener")
+        if match is not None:
+            print(f"Cursor matches listener : {match}")
         print(f"Errors retried          : {r.get('errors_retried', 0)}")
     print(f"FDB write rate achieved : {r['write_rate_per_s']:,.0f} mutations/s")
     if r.get("writer_behind_batches"):
@@ -804,11 +906,17 @@ def print_report(r: dict[str, Any]) -> None:
     print(bar)
 
 
-def main() -> int:
-    """Parse arguments, run, report.
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """Parse CLI arguments for the benchmark harness.
+
+    Args:
+        argv: Argument vector; defaults to ``sys.argv[1:]``.
 
     Returns:
-        Process exit code (0 for success).
+        Parsed namespace.
+
+    Raises:
+        SystemExit: On invalid flag combinations (via ``ArgumentParser.error``).
     """
     p = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawTextHelpFormatter
@@ -847,12 +955,25 @@ def main() -> int:
         "--verify", action="store_true", help="check dupes/gaps/order (slows bridge)"
     )
     p.add_argument("--output", help="write results JSON to this path")
-    args = p.parse_args()
+    args = p.parse_args(argv)
 
     if args.use_bridge and args.verify:
         p.error("--verify is not supported with --use-bridge")
     if args.verify and args.key_pool != 0:
         p.error("--verify requires unique keys; pass --key-pool 0")
+    return args
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Parse arguments, run, report.
+
+    Args:
+        argv: Optional argument vector for tests; defaults to ``sys.argv[1:]``.
+
+    Returns:
+        Process exit code (0 for success).
+    """
+    args = parse_args(argv)
 
     if args.use_bridge:
         results = run_bridge_benchmark(args)
@@ -862,31 +983,31 @@ def main() -> int:
     if args.output:
         with open(args.output, "w", encoding="utf-8") as fh:
             json.dump(results, fh, indent=2)
+            fh.write("\n")
         print(f"Results written to {args.output}")
 
-    if results.get("backlog_growing"):
-        print("ERROR: Benchmark failed - backlog was growing.", file=sys.stderr)
-        return 1
-    if not results.get("drained", True):
-        print(
-            "ERROR: Benchmark failed - did not drain remaining writes within deadline.",
-            file=sys.stderr,
-        )
-        return 1
-    if "integrity" in results:
-        integ = results["integrity"]
-        if (
-            integ.get("duplicates", 0) > 0
-            or (integ.get("missing") is not None and integ.get("missing", 0) > 0)
-            or integ.get("order_violations", 0) > 0
-        ):
+    code = exit_code_for_results(results)
+    if code != 0:
+        if results.get("backlog_growing"):
+            print("ERROR: Benchmark failed - backlog was growing.", file=sys.stderr)
+        elif not results.get("drained", True):
+            print(
+                "ERROR: Benchmark failed - did not drain remaining writes "
+                "within deadline.",
+                file=sys.stderr,
+            )
+        elif results.get("cursor_matches_listener") is False:
+            print(
+                "ERROR: Benchmark failed - cursor checkpoint disagrees with "
+                "listener position.",
+                file=sys.stderr,
+            )
+        else:
             print(
                 "ERROR: Benchmark failed - data integrity check failed.",
                 file=sys.stderr,
             )
-            return 1
-
-    return 0
+    return code
 
 
 if __name__ == "__main__":
