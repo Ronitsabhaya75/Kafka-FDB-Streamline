@@ -56,7 +56,7 @@ A complete end-to-end demo runs against live containerized FoundationDB 8.0 and 
 # 1. Start the FoundationDB + Kafka stack
 docker compose -f .devcontainer/docker-compose.yml up -d --build
 
-# 2. Install the bridge package
+# 2. Wait until FDB and Kafka accept connections, then install the bridge
 docker compose -f .devcontainer/docker-compose.yml exec app \
   pip3 install --break-system-packages -e .
 
@@ -64,6 +64,8 @@ docker compose -f .devcontainer/docker-compose.yml exec app \
 docker compose -f .devcontainer/docker-compose.yml exec app \
   python3 demo/run_demo.py --count 10000
 ```
+
+Give the stack a short moment after `up` before step 2 if FDB or Kafka are still starting.
 
 ### What happens:
 1. Connects to FoundationDB using API version 800.
@@ -87,6 +89,9 @@ The bridge guarantees **at-least-once delivery** and **strict commit-version ord
   * If Kafka delivery or cursor checkpoint fails, FDB is **never acknowledged**. On restart, the bridge replays from the last durable cursor.
   * Each mutation envelope carries `fdb_version` and `sequence_no`, allowing downstream consumers to deduplicate or apply idempotent upserts.
   * If a crash occurs between cursor disk sync and FDB acknowledgement, the listener recovers by re-acknowledging the persisted cursor on startup before polling new records.
+
+Kafka producer behavior and local verification are documented in the
+[`Kafka producer specification`](docs/KAFKA-PRODUCER-SPEC.md).
 
 ---
 
@@ -128,13 +133,21 @@ make lint
 make test
 ```
 
+Requires Python 3.12. Commits must be signed — see [Signed commits](docs/conventions.md#signed-commits).
+
 ### Installation
 
 ```bash
 pip install .
 ```
 
-Installs the `fdb-kafka-bridge` distribution, providing `fdb_kafka_bridge` and `fdbkafka` (Protobuf gencode).
+Installs the `fdb-kafka-bridge` distribution, which provides the import packages `fdb_kafka_bridge` (subpackages `bridge`, `cdc`, `kafka`, `serialization`) and `fdbkafka` (generated Protobuf).
+
+`libfdb_c` is a system requirement that pip does not install. The `foundationdb` Python package depends on it at runtime: `import fdb` succeeds without it, but `fdb.api_version()` raises `Unable to locate the FoundationDB API shared library!`. Install the client library from the [FoundationDB release](https://github.com/apple/foundationdb/releases) that matches `FDB_VERSION` in the [`Dockerfile`](Dockerfile), which shows the Linux setup.
+
+### Contributing
+
+Repo layout, branching, code style and PR workflow: [`docs/conventions.md`](docs/conventions.md). Coding-agent guidance: [`AGENTS.md`](AGENTS.md).
 
 ---
 
@@ -143,4 +156,6 @@ Installs the `fdb-kafka-bridge` distribution, providing `fdb_kafka_bridge` and `
 * [`Proposal.md`](Proposal.md) — Architecture motivation, design rationale, and background.
 * [`docs/INDEX.md`](docs/INDEX.md) — Map of all project specifications and deep dives.
 * [`docs/CDC-DEEP-DIVE.md`](docs/CDC-DEEP-DIVE.md) — Comprehensive analysis of FDB native CDC mechanics and limitations.
+* [`docs/KAFKA-PRODUCER-SPEC.md`](docs/KAFKA-PRODUCER-SPEC.md) — Producer durability contract and local Kafka verification.
 * [`docs/conventions.md`](docs/conventions.md) — Repository layout, branching rules, and PR requirements.
+* [`demo/README.md`](demo/README.md) — Live Docker demo details and CLI flags.
