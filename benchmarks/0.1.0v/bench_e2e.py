@@ -723,18 +723,24 @@ def run_bridge_benchmark(args: argparse.Namespace) -> dict[str, Any]:
 
         bridge.request_shutdown()
         bridge_thread.join(timeout=15)
-        if bridge_thread.is_alive():
-            raise TimeoutError("bridge thread did not stop within 15s")
-        if bridge_errors:
-            raise RuntimeError("Bridge thread crashed") from bridge_errors[0]
 
         listener_version: int | None = None
-        listener = bridge._listener
-        if listener is not None:
-            try:
-                listener_version = listener.get_position().last_consumed_version
-            except (AttributeError, CDCError):
-                listener_version = None
+        if bridge_thread.is_alive():
+            bridge.stop()
+            bridge_thread.join(timeout=15)
+            if bridge_thread.is_alive():
+                raise TimeoutError("bridge thread did not stop within 15s after stop()")
+        else:
+            listener = bridge._listener
+            if listener is not None:
+                try:
+                    listener_version = listener.get_position().last_consumed_version
+                except (AttributeError, CDCError):
+                    listener_version = None
+            bridge.stop()
+
+        if bridge_errors:
+            raise RuntimeError("Bridge thread crashed") from bridge_errors[0]
 
         cursor_data: dict[str, Any] = {}
         if os.path.exists(cursor_file):
@@ -751,8 +757,6 @@ def run_bridge_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             cursor_matches_listener = listener_version == cursor_version
         if cursor_version is not None and writer.last_committed_version > 0:
             cursor_covers_writer = cursor_version >= writer.last_committed_version
-
-        bridge.stop()
 
         win_start, win_end = warm_end, write_end
         window_s = win_end - win_start
@@ -910,11 +914,15 @@ def print_report(r: dict[str, Any]) -> None:
     if "latency_ms" in r:
         lat = r["latency_ms"]
         print("-" * 72)
-        print(
-            f"Client write -> Kafka ack latency (n={lat['samples']}): "
-            f"p50={lat['p50']:.1f}ms p90={lat['p90']:.1f}ms "
-            f"p99={lat['p99']:.1f}ms max={lat['max']:.1f}ms"
-        )
+        samples = lat.get("samples", 0)
+        if samples == 0 or lat.get("p50") is None:
+            print("Client write -> Kafka ack latency: n/a")
+        else:
+            print(
+                f"Client write -> Kafka ack latency (n={samples}): "
+                f"p50={lat['p50']:.1f}ms p90={lat['p90']:.1f}ms "
+                f"p99={lat['p99']:.1f}ms max={lat['max']:.1f}ms"
+            )
     lag = r.get("lag_versions", {})
     if lag.get("max") is not None:
         print("-" * 72)

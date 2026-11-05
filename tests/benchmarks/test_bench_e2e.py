@@ -178,3 +178,35 @@ def test_stop_writer_raises_if_thread_alive(
 
     with pytest.raises(TimeoutError, match="writer did not stop"):
         bench.stop_writer(FakeWriter(), timeout=0.01)
+
+
+def test_print_report_handles_zero_latency_samples(
+    bench: ModuleType, capsys: pytest.CaptureFixture[str]
+) -> None:
+    results = {
+        "config": {
+            "duration_s": 10,
+            "warmup_s": 2,
+            "batch_size": 100,
+            "value_size": 100,
+            "target_rate": 1000,
+        },
+        "write_rate_per_s": 1000.0,
+        "bridge_rate_per_s": 1000.0,
+        "backlog_growing": False,
+        "backlog_slope_per_s": 0.0,
+        "drained": True,
+        "drain_s": 0.5,
+        "total_written": 1000,
+        "total_acked": 1000,
+        "latency_ms": {
+            "samples": 0,
+            "p50": None,
+            "p90": None,
+            "p99": None,
+            "max": None,
+        },
+    }
+    bench.print_report(results)
+    captured = capsys.readouterr()
+    assert "Client write -> Kafka ack latency: n/a" in captured.out
