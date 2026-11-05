@@ -12,12 +12,12 @@ Each results JSON is a **single run** on the environment below. Latency and lag 
 
 | Category | Result | Significance |
 |---|---|---|
-| **Peak Unthrottled Throughput** | **56,683 mutations/sec** (8.00 MB/s) | Achieved by a single writer thread without pipeline saturation (backlog slope -52 mut/s). |
-| **10-Min Sustained Run** | **9,450,500 mutations total** (15,000 mut/s) | 600s steady-state window with flat backlog (+0.016 mut/s) in the core pipeline loop. Includes 30s warm-up in the total. |
-| **End-to-End Latency (10-min)** | **p50 = 12.2 ms**, **p90 = 26.1 ms**, **p99 = 115.5 ms** | Client `tr.commit()` in FDB to Kafka broker ACK (`acks=all`). Max ≈ 0.99 s. |
-| **CDC Read-Head Lag (10-min)** | **1,571 versions (~1.6 ms)** mean, **0.98 s** max | Polling loop trails the writer's last commit version during continuous ingestion. |
-| **Full Bridge Checkpointing** | **15,917 atomic checkpoints** | Maintained ~15k mut/s with zero errors (each checkpoint fsyncs cursor file and parent directory). |
-| **CDC Stream Ordering (`--verify`)** | **0 duplicates, 0 missing, 0 order violations** | Monotonic ordering verified across 1,050,000 polled mutations (`--key-pool 0`). |
+| **Peak Unthrottled Throughput** | **58,417 mutations/sec** (8.24 MB/s) | Achieved by a single writer thread without pipeline saturation (backlog slope -387 mut/s). |
+| **10-Min Sustained Run** | **9,450,000 mutations total** (15,000 mut/s) | 600s steady-state window with flat backlog (-0.049 mut/s) in the core pipeline loop. Includes 30s warm-up in the total. |
+| **End-to-End Latency (10-min)** | **p50 = 14.2 ms**, **p90 = 41.5 ms**, **p99 = 153.9 ms** | Client `tr.commit()` in FDB to Kafka broker ACK (`acks=all`). Max ≈ 1.07 s. |
+| **CDC Read-Head Lag (10-min)** | **2,133 versions (~2.1 ms)** mean, **0.75 s** max | Polling loop trails the writer's last commit version during continuous ingestion. |
+| **Full Bridge Checkpointing** | **6,537 atomic checkpoints** | Maintained ~15k mut/s with zero errors (each checkpoint fsyncs cursor file and parent directory). |
+| **CDC Stream Ordering (`--verify`)** | **0 duplicates, 0 missing, 0 order violations** | Monotonic ordering verified across 1,050,500 polled mutations (`--key-pool 0`). |
 
 ---
 
@@ -114,13 +114,13 @@ $$
 
 | Benchmark Test | Mode | Total Volume | Target Rate | Measured Rate | Wire Bandwidth | Latency (p50 / p90 / p99) | Backlog Trend | Result File |
 |---|---|---|---|---|---|---|---|---|
-| **15k Baseline** | Core Pipeline | 1,050,000 | 15,000 mut/s | 15,000 mut/s | 2.11 MB/s | 13.0ms / 64.4ms / 316.2ms | Flat (+2 mut/s) | [`results_15k.json`](results_15k.json) |
-| **20k Baseline** | Core Pipeline | 1,400,500 | 20,000 mut/s | 19,992 mut/s | 2.84 MB/s | 11.9ms / 17.5ms / 49.8ms | Flat (-0 mut/s) | [`results_20k.json`](results_20k.json) |
-| **25k Baseline** | Core Pipeline | 1,750,500 | 25,000 mut/s | 25,000 mut/s | 3.54 MB/s | 12.1ms / 24.1ms / 59.3ms | Flat (+1 mut/s) | [`results_25k.json`](results_25k.json) |
-| **Unthrottled Peak** | Core Pipeline (Single Writer) | 2,077,500 | Unthrottled | **56,683 mut/s** | **8.00 MB/s** | 36.7ms / 62.4ms / 116.6ms | Flat (-52 mut/s) | [`results_unthrottled.json`](results_unthrottled.json) |
-| **Stream Verification** | Core Pipeline (`--verify --key-pool 0`) | 1,050,000 | 15,000 mut/s | 15,000 mut/s | 2.13 MB/s | 12.0ms / 15.4ms / 39.4ms | Flat (-0 mut/s) | [`results_15k_verified.json`](results_15k_verified.json) |
-| **10-Min Sustained Run** | Core Pipeline (Loop only) | **9,450,500** | 15,000 mut/s | **15,000 mut/s** | **2.13 MB/s** | **12.2ms / 26.1ms / 115.5ms** | **Flat (+0.016 mut/s)** | [`results_10min_sustained.json`](results_10min_sustained.json) |
-| **Autonomous Bridge** | Full Daemon (`--use-bridge`) | 1,050,500 | 15,000 mut/s | 14,992 mut/s | n/a | n/a | Flat (+1 mut/s) | [`results_bridge_15k.json`](results_bridge_15k.json) |
+| **15k Baseline** | Core Pipeline | 1,050,000 | 15,000 mut/s | 15,000 mut/s | 2.13 MB/s | 12.4ms / 20.3ms / 70.4ms | Flat (-0 mut/s) | [`results_15k.json`](results_15k.json) |
+| **20k Baseline** | Core Pipeline | 1,400,500 | 20,000 mut/s | 20,050 mut/s | 2.84 MB/s | 12.6ms / 28.9ms / 146.3ms | Flat (-1 mut/s) | [`results_20k.json`](results_20k.json) |
+| **25k Baseline** | Core Pipeline | 1,750,500 | 25,000 mut/s | 25,000 mut/s | 3.54 MB/s | 13.1ms / 50.6ms / 207.0ms | Flat (-2 mut/s) | [`results_25k.json`](results_25k.json) |
+| **Unthrottled Peak** | Core Pipeline (Single Writer) | 2,020,000 | Unthrottled | **58,417 mut/s** | **8.24 MB/s** | 45.0ms / 144.9ms / 3325.6ms | Flat (-387 mut/s) | [`results_unthrottled.json`](results_unthrottled.json) |
+| **Stream Verification** | Core Pipeline (`--verify --key-pool 0`) | 1,050,500 | 15,000 mut/s | 14,983 mut/s | 2.12 MB/s | 24.1ms / 126.1ms / 304.9ms | Flat (-4 mut/s) | [`results_15k_verified.json`](results_15k_verified.json) |
+| **10-Min Sustained Run** | Core Pipeline (Loop only) | **9,450,000** | 15,000 mut/s | **15,001 mut/s** | **2.13 MB/s** | **14.2ms / 41.5ms / 153.9ms** | **Flat (-0.05 mut/s)** | [`results_10min_sustained.json`](results_10min_sustained.json) |
+| **Autonomous Bridge** | Full Daemon (`--use-bridge`) | 1,051,000 | 15,000 mut/s | 14,983 mut/s | n/a | n/a | Flat (+4 mut/s) | [`results_bridge_15k.json`](results_bridge_15k.json) |
 
 ---
 
@@ -129,10 +129,10 @@ $$
 ### 5.1. 10-Minute Sustained Ingestion (Core Pipeline Loop)
 Evaluates the core ingestion loop without cursor disk persistence against continuous foreground writers for 10 minutes (600.0s steady-state window + 30.0s warmup) at 15,000 mut/s:
 
-* Over the 600.0-second window, the backlog trend slope was **`+0.016 mut/s`** (linear regression; treated as flat by the 1% write-rate threshold).
-* Totals for the whole run (warmup included): written `9,450,500`; acknowledged `9,450,500`. The 600s measured window alone is about 9.0M mutations at 15k/s.
-* **Drain time after writes stopped was 0.059 seconds**, confirming that the core ingestion loop kept pace with the foreground writers through the 10-minute window.
-* Latency in this artifact: p50 **12.2 ms**, p90 **26.1 ms**, p99 **115.5 ms**, max **990 ms**. Mean CDC lag **1,571 versions** (~1.6 ms); max lag ≈ **0.98 s**.
+* Over the 600.0-second window, the backlog trend slope was **`-0.049 mut/s`** (linear regression; treated as flat by the 1% write-rate threshold).
+* Totals for the whole run (warmup included): written `9,450,000`; acknowledged `9,450,000`. The 600s measured window alone is about 9.0M mutations at 15k/s.
+* **Drain time after writes stopped was 0.040 seconds**, confirming that the core ingestion loop kept pace with the foreground writers through the 10-minute window.
+* Latency in this artifact: p50 **14.2 ms**, p90 **41.5 ms**, p99 **153.9 ms**, max **1,068 ms**. Mean CDC lag **2,133 versions** (~2.1 ms); max lag ≈ **0.75 s**.
 
 ### 5.2. Atomic Checkpoint Durability Overhead
 In **Benchmark 2** (`--use-bridge`), every CDC batch was processed through the complete `fdb_kafka_bridge.bridge.Bridge` daemon lifecycle:
@@ -141,12 +141,12 @@ In **Benchmark 2** (`--use-bridge`), every CDC batch was processed through the c
            ──> [f.flush() + os.fsync(cursor_file)] ──> [atomic os.replace()] 
            ──> [os.fsync(parent_dir)] ──> [FDB acknowledge()]
 ```
-* **15,917 discrete atomic disk checkpoints** (each fsyncing the cursor file and parent directory) were completed before advancing the FDB watermark (`batches_acked`; watermark-only replies also count).
-* The bridge maintained **14,992 mutations/sec** with **zero errors** and an average version lag of **1,624 versions (~1.6 ms)**.
+* **6,537 discrete atomic disk checkpoints** (each fsyncing the cursor file and parent directory) were completed before advancing the FDB watermark (`batches_acked`; watermark-only replies also count).
+* The bridge maintained **14,983 mutations/sec** with **zero errors** and an average version lag of **26,287 versions (~26.3 ms)**.
 * The committed cursor file recorded `stream_id` and `last_consumed_version`. The harness now compares that version to the listener position before teardown (`cursor_matches_listener` in new runs).
 
 ### 5.3. CDC Stream Sequence and Key Monotonicity
-Under `--verify` mode with an unbounded key pool (`--key-pool 0`), the harness tracked sequence numbers and key existence across **1,050,000** mutations polled from the CDC stream:
+Under `--verify` mode with an unbounded key pool (`--key-pool 0`), the harness tracked sequence numbers and key existence across **1,050,500** mutations polled from the CDC stream:
 * `duplicates`: **0**
 * `missing`: **0**
 * `order_violations`: **0**
@@ -237,7 +237,7 @@ docker compose -f .devcontainer/docker-compose.yml exec app \
 * [`results_15k.json`](results_15k.json): 15,000 mut/s 1-minute baseline test.
 * [`results_20k.json`](results_20k.json): 20,000 mut/s 1-minute baseline test.
 * [`results_25k.json`](results_25k.json): 25,000 mut/s 1-minute baseline test.
-* [`results_unthrottled.json`](results_unthrottled.json): 56,683 mut/s unthrottled single-writer run.
-* [`results_15k_verified.json`](results_15k_verified.json): 1,050,000 mutation CDC ordering verification run.
-* [`results_10min_sustained.json`](results_10min_sustained.json): 9,450,500 mutation 10-minute sustained core-loop run.
-* [`results_bridge_15k.json`](results_bridge_15k.json): 15,917 disk fsync autonomous daemon run.
+* [`results_unthrottled.json`](results_unthrottled.json): 58,417 mut/s unthrottled single-writer run.
+* [`results_15k_verified.json`](results_15k_verified.json): 1,050,500 mutation CDC ordering verification run.
+* [`results_10min_sustained.json`](results_10min_sustained.json): 9,450,000 mutation 10-minute sustained core-loop run.
+* [`results_bridge_15k.json`](results_bridge_15k.json): 6,537 atomic checkpoint autonomous daemon run.
