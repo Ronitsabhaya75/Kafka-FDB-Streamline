@@ -54,7 +54,7 @@ WRITER_JOIN_TIMEOUT_S = 60.0
 
 
 def _git_sha() -> str:
-    """Return the current short git SHA, or 'unknown' if unavailable.
+    """Return the current short git SHA (with '-dirty' if uncommitted), or 'unknown'.
 
     Returns:
         Git commit hash string or 'unknown'.
@@ -68,7 +68,18 @@ def _git_sha() -> str:
             text=True,
             check=False,
         )
-        return res.stdout.strip() or "unknown"
+        sha = res.stdout.strip()
+        if not sha:
+            return "unknown"
+        status = subprocess.run(
+            ["git", "status", "--porcelain"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if status.stdout.strip():
+            sha += "-dirty"
+        return sha
     except Exception:
         return "unknown"
 
@@ -170,6 +181,8 @@ def exit_code_for_results(results: dict[str, Any]) -> int:
     if not results.get("drained", True):
         return 1
     if results.get("cursor_matches_listener") is False:
+        return 1
+    if results.get("cursor_covers_writer") is False:
         return 1
     if "integrity" in results:
         integ = results["integrity"]
@@ -282,6 +295,7 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
     """
     # Imported lazily so the helpers above can be unit tested without FDB.
     from fdb_kafka_bridge.cdc import FDBClient, FDBMutationListener, strinc
+    from fdb_kafka_bridge.cdc.errors import CDCError
     from fdb_kafka_bridge.kafka import MutationProducer
     from fdbkafka.cdc.v1 import mutations_pb2  # noqa: F401
 
@@ -329,8 +343,8 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
     registered = False
 
     try:
-        listener.start()
         registered = True
+        listener.start()
         t0 = time.monotonic()
         warm_end = t0 + args.warmup
         write_end = warm_end + args.duration
@@ -399,8 +413,8 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             listener.acknowledge()
             p4 = time.perf_counter()
 
+            t_now = time.monotonic()
             batch_mutations = 0
-            latency_sample: float | None = None
             for record in records:
                 wire_bytes += record.ByteSize()
                 if not record.HasField("batch"):
@@ -413,7 +427,8 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
                 ):
                     val = mutations[-1].single_key_mutation.value
                     if len(val) > TS_WIDTH and val[TS_WIDTH : TS_WIDTH + 1] == b"|":
-                        latency_sample = (flush_done_ns - int(val[:TS_WIDTH])) / 1e6
+                        lat_t.append(t_now)
+                        lat_ms.append((flush_done_ns - int(val[:TS_WIDTH])) / 1e6)
                 if args.verify:
                     for m in mutations:
                         vi = (
@@ -430,7 +445,6 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
                             seen.add(idx)
             acked += batch_mutations
 
-            t_now = time.monotonic()
             append_step_sample(
                 step_t,
                 step_acked,
@@ -444,14 +458,11 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             stage["produce"].append((p2 - p1) * 1e3)
             stage["flush"].append((p3 - p2) * 1e3)
             stage["ack"].append((p4 - p3) * 1e3)
-            if latency_sample is not None:
-                lat_t.append(t_now)
-                lat_ms.append(latency_sample)
             try:
                 consumed = listener.get_position().last_consumed_version
                 lag_t.append(t_now)
                 lag_versions.append(max(0, writer.last_committed_version - consumed))
-            except AttributeError:
+            except (AttributeError, CDCError):
                 pass  # position API differs; lag is then omitted
 
         # ---- summarize the steady-state window -------------------------
@@ -525,10 +536,10 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             "stage_mean_ms": stage_means,
             "latency_ms": {
                 "samples": len(lats),
-                "p50": percentile(lats, 50),
-                "p90": percentile(lats, 90),
-                "p99": percentile(lats, 99),
-                "max": lats[-1] if lats else float("nan"),
+                "p50": percentile(lats, 50) if lats else None,
+                "p90": percentile(lats, 90) if lats else None,
+                "p99": percentile(lats, 99) if lats else None,
+                "max": lats[-1] if lats else None,
             },
             "lag_versions": {
                 "mean": sum(lags) / len(lags) if lags else None,
@@ -578,6 +589,7 @@ def run_bridge_benchmark(args: argparse.Namespace) -> dict[str, Any]:
     from fdb_kafka_bridge.bridge.config import from_dict
     from fdb_kafka_bridge.bridge.pipeline import Bridge
     from fdb_kafka_bridge.cdc import FDBClient, strinc
+    from fdb_kafka_bridge.cdc.errors import CDCError
 
     run_id = uuid.uuid4().hex[:10]
     stream_name = f"bench-{run_id}"
@@ -616,16 +628,7 @@ def run_bridge_benchmark(args: argparse.Namespace) -> dict[str, Any]:
     )
 
     bridge = Bridge(config, client=client)
-    bridge.start()
-
-    step_t: list[float] = []
-    step_acked: list[float] = []
-    lag_t: list[float] = []
-    lag_versions: list[float] = []
-
-    drained = False
-    drain_s: float | None = None
-    registered = True
+    registered = False
     bridge_errors: list[Exception] = []
 
     def _bridge_worker() -> None:
@@ -637,6 +640,16 @@ def run_bridge_benchmark(args: argparse.Namespace) -> dict[str, Any]:
     bridge_thread = threading.Thread(target=_bridge_worker, daemon=True)
 
     try:
+        registered = True
+        bridge.start()
+
+        step_t: list[float] = []
+        step_acked: list[float] = []
+        lag_t: list[float] = []
+        lag_versions: list[float] = []
+
+        drained = False
+        drain_s: float | None = None
         t0 = time.monotonic()
         warm_end = t0 + args.warmup
         write_end = warm_end + args.duration
@@ -660,10 +673,11 @@ def run_bridge_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             step_t.append(now)
             step_acked.append(acked)
 
-            if bridge._listener is not None:
+            listener = bridge._listener
+            if listener is not None:
                 try:
-                    consumed = bridge._listener.get_position().last_consumed_version
-                except AttributeError:
+                    consumed = listener.get_position().last_consumed_version
+                except (AttributeError, CDCError):
                     pass
                 else:
                     lag_t.append(now)
@@ -707,30 +721,38 @@ def run_bridge_benchmark(args: argparse.Namespace) -> dict[str, Any]:
 
             time.sleep(0.05)
 
-        listener_version: int | None = None
-        if bridge._listener is not None:
-            try:
-                listener_version = bridge._listener.get_position().last_consumed_version
-            except AttributeError:
-                listener_version = None
-
-        bridge.stop()
+        bridge.request_shutdown()
         bridge_thread.join(timeout=15)
         if bridge_thread.is_alive():
             raise TimeoutError("bridge thread did not stop within 15s")
         if bridge_errors:
             raise RuntimeError("Bridge thread crashed") from bridge_errors[0]
 
+        listener_version: int | None = None
+        listener = bridge._listener
+        if listener is not None:
+            try:
+                listener_version = listener.get_position().last_consumed_version
+            except (AttributeError, CDCError):
+                listener_version = None
+
         cursor_data: dict[str, Any] = {}
         if os.path.exists(cursor_file):
             with open(cursor_file, encoding="utf-8") as f:
                 cursor_data = json.load(f)
 
+        cursor_version = (
+            cursor_data.get("last_consumed_version") if cursor_data else None
+        )
+
         cursor_matches_listener: bool | None = None
+        cursor_covers_writer: bool | None = None
         if cursor_data and listener_version is not None:
-            cursor_matches_listener = listener_version == cursor_data.get(
-                "last_consumed_version"
-            )
+            cursor_matches_listener = listener_version == cursor_version
+        if cursor_version is not None and writer.last_committed_version > 0:
+            cursor_covers_writer = cursor_version >= writer.last_committed_version
+
+        bridge.stop()
 
         win_start, win_end = warm_end, write_end
         window_s = win_end - win_start
@@ -797,6 +819,7 @@ def run_bridge_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             },
             "cursor_checkpoint": cursor_data,
             "cursor_matches_listener": cursor_matches_listener,
+            "cursor_covers_writer": cursor_covers_writer,
         }
         return results
     finally:
@@ -853,6 +876,9 @@ def print_report(r: dict[str, Any]) -> None:
         match = r.get("cursor_matches_listener")
         if match is not None:
             print(f"Cursor matches listener : {match}")
+        covers = r.get("cursor_covers_writer")
+        if covers is not None:
+            print(f"Cursor covers writer    : {covers}")
         print(f"Errors retried          : {r.get('errors_retried', 0)}")
     print(f"FDB write rate achieved : {r['write_rate_per_s']:,.0f} mutations/s")
     if r.get("writer_behind_batches"):
@@ -1000,6 +1026,12 @@ def main(argv: list[str] | None = None) -> int:
             print(
                 "ERROR: Benchmark failed - cursor checkpoint disagrees with "
                 "listener position.",
+                file=sys.stderr,
+            )
+        elif results.get("cursor_covers_writer") is False:
+            print(
+                "ERROR: Benchmark failed - cursor checkpoint does not cover "
+                "last committed writer version.",
                 file=sys.stderr,
             )
         else:

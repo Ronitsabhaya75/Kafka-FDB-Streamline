@@ -11,7 +11,8 @@
   "environment": {
     "platform": "Linux-7.0.14-linuxkit-x86_64-with-glibc2.39",
     "cpu_count": 8,
-    "python": "3.12.3"
+    "python": "3.12.3",
+    "git_sha": "fdd5920"
   },
   "write_rate_per_s": 15000.0,
   "writer_behind_batches": 1115,

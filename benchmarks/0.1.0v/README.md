@@ -16,14 +16,14 @@ Each results JSON is a **single run** on the environment below. Latency and lag 
 | **10-Min Sustained Run** | **9,450,500 mutations total** (15,000 mut/s) | 600s steady-state window with flat backlog (+0.016 mut/s) in the core pipeline loop. Includes 30s warm-up in the total. |
 | **End-to-End Latency (10-min)** | **p50 = 12.2 ms**, **p90 = 26.1 ms**, **p99 = 115.5 ms** | Client `tr.commit()` in FDB to Kafka broker ACK (`acks=all`). Max ≈ 0.99 s. |
 | **CDC Read-Head Lag (10-min)** | **1,571 versions (~1.6 ms)** mean, **0.98 s** max | Polling loop trails the writer's last commit version during continuous ingestion. |
-| **Full Bridge Checkpointing** | **15,917 atomic disk fsyncs** | Maintained ~15k mut/s with zero errors while fsyncing cursor on every batch. |
+| **Full Bridge Checkpointing** | **15,917 atomic checkpoints** | Maintained ~15k mut/s with zero errors (each checkpoint fsyncs cursor file and parent directory). |
 | **CDC Stream Ordering (`--verify`)** | **0 duplicates, 0 missing, 0 order violations** | Monotonic ordering verified across 1,050,000 polled mutations (`--key-pool 0`). |
 
 ---
 
 ## 2. Test Environment
 
-* **Platform**: Linux x86_64 (`ubuntu:24.04` on Docker Desktop / linuxkit), 8 CPU Cores.
+* **Platform**: Linux x86_64 (`ubuntu:24.04` container running on Docker Desktop / linuxkit on an Apple Silicon macOS host via Rosetta 2 x86_64 emulation), 8 vCPU cores.
 * **FoundationDB**: Version **8.0.0** (API version 800) with native CDC enabled (`--knob_enable_native_cdc=1`).
 * **Apache Kafka**: Version **3.9.0** (`apache/kafka:3.9.0`), KRaft controller, single partition topic (single broker, `acks=all` — no multi-replica ISR).
 * **Producer Durability**: `acks=all`, `enable.idempotence=true`, `enable.gapless.guarantee=true`, `compression.type=lz4`, `linger.ms=5`.
@@ -141,7 +141,7 @@ In **Benchmark 2** (`--use-bridge`), every CDC batch was processed through the c
            ──> [f.flush() + os.fsync(cursor_file)] ──> [atomic os.replace()] 
            ──> [os.fsync(parent_dir)] ──> [FDB acknowledge()]
 ```
-* **15,917 discrete synchronous disk fsync operations** were completed before advancing the FDB watermark (`batches_acked`; watermark-only replies also count).
+* **15,917 discrete atomic disk checkpoints** (each fsyncing the cursor file and parent directory) were completed before advancing the FDB watermark (`batches_acked`; watermark-only replies also count).
 * The bridge maintained **14,992 mutations/sec** with **zero errors** and an average version lag of **1,624 versions (~1.6 ms)**.
 * The committed cursor file recorded `stream_id` and `last_consumed_version`. The harness now compares that version to the listener position before teardown (`cursor_matches_listener` in new runs).
 
@@ -196,7 +196,31 @@ docker compose -f .devcontainer/docker-compose.yml exec app \
         --output benchmarks/0.1.0v/results_15k_verified.json
 ```
 
-### 4. Run Unthrottled Throughput Test
+### 4. Run Baseline Rate Tests (15k, 20k, 25k mut/s)
+```bash
+# 15,000 mut/s baseline
+docker compose -f .devcontainer/docker-compose.yml exec app \
+    python3 benchmarks/0.1.0v/bench_e2e.py \
+        --kafka-bootstrap-servers kafka:19092 \
+        --duration 60 --warmup 10 --target-rate 15000 \
+        --output benchmarks/0.1.0v/results_15k.json
+
+# 20,000 mut/s baseline
+docker compose -f .devcontainer/docker-compose.yml exec app \
+    python3 benchmarks/0.1.0v/bench_e2e.py \
+        --kafka-bootstrap-servers kafka:19092 \
+        --duration 60 --warmup 10 --target-rate 20000 \
+        --output benchmarks/0.1.0v/results_20k.json
+
+# 25,000 mut/s baseline
+docker compose -f .devcontainer/docker-compose.yml exec app \
+    python3 benchmarks/0.1.0v/bench_e2e.py \
+        --kafka-bootstrap-servers kafka:19092 \
+        --duration 60 --warmup 10 --target-rate 25000 \
+        --output benchmarks/0.1.0v/results_25k.json
+```
+
+### 5. Run Unthrottled Throughput Test
 ```bash
 docker compose -f .devcontainer/docker-compose.yml exec app \
     python3 benchmarks/0.1.0v/bench_e2e.py \

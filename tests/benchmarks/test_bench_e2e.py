@@ -92,14 +92,74 @@ def test_exit_code_cursor_mismatch(bench: ModuleType) -> None:
     assert bench.exit_code_for_results(results) == 1
 
 
-def test_verify_requires_unbounded_key_pool(bench: ModuleType) -> None:
+def test_exit_code_cursor_covers_writer_mismatch(bench: ModuleType) -> None:
+    results = {
+        "backlog_growing": False,
+        "drained": True,
+        "cursor_covers_writer": False,
+    }
+    assert bench.exit_code_for_results(results) == 1
+
+
+def test_exit_code_missing_keys(bench: ModuleType) -> None:
+    results = {
+        "backlog_growing": False,
+        "drained": True,
+        "integrity": {
+            "duplicates": 0,
+            "missing": 5,
+            "order_violations": 0,
+        },
+    }
+    assert bench.exit_code_for_results(results) == 1
+
+
+def test_exit_code_order_violations(bench: ModuleType) -> None:
+    results = {
+        "backlog_growing": False,
+        "drained": True,
+        "integrity": {
+            "duplicates": 0,
+            "missing": 0,
+            "order_violations": 2,
+        },
+    }
+    assert bench.exit_code_for_results(results) == 1
+
+
+def test_verify_requires_unbounded_key_pool(
+    bench: ModuleType, capsys: pytest.CaptureFixture[str]
+) -> None:
     with pytest.raises(SystemExit):
         bench.parse_args(["--verify", "--key-pool", "500000"])
+    captured = capsys.readouterr()
+    assert "--key-pool 0" in captured.err
 
 
-def test_verify_rejected_with_use_bridge(bench: ModuleType) -> None:
+def test_verify_rejected_with_use_bridge(
+    bench: ModuleType, capsys: pytest.CaptureFixture[str]
+) -> None:
     with pytest.raises(SystemExit):
         bench.parse_args(["--use-bridge", "--verify", "--key-pool", "0"])
+    captured = capsys.readouterr()
+    assert "--verify is not supported with --use-bridge" in captured.err
+
+
+def test_stop_writer_raises_if_error_set(bench: ModuleType) -> None:
+    class FakeErrorWriter:
+        def __init__(self) -> None:
+            self.stop_event = type("E", (), {"set": lambda self: None})()
+            self.error = RuntimeError("FDB commit failed")
+
+        def join(self, timeout: float | None = None) -> None:
+            return None
+
+        def is_alive(self) -> bool:
+            return False
+
+    expected_err = r"writer failed: RuntimeError\('FDB commit failed'\)"
+    with pytest.raises(RuntimeError, match=expected_err):
+        bench.stop_writer(FakeErrorWriter(), timeout=0.01)
 
 
 def test_stop_writer_raises_if_thread_alive(
