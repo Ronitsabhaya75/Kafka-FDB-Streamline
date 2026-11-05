@@ -148,3 +148,11 @@ PYTHONPATH=.:src:protobuf/gen \
 The script uses a unique topic by default. Pass `--topic`,
 `--bootstrap-servers`, or `--console-bootstrap-servers` to override its local
 defaults.
+
+## Destination identity
+
+`MutationProducer.cluster_id(timeout=10.0)` reads the broker-reported cluster ID
+without requesting or creating a topic. A missing identity is a `ValueError`;
+metadata retrieval errors propagate. Closed/fatal instances reject the operation.
+The FDB checkpoint backend binds progress to this identity and the configured topic;
+see [FDB checkpoints](FDB-CHECKPOINT-SPEC.md).

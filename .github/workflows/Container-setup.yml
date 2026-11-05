@@ -322,13 +322,14 @@ jobs:
               raise SystemExit("Timed out waiting for Kafka broker on localhost:9092")
           '
 
-      - name: Run bridge partition integration test inside FDB container
+      - name: Verify durable bridge against live FDB and Kafka
         run: |
           docker run --rm \
             --network host \
             -v "${{ github.workspace }}:/workspace" \
             -w /workspace \
             -e HYPOTHESIS_PROFILE=ci \
+            -e FDB_CDC_INTEGRATION=1 \
             -e KAFKA_INTEGRATION=1 \
             -e KAFKA_BOOTSTRAP_SERVERS=localhost:9092 \
             fdb-cdc:ci \
@@ -336,9 +337,10 @@ jobs:
               set -e
               pip3 install --break-system-packages -r requirements-dev.txt
 
-              echo "=== Running Bridge Live Kafka Tests ==="
+              echo "=== Running Durable Bridge Tests ==="
               PYTHONPATH=/workspace:/workspace/src:/workspace/protobuf/gen \
               python3 -m pytest \
-                tests/bridge/test_pipeline_integration.py \
-                -v -m integration
+                tests/bridge/ tests/cdc/test_checkpoint*.py \
+                --cov=fdb_kafka_bridge.cdc.checkpoint --cov-branch \
+                --cov-report=term-missing --cov-fail-under=100 -v
             '

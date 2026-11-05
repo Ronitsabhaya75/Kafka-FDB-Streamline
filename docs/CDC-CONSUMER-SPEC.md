@@ -124,3 +124,10 @@ non-native consume/ack failure is wrapped as `CDCError` with the original as its
 Unit tests run without FoundationDB. The live-cluster integration test is skipped unless
 `FDB_CDC_INTEGRATION=1` is set in an environment containing the API-800 Python bindings,
 CDC-enabled client library, and a reachable CDC-enabled cluster.
+
+## Durable FDB checkpoints
+
+`fdb_kafka_bridge.cdc` exports `CheckpointStore`, `CheckpointCursor`, `SinkIdentity`
+and the checkpoint error classes. The store validates Kafka destination identity
+and cursor monotonicity before advancing. See [FDB checkpoints](FDB-CHECKPOINT-SPEC.md)
+for the storage layout, overlap guards and bridge integration.

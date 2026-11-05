@@ -36,6 +36,14 @@ except ImportError:
 from confluent_kafka import KafkaException
 
 from fdb_kafka_bridge.bridge.config import BridgeConfig
+from fdb_kafka_bridge.bridge.startup import resolve_startup
+from fdb_kafka_bridge.cdc.checkpoint import (
+    CheckpointError,
+    CheckpointSinkMismatchError,
+    CheckpointStore,
+    CheckpointWriteError,
+    SinkIdentity,
+)
 from fdb_kafka_bridge.cdc.client import FDBClient
 from fdb_kafka_bridge.cdc.errors import CDCRetryableError, CDCTerminalError
 from fdb_kafka_bridge.cdc.listener import FDBMutationListener
@@ -585,6 +593,7 @@ class Bridge:
     Args:
         config: Declarative configuration for FDB, CDC stream, Kafka, and pipeline.
         client: Optional pre-configured :class:`FDBClient` (useful for testing).
+        checkpoint_store: Optional FDB cursor backend, shared with this client's stream.
         listener: Optional pre-configured :class:`FDBMutationListener`.
         producer: Optional pre-configured :class:`MutationProducer`.
         producer_factory: Optional builder for replacement producers.
@@ -598,6 +607,7 @@ class Bridge:
         listener: FDBMutationListener | None = None,
         producer: MutationProducer | None = None,
         producer_factory: Callable[[], MutationProducer] | None = None,
+        checkpoint_store: CheckpointStore | None = None,
     ) -> None:
         """Initialize the Bridge with declarative configuration.
 
@@ -612,6 +622,8 @@ class Bridge:
             producer: Optional injected MutationProducer. A transactional one
                 must not have had ``init_transactions()`` called; ``start``
                 calls it.
+            checkpoint_store: Optional FDB store bound to the same client. Cannot
+                be combined with an injected listener or a cursor file.
             producer_factory: Builds each replacement producer after a
                 rebuild. Defaults to ``MutationProducer`` from
                 ``config.kafka``, transactional when ``transactional_id`` is
@@ -620,7 +632,9 @@ class Bridge:
         Raises:
             ValueError: If ``producer`` is transactional but neither
                 ``producer_factory`` nor ``config.kafka.transactional_id`` is
-                given, so a rebuild would downgrade it to idempotent.
+                given, so a rebuild would downgrade it to idempotent; or the
+                FDB checkpoint backend conflicts with an injected listener,
+                cursor file or FDB client.
         """
         if (
             producer is not None
@@ -632,6 +646,23 @@ class Bridge:
                 "An injected transactional producer needs producer_factory or "
                 "kafka.transactional_id so rebuilds stay transactional"
             )
+        uses_fdb_checkpoint = (
+            checkpoint_store is not None or config.cdc.checkpoint_path is not None
+        )
+        if uses_fdb_checkpoint and (
+            listener is not None or config.cdc.cursor_file is not None
+        ):
+            raise ValueError(
+                "FDB checkpoints require a managed listener and no cursor_file"
+            )
+        if checkpoint_store is not None:
+            if client is not None and checkpoint_store.client is not client:
+                raise ValueError(
+                    "Checkpoint store and bridge must share the FDB client"
+                )
+            client = checkpoint_store.client
+        self._uses_fdb_checkpoint = uses_fdb_checkpoint
+        self._checkpoint_store = checkpoint_store
         self.config = config
         self._shutdown_requested = threading.Event()
         self._step_lock = threading.Lock()
@@ -702,10 +733,15 @@ class Bridge:
                     if self.config.cdc.begin_key or self.config.cdc.end_key
                     else None
                 )
-                cursor = _load_cursor_from_file(
-                    self.config.cdc.cursor_file,
-                    stream_name=self.config.cdc.stream_name,
-                )
+                if self._uses_fdb_checkpoint:
+                    cursor, register = self._resolve_fdb_startup(key_range)
+                    if not register:
+                        key_range = None
+                else:
+                    cursor = _load_cursor_from_file(
+                        self.config.cdc.cursor_file,
+                        stream_name=self.config.cdc.stream_name,
+                    )
                 self._listener = FDBMutationListener(
                     self._client,
                     stream_name=self.config.cdc.stream_name,
@@ -733,11 +769,14 @@ class Bridge:
         partition_key = stream_bytes if stream_bytes else None
 
         def _checkpoint_callback(position: Any) -> None:
-            _save_cursor_to_file(
-                self.config.cdc.cursor_file,
-                position,
-                stream_name=self.config.cdc.stream_name,
-            )
+            if self._checkpoint_store is not None:
+                self._checkpoint_store.save(stream_bytes, position)
+            else:
+                _save_cursor_to_file(
+                    self.config.cdc.cursor_file,
+                    position,
+                    stream_name=self.config.cdc.stream_name,
+                )
 
         self._pipeline = BridgePipeline(
             self._counting_listener,  # type: ignore[arg-type]
@@ -746,6 +785,35 @@ class Bridge:
             checkpoint=_checkpoint_callback,
             partition_key=partition_key,
             flush_timeout_seconds=self.config.pipeline.flush_timeout_seconds,
+        )
+
+    def _resolve_fdb_startup(
+        self, key_range: tuple[bytes, bytes] | None
+    ) -> tuple[Any | None, bool]:
+        """Validate destination and native stream before allocating or registering."""
+        if self._producer is None:
+            self._producer = self._producer_factory()
+        sink = SinkIdentity(
+            self._producer.cluster_id(self.config.pipeline.flush_timeout_seconds),
+            self.config.kafka.topic,
+        )
+        if self._checkpoint_store is None:
+            self._checkpoint_store = CheckpointStore(
+                self._client,
+                sink=sink,
+                path=self.config.cdc.checkpoint_path,
+                timeout_s=self.config.cdc.checkpoint_timeout_seconds,
+                retry_limit=self.config.cdc.checkpoint_retry_limit,
+            )
+        if self._checkpoint_store.sink != sink:
+            raise CheckpointSinkMismatchError(
+                "Kafka destination changed during rebuild"
+            )
+        return resolve_startup(
+            self._client,
+            self._checkpoint_store,
+            self.config.cdc.stream_name.encode("utf-8"),
+            key_range,
         )
 
     def _discard_listener_and_producer(self) -> None:
@@ -864,8 +932,12 @@ class Bridge:
                     raise
                 # Checkpoint coordinates and cursor files fail the same way on
                 # every retry. SerializationError is per-reply and resumable.
-                if isinstance(exc, ValueError) and not isinstance(
-                    exc, SerializationError
+                if (
+                    isinstance(exc, ValueError)
+                    and not isinstance(exc, SerializationError)
+                ) or (
+                    isinstance(exc, CheckpointError)
+                    and not isinstance(exc, CheckpointWriteError)
                 ):
                     logger.error(
                         "Permanent error in bridge run loop: %s", exc, exc_info=True

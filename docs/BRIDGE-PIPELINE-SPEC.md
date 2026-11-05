@@ -140,3 +140,17 @@ A `RecordTooLargeError` caused by the data itself recurs after every rebuild, so
 | Kafka-side atomicity (txn mode) | Yes, for `read_committed` consumers |
 | Cross-system exactly-once | No. The CDC cursor is not inside the Kafka transaction. |
 | Duplicate suppression | No. Consumers dedup on `(stream, version, sequence)`. |
+
+## FDB checkpoint backend and CLI
+
+Set `cdc.checkpoint_path` to enable sink-checked FDB cursor storage instead of
+`cdc.cursor_file`; the two settings are mutually exclusive. `Bridge` validates
+stream identity, configured range and checkpoint overlap before registration,
+and revalidates Kafka cluster/topic identity on rebuild. FDB checkpoint writes
+use the existing checkpoint callback and preserve phase-only retries. Permanent
+checkpoint errors stop the loop; transient transaction failures retry in place.
+
+The `streamline-daemon` command wraps this same `Bridge` with signal handling and
+FDB checkpoints by default. It chooses `fdb.cdc.<stream_name>` unless overridden.
+See [FDB checkpoint and CLI contract](FDB-CHECKPOINT-SPEC.md) for the wire format,
+configuration, single-process ownership requirement, exit codes and tests.
