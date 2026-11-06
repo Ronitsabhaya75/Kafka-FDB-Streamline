@@ -22,11 +22,15 @@ cluster file are available:
 
 ```bash
 docker compose -f .devcontainer/docker-compose.yml up -d --build
+# Wait until FDB and Kafka accept connections, then:
 docker compose -f .devcontainer/docker-compose.yml exec app \
-  pip3 install --break-system-packages -r requirements-dev.txt
+  pip3 install --break-system-packages -e .
 docker compose -f .devcontainer/docker-compose.yml exec app \
-  env PYTHONPATH=.:src:protobuf/gen python3 demo/run_demo.py --count 10000
+  python3 demo/run_demo.py --count 10000
 ```
+
+`run_demo.py` falls back to a local `workload` import when `demo` is not on
+`PYTHONPATH`, so the command above works from the container `WORKDIR`.
 
 Use `--kafka-bootstrap-servers` and `--timeout` to override the broker address
 or the default one-hour deadline.
