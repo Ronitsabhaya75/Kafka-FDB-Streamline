@@ -394,7 +394,7 @@ def test_idle_replies_flush_one_watermark_when_time_threshold_elapses() -> None:
         idle_ack_max_seconds=5.0,
     )
 
-    with patch("src.cdc.listener.time.monotonic") as clock:
+    with patch("fdb_kafka_bridge.cdc.listener.time.monotonic") as clock:
         clock.return_value = 0.0
         listener.start()
         clock.return_value = 4.9
@@ -454,7 +454,7 @@ def test_resume_starts_a_fresh_idle_window() -> None:
         idle_ack_max_seconds=5.0,
     )
 
-    with patch("src.cdc.listener.time.monotonic") as clock:
+    with patch("fdb_kafka_bridge.cdc.listener.time.monotonic") as clock:
         clock.return_value = 1000.0
         listener.start()
         clock.return_value = 1004.9
