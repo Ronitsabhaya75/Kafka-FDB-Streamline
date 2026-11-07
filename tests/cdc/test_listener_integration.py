@@ -5,9 +5,9 @@ import time
 
 import pytest
 
+from fdb_kafka_bridge.cdc.client import FDBClient
+from fdb_kafka_bridge.cdc.listener import FDBMutationListener, strinc
 from fdbkafka.cdc.v1 import mutations_pb2
-from src.cdc.client import FDBClient
-from src.cdc.listener import FDBMutationListener, strinc
 
 pytestmark = [
     pytest.mark.integration,

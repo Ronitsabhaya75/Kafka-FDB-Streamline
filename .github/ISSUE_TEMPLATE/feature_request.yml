@@ -1,0 +1,61 @@
+name: Feature or enhancement request
+description: File a request for a feature, optimization, or enhancement.
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to suggest an improvement for **Kafka-FDB-Streamline**!
+  - type: textarea
+    id: motivation
+    attributes:
+      label: Problem & Motivation
+      description: What problem or limitation does this feature solve?
+      placeholder: |
+        A clear description of what challenge or missing capability you're addressing...
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed Solution & Details
+      description: Describe your proposed feature, API changes, or architectural approach. Code samples or schema changes are very helpful!
+      placeholder: |
+        Proposed API, configuration changes, or workflow...
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives Considered
+      description: Describe any alternative solutions or workarounds you considered, and why this proposal is preferred.
+  - type: dropdown
+    id: component
+    attributes:
+      label: Affected Component(s)
+      description: Which module does this feature primarily touch?
+      multiple: true
+      options:
+        - CDC Consumer (`fdb_kafka_bridge.cdc`)
+        - Protobuf Serialization (`fdb_kafka_bridge.serialization`)
+        - Kafka Producer (`fdb_kafka_bridge.kafka`)
+        - Bridge Coordinator / Daemon (`fdb_kafka_bridge.bridge`)
+        - Protobuf Schema (`protobuf/proto`)
+        - CLI / Tooling / Demo
+        - Documentation / Deployment / CI
+  - type: checkboxes
+    id: contribution
+    attributes:
+      label: Implementation
+      options:
+        - label: I am interested in implementing this feature and submitting a pull request.
+  - type: checkboxes
+    id: terms
+    attributes:
+      label: Code of Conduct & Contribution Guidelines
+      description: By submitting this issue, you agree to follow our project conventions.
+      options:
+        - label: I agree to follow this project's [Contribution Conventions](https://github.com/Ronitsabhaya75/Kafka-FDB-Streamline/blob/main/docs/conventions.md).
+          required: true
+

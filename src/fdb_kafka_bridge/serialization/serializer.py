@@ -2,10 +2,10 @@
 
 from collections.abc import Iterable
 
+from fdb_kafka_bridge.serialization import _checks, _wire
+from fdb_kafka_bridge.serialization.errors import InputValueError
+from fdb_kafka_bridge.serialization.model import NativeMutation
 from fdbkafka.cdc.v1 import mutations_pb2
-from src.serialization import _checks, _wire
-from src.serialization.errors import InputValueError
-from src.serialization.model import NativeMutation
 
 
 def serialize_mutation(

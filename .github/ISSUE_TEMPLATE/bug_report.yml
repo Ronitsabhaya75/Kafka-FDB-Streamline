@@ -1,0 +1,71 @@
+name: Bug report
+description: File a bug report for Kafka-FDB-Streamline.
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report an issue with **Kafka-FDB-Streamline**!
+  - type: checkboxes
+    id: prereqs
+    attributes:
+      label: Prerequisites
+      description: Please verify the following before submitting.
+      options:
+        - label: I have searched existing issues to ensure this is not a duplicate.
+          required: true
+        - label: If possible, I have reproduced the issue using the `main` branch.
+          required: false
+  - type: textarea
+    id: problem-description
+    attributes:
+      label: Problem Description
+      description: A clear and concise description of what the bug is, including expected vs. actual behavior.
+      placeholder: |
+        Briefly describe what happened and what you expected to happen instead...
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to Reproduce
+      description: Steps or a minimal code example to reproduce the behavior.
+      placeholder: |
+        1. Start FoundationDB 8.0 and Kafka (e.g. via .devcontainer/docker-compose.yml)
+        2. Configure Bridge with ...
+        3. Execute transaction ...
+        4. See error ...
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs and Stack Traces
+      description: Paste relevant logs, stack traces, or exception messages here.
+      render: shell
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment Information
+      description: Please provide your runtime environment details.
+      value: |
+        - **OS & Architecture**: (e.g. Linux x86_64, macOS aarch64)
+        - **Python Version**: (e.g. 3.12.3)
+        - **FoundationDB Version & libfdb_c**: (e.g. 8.0.0, API version 800)
+        - **Kafka Broker Version**: (e.g. Kafka 3.7.0, Confluent, Redpanda)
+        - **confluent-kafka Version**: (e.g. 2.6.0)
+        - **Deployment Mode**: (e.g. Docker Compose, Devcontainer, bare metal)
+        - **Producer Mode**: (e.g. Transactional with transactional_id, or Idempotent)
+      render: markdown
+    validations:
+      required: true
+  - type: checkboxes
+    id: terms
+    attributes:
+      label: Code of Conduct & Contribution Guidelines
+      description: By submitting this issue, you agree to follow our project conventions.
+      options:
+        - label: I agree to follow this project's [Contribution Conventions](https://github.com/Ronitsabhaya75/Kafka-FDB-Streamline/blob/main/docs/conventions.md).
+          required: true
+

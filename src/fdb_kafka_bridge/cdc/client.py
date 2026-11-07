@@ -7,7 +7,7 @@ try:
 except ImportError:  # pragma: no cover
     fdb = None  # type: ignore[assignment]
 
-from src.cdc.errors import (
+from fdb_kafka_bridge.cdc.errors import (
     CDCError,
     CDCInvalidCursorError,
     CDCInvalidRangeError,

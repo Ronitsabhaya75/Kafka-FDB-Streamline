@@ -1,6 +1,6 @@
 # Serialization module spec
 
-Contract for `src/serialization/`: native FDB CDC mutations → Protobuf `FDBMutationRecord`
+Contract for `src/fdb_kafka_bridge/serialization/`: native FDB CDC mutations → Protobuf `FDBMutationRecord`
 bytes, and back. Trello:
 [Implement Binary Serializer & Deserializer Module](https://trello.com/c/amcMAYnn). Schema:
 [`mutations.proto`](../protobuf/proto/fdbkafka/cdc/v1/mutations.proto), used as-is.
@@ -22,10 +22,10 @@ producing, idle-watermark policy.
 
 ## 2. Public API
 
-Import from `src.serialization`; everything in its `__all__` is contract. Private helpers live
+Import from `fdb_kafka_bridge.serialization`; everything in its `__all__` is contract. Private helpers live
 in `_`-modules. Runtime dependency: `protobuf>=7.34,<8` (the committed gencode is 6.30.2,
 which protobuf 8 will not load); generated code is imported as
-`from fdbkafka.cdc.v1 import mutations_pb2` (`protobuf/gen` on the path).
+`from fdbkafka.cdc.v1 import mutations_pb2` (installed with the wheel; from a checkout, `protobuf/gen` on the path).
 
 ### 2.1 Input
 

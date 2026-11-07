@@ -6,7 +6,11 @@ is a real regression. Each literal is the bytes of the equivalent hand-built
 `mutations_pb2` message.
 """
 
-from src.serialization import serialize_batch, serialize_mutation, serialize_version_end
+from fdb_kafka_bridge.serialization import (
+    serialize_batch,
+    serialize_mutation,
+    serialize_version_end,
+)
 from tests.serialization.doubles import ADD, CLEAR, ENV, V
 
 G1 = bytes.fromhex(

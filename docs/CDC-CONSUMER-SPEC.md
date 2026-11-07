@@ -1,6 +1,6 @@
 # CDC Consumer Module Spec
 
-Contract for `src/cdc/`: FoundationDB native CDC client initialization, stream
+Contract for `src/fdb_kafka_bridge/cdc/`: FoundationDB native CDC client initialization, stream
 lifecycle, bounded record polling, and safe acknowledgement.
 
 Trello: [Basic FDB Client & Mutation Stream Listener](https://trello.com/c/0Wn8zbEk) (CDC Engine).
@@ -24,7 +24,7 @@ Schema: [`mutations.proto`](../protobuf/proto/fdbkafka/cdc/v1/mutations.proto).
   close it and resume from the last durable cursor.
 - **Protobuf Fidelity:** Raw FDB mutations are mapped directly into Protobuf types
   (`FDBSingleKeyMutation`, `FDBClearRange`, `FDBMutation`, `FDBMutationBatch`, `FDBMutationRecord`).
-  `poll_records()` uses `src.serialization.serialize_version_group()` to split each
+  `poll_records()` uses `fdb_kafka_bridge.serialization.serialize_version_group()` to split each
   version group into records no larger than `max_record_bytes`, then emits its
   `VersionEnd`. A reply watermark beyond the final version group is represented by an
   additional zero-mutation `VersionEnd`, unless idle coalescing withholds it (below).
@@ -48,9 +48,9 @@ Schema: [`mutations.proto`](../protobuf/proto/fdbkafka/cdc/v1/mutations.proto).
 
 ## 2. Public API
 
-Import from `src.cdc`; everything in its `__all__` is contract.
+Import from `fdb_kafka_bridge.cdc`; everything in its `__all__` is contract.
 
-### 2.1 Client & Connection (`src/cdc/client.py`)
+### 2.1 Client & Connection (`src/fdb_kafka_bridge/cdc/client.py`)
 
 ```python
 init_fdb(api_version: int = 800) -> None
@@ -71,7 +71,7 @@ class FDBClient:
     def get_read_version(self) -> int: ...
 ```
 
-### 2.2 Mutation Stream Listener (`src/cdc/listener.py`)
+### 2.2 Mutation Stream Listener (`src/fdb_kafka_bridge/cdc/listener.py`)
 
 ```python
 class FDBMutationListener:
@@ -102,12 +102,12 @@ starts. Omit both to consume a stream registered elsewhere. Supplying both is in
 Leave both `idle_ack_*` bounds `None` for per-reply idle acks; set either (positive) to
 coalesce idle replies (§1).
 
-### 2.3 Prefix Utilities (`src/cdc/listener.py`)
+### 2.3 Prefix Utilities (`src/fdb_kafka_bridge/cdc/listener.py`)
 
 - `strinc(key: bytes) -> bytes`: Computes the lexicographically adjacent prefix upper bound.
 - `subspace_to_key_range(subspace: Any) -> tuple[bytes, bytes]`: Extracts `(prefix, strinc(prefix))`.
 
-### 2.4 Errors (`src/cdc/errors.py`)
+### 2.4 Errors (`src/fdb_kafka_bridge/cdc/errors.py`)
 
 - `CDCError`: Base class for CDC exceptions.
 - `CDCNotSupportedError`: FDB bindings missing, API version < 800, or native CDC
