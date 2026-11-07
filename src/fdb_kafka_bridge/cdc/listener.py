@@ -148,6 +148,10 @@ class FDBMutationListener:
                 idle_ack_max_seconds, bool
             ):
                 raise TypeError("idle_ack_max_seconds must be numeric")
+            try:
+                idle_ack_max_seconds = float(idle_ack_max_seconds)
+            except OverflowError:
+                raise ValueError("idle_ack_max_seconds must be finite") from None
             if not math.isfinite(idle_ack_max_seconds):
                 raise ValueError("idle_ack_max_seconds must be finite")
             if idle_ack_max_seconds <= 0:
@@ -168,9 +172,7 @@ class FDBMutationListener:
         self._awaiting_ack = False
         self._delivery_failed = False
         self.idle_ack_max_replies = idle_ack_max_replies
-        self.idle_ack_max_seconds = (
-            float(idle_ack_max_seconds) if idle_ack_max_seconds is not None else None
-        )
+        self.idle_ack_max_seconds = idle_ack_max_seconds
         self._skipped_idle_replies = 0
         self._idle_window_start = 0.0
 
@@ -336,7 +338,7 @@ class FDBMutationListener:
         return records
 
     def _reset_idle_window(self) -> None:
-        """Start a new idle-coalescing window from the current acked position."""
+        """Clear the skipped-idle count and restart the idle timer."""
         self._skipped_idle_replies = 0
         self._idle_window_start = time.monotonic()
 

@@ -20,6 +20,7 @@ from fdb_kafka_bridge.cdc.listener import (
     subspace_to_key_range,
 )
 from fdb_kafka_bridge.serialization.errors import InputTypeError
+from fdbkafka.cdc.v1 import mutations_pb2
 
 
 class _FakeFDBError(Exception):
@@ -328,12 +329,20 @@ def _listener_with_batches(
 
 
 def _version_ends(
-    records: list[object],
+    records: list[mutations_pb2.FDBMutationRecord],
 ) -> list[tuple[int, int]]:
     return [
         (record.version_end.fdb_version, record.version_end.total_mutations)
         for record in records
         if record.HasField("version_end")
+    ]
+
+
+def _consume_and_ack_order(consumer: MagicMock) -> list[str]:
+    return [
+        name
+        for name, _, _ in consumer.mock_calls
+        if name in ("consume().wait", "acknowledge().wait")
     ]
 
 
@@ -383,7 +392,12 @@ def test_idle_replies_flush_one_watermark_at_reply_threshold() -> None:
 
     assert _version_ends(flushed) == [(300, 0)]
     assert len(flushed) == 1
-    consumer.acknowledge.return_value.wait.assert_called_once()
+    assert _consume_and_ack_order(consumer) == [
+        "consume().wait",
+        "consume().wait",
+        "consume().wait",
+        "acknowledge().wait",
+    ]
     assert listener.poll_records(bridge_timestamp_ns=1) == []
     assert listener.poll_records(bridge_timestamp_ns=1) == []
 
@@ -395,19 +409,53 @@ def test_idle_replies_flush_one_watermark_when_time_threshold_elapses() -> None:
     )
 
     with patch("fdb_kafka_bridge.cdc.listener.time.monotonic") as clock:
-        clock.return_value = 0.0
+        # Non-zero: 0.0 is the window's pre-start value and would mask a missing reset.
+        clock.return_value = 1000.0
         listener.start()
-        clock.return_value = 4.9
+        clock.return_value = 1004.9
         assert listener.poll_records(bridge_timestamp_ns=1) == []
-        clock.return_value = 5.0
+        clock.return_value = 1005.0
         flushed = listener.poll_records(bridge_timestamp_ns=1)
         listener.acknowledge()
-        clock.return_value = 9.9
+        clock.return_value = 1009.9
         after_ack = listener.poll_records(bridge_timestamp_ns=1)
 
     assert _version_ends(flushed) == [(200, 0)]
     assert after_ack == []
     consumer.acknowledge.return_value.wait.assert_called_once()
+
+
+def test_time_threshold_flushes_before_reply_threshold_when_both_set() -> None:
+    listener, _, _ = _listener_with_batches(
+        [MockConsumeResult([], version) for version in (100, 200)],
+        idle_ack_max_replies=10,
+        idle_ack_max_seconds=5.0,
+    )
+
+    with patch("fdb_kafka_bridge.cdc.listener.time.monotonic") as clock:
+        clock.return_value = 1000.0
+        listener.start()
+        clock.return_value = 1004.9
+        skipped = listener.poll_records(bridge_timestamp_ns=1)
+        clock.return_value = 1005.0
+        flushed = listener.poll_records(bridge_timestamp_ns=1)
+
+    assert skipped == []
+    assert _version_ends(flushed) == [(200, 0)]
+    assert listener.awaiting_ack
+
+
+def test_reply_without_watermark_does_not_count_toward_reply_threshold() -> None:
+    listener, _, _ = _listener_with_batches(
+        [MockConsumeResult([], version) for version in (-1, 100, 200)],
+        idle_ack_max_replies=2,
+    )
+
+    assert listener.poll_records(bridge_timestamp_ns=1) == []
+    assert listener.poll_records(bridge_timestamp_ns=1) == []
+    flushed = listener.poll_records(bridge_timestamp_ns=1)
+
+    assert _version_ends(flushed) == [(200, 0)]
 
 
 def test_data_reply_after_skipped_idles_is_delivered_and_resets_window() -> None:
@@ -432,8 +480,14 @@ def test_data_reply_after_skipped_idles_is_delivered_and_resets_window() -> None
         listener.poll_records()
     listener.acknowledge()
 
+    assert records[-1].HasField("version_end")
     assert _version_ends(records) == [(300, 1), (350, 0)]
-    consumer.acknowledge.return_value.wait.assert_called_once()
+    assert _consume_and_ack_order(consumer) == [
+        "consume().wait",
+        "consume().wait",
+        "consume().wait",
+        "acknowledge().wait",
+    ]
     assert listener.poll_records(bridge_timestamp_ns=1) == []
     assert listener.poll_records(bridge_timestamp_ns=1) == []
 
@@ -512,59 +566,6 @@ def test_close_mid_idle_window_then_resume_reacks_cursor_and_coalesces_afresh() 
     ]
 
 
-def _consume_and_ack_order(consumer: MagicMock) -> list[str]:
-    return [
-        name
-        for name, _, _ in consumer.mock_calls
-        if name in ("consume().wait", "acknowledge().wait")
-    ]
-
-
-def test_data_reply_acks_once_at_its_own_frontier_after_skipped_idles() -> None:
-    data = MockConsumeResult(
-        [MockVersionGroup(300, [MockCdcMutation(0, b"key", b"value")])], 350
-    )
-    listener, _, consumer = _listener_with_batches(
-        [MockConsumeResult([], 100), MockConsumeResult([], 200), data],
-        idle_ack_max_replies=5,
-    )
-
-    assert listener.poll_records(bridge_timestamp_ns=1) == []
-    assert listener.poll_records(bridge_timestamp_ns=1) == []
-    records = listener.poll_records(bridge_timestamp_ns=1)
-    listener.acknowledge()
-
-    assert records[-1].HasField("version_end")
-    assert _version_ends(records) == [(300, 1), (350, 0)]
-    assert _consume_and_ack_order(consumer) == [
-        "consume().wait",
-        "consume().wait",
-        "consume().wait",
-        "acknowledge().wait",
-    ]
-
-
-def test_idle_flush_acks_once_at_latest_watermark() -> None:
-    listener, _, consumer = _listener_with_batches(
-        [MockConsumeResult([], version) for version in (100, 200, 300)],
-        idle_ack_max_replies=3,
-    )
-
-    assert listener.poll_records(bridge_timestamp_ns=1) == []
-    assert listener.poll_records(bridge_timestamp_ns=1) == []
-    flushed = listener.poll_records(bridge_timestamp_ns=1)
-    listener.acknowledge()
-
-    assert _version_ends(flushed) == [(300, 0)]
-    assert len(flushed) == 1
-    assert _consume_and_ack_order(consumer) == [
-        "consume().wait",
-        "consume().wait",
-        "consume().wait",
-        "acknowledge().wait",
-    ]
-
-
 @pytest.mark.parametrize(
     ("kwargs", "error"),
     [
@@ -579,6 +580,7 @@ def test_idle_flush_acks_once_at_latest_watermark() -> None:
         ({"idle_ack_max_seconds": math.nan}, ValueError),
         ({"idle_ack_max_seconds": math.inf}, ValueError),
         ({"idle_ack_max_seconds": -math.inf}, ValueError),
+        ({"idle_ack_max_seconds": 10**400}, ValueError),
     ],
 )
 def test_constructor_validates_idle_ack_thresholds(
@@ -593,4 +595,5 @@ def test_constructor_accepts_integer_idle_ack_seconds() -> None:
         MagicMock(spec=FDBClient), "stream", idle_ack_max_seconds=5
     )
 
+    assert isinstance(listener.idle_ack_max_seconds, float)
     assert listener.idle_ack_max_seconds == 5.0

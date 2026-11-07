@@ -36,12 +36,16 @@ Schema: [`mutations.proto`](../protobuf/proto/fdbkafka/cdc/v1/mutations.proto).
   coalescing ([CDC deep dive §1.3](CDC-DEEP-DIVE.md#13-acknowledgement-semantics-),
   [§2.7](CDC-DEEP-DIVE.md#27-threads-blocking-and-the-network-thread-)): an idle reply
   below threshold returns `[]` and needs no ack. Once N idle replies (this one included)
-  accumulate since the last ack, or T seconds pass since the last ack (or start/resume), the reply flushes as one
-  `VersionEnd` at the latest watermark, acked as usual. T is soft: it is checked only when
-  a reply arrives, since `consume()` blocks. Data replies are unchanged and their ack
+  accumulate since the last ack, or T seconds pass since the last ack (or start/resume),
+  the reply flushes as one `VersionEnd` at the latest watermark, acked as usual; with both
+  set, whichever is reached first flushes. T is soft: it is checked only when a reply
+  arrives, since `consume()` long-polls, so a T at or below the native idle reply cadence
+  flushes every idle reply; set it well above. Data replies are unchanged and their ack
   subsumes skipped idle progress; ack and start/resume reset both bounds. Skipped progress
   un-acked at close is re-consumed as an idle reply after resume. Downstream sees
-  `VersionEnd` heartbeats less often.
+  `VersionEnd` heartbeats less often. After a `[]`, `get_position()` is past the last ack:
+  checkpoint a position only for a reply you then acknowledge, never after a `[]`.
+  Coalescing is a listener option only; the Bridge daemon does not expose it.
 - **Resume Safety:** Resume waits until a fresh database read version reaches the cursor's
   `last_consumed_version`, then re-acknowledges the resumed cursor before polling. This
   restores the native consumer's retention watermark after process restart.
@@ -99,8 +103,9 @@ class FDBMutationListener:
 
 Supply exactly one of `key_range` or `subspace` to register a stream when the listener
 starts. Omit both to consume a stream registered elsewhere. Supplying both is invalid.
-Leave both `idle_ack_*` bounds `None` for per-reply idle acks; set either (positive) to
-coalesce idle replies (§1).
+Leave both `idle_ack_*` bounds `None` for per-reply idle acks; set either to coalesce
+idle replies (§1). N must be an `int` >= 1 and T a finite `int` or `float` > 0 (`bool`
+rejected); wrong types raise `TypeError`, bad values `ValueError`.
 
 ### 2.3 Prefix Utilities (`src/fdb_kafka_bridge/cdc/listener.py`)
 
