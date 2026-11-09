@@ -21,11 +21,9 @@ Related: [`<research doc>`](<research doc>) (research; this spec is normative fo
 
 ## 3. Errors
 
-<a id="err-<pkg>-<name>"></a>
-
 | Error | Meaning | Retry? |
 |-------|---------|--------|
-| `<ErrorClass>` | <...> | <yes/no> |
+| <a id="err-<pkg>-<name>"></a>`<ErrorClass>` | <...> | <yes/no> |
 
 This section is the single source for these errors' handling; other specs link here.
 Errors raised by other components link to their owner's anchor instead of restating it.
