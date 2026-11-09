@@ -3,12 +3,9 @@
 Produces Protobuf-serialised FDBMutationRecord messages to a local Kafka
 topic, then consumes and deserialises them to verify the full round-trip.
 
-Opt-in.  From the host, or a container started with ``--network host``, the
-broker is ``localhost:9092`` (the default):
+Run explicitly inside the devcontainer:
     KAFKA_INTEGRATION=1 pytest tests/kafka/test_producer_integration.py \
         -v -m integration
-Inside the devcontainer the broker is ``kafka:19092``; the ``app`` service
-already exports ``KAFKA_BOOTSTRAP_SERVERS=kafka:19092``.
 """
 
 import os

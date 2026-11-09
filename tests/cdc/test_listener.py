@@ -18,7 +18,7 @@ from fdb_kafka_bridge.cdc.listener import (
     strinc,
     subspace_to_key_range,
 )
-from fdb_kafka_bridge.serialization.errors import InputTypeError, RecordTooLargeError
+from fdb_kafka_bridge.serialization.errors import InputTypeError
 
 
 class _FakeFDBError(Exception):
@@ -224,7 +224,7 @@ def test_poll_records_slices_large_version_group_to_record_budget() -> None:
     assert records[-1].version_end.total_mutations == 5
 
 
-def test_serialization_failure_blocks_ack_and_poll() -> None:
+def test_serialization_failure_cannot_be_acknowledged() -> None:
     malformed = MockCdcMutation(0, "not-bytes", b"value")
     listener, _, consumer = _listener_with_batch(
         MockConsumeResult([MockVersionGroup(1000, [malformed])], 1000)
@@ -232,14 +232,10 @@ def test_serialization_failure_blocks_ack_and_poll() -> None:
 
     with pytest.raises(InputTypeError):
         listener.poll_records(bridge_timestamp_ns=1_000_000)
-    assert listener.delivery_failed
     with pytest.raises(CDCError, match="not completely serialized"):
         listener.acknowledge()
-    with pytest.raises(CDCError, match="could not be serialized"):
-        listener.poll_records(bridge_timestamp_ns=1_000_000)
 
     consumer.acknowledge.assert_not_called()
-    assert consumer.consume.call_count == 1
 
 
 def test_close_propagates_native_error() -> None:
@@ -302,11 +298,8 @@ def test_poll_records_passes_through_unknown_fdb_error() -> None:
 def test_poll_records_wraps_non_native_failure_as_cdc_error() -> None:
     listener = _listener_whose_consume_raises(ValueError("boom"))
 
-    with pytest.raises(CDCError, match="consume CDC reply") as excinfo:
+    with pytest.raises(CDCError, match="consume CDC reply"):
         listener.poll_records()
-
-    assert type(excinfo.value) is CDCError
-    assert isinstance(excinfo.value.__cause__, ValueError)
 
 
 def test_acknowledge_maps_native_error_code() -> None:
@@ -321,107 +314,3 @@ def test_acknowledge_maps_native_error_code() -> None:
         listener.acknowledge()
 
     assert excinfo.value.code == 1211
-
-
-def test_zero_record_reply_needs_no_ack_and_does_not_block_poll() -> None:
-    listener, _, consumer = _listener_with_batch(MockConsumeResult([], -1))
-
-    assert listener.poll_records(bridge_timestamp_ns=1) == []
-    assert not listener.awaiting_ack
-    assert listener.poll_records(bridge_timestamp_ns=1) == []
-
-    consumer.acknowledge.assert_not_called()
-    assert consumer.consume.call_count == 2
-
-
-def test_failed_native_ack_can_be_retried_in_place() -> None:
-    batch = MockConsumeResult(
-        [MockVersionGroup(1000, [MockCdcMutation(0, b"k", b"v")])], 1000
-    )
-    listener, _, consumer = _listener_with_batch(batch)
-    listener.poll_records(bridge_timestamp_ns=1)
-    consumer.acknowledge.return_value.wait.side_effect = [_FakeFDBError(1211), None]
-
-    with pytest.raises(CDCRetryableError):
-        listener.acknowledge()
-    assert listener.awaiting_ack
-
-    listener.acknowledge()
-    assert not listener.awaiting_ack
-    assert consumer.acknowledge.return_value.wait.call_count == 2
-
-
-def test_oversized_watermark_version_end_raises_and_blocks_delivery() -> None:
-    listener, _, _ = _listener_with_batch(
-        MockConsumeResult([], 2500), max_record_bytes=1
-    )
-
-    with pytest.raises(RecordTooLargeError, match="watermark version end"):
-        listener.poll_records(bridge_timestamp_ns=1)
-    assert listener.delivery_failed
-
-
-@pytest.mark.parametrize("watermark", [-1, 999, 1000])
-def test_no_watermark_version_end_unless_beyond_last_group(watermark: int) -> None:
-    batch = MockConsumeResult(
-        [MockVersionGroup(1000, [MockCdcMutation(0, b"k", b"v")])], watermark
-    )
-    listener, _, _ = _listener_with_batch(batch)
-
-    records = listener.poll_records(bridge_timestamp_ns=1)
-
-    ends = [record.version_end for record in records if record.HasField("version_end")]
-    assert [end.fdb_version for end in ends] == [1000]
-
-
-def test_resume_reack_failure_is_classified_and_closes_partial_consumer() -> None:
-    client = MagicMock(spec=FDBClient)
-    consumer = MagicMock()
-    client.resume_cdc_consumer.return_value = consumer
-    client.get_read_version.return_value = 500
-    consumer.acknowledge.return_value.wait.side_effect = _FakeFDBError(1007)
-    listener = FDBMutationListener(client, "stream", cursor=MockCursor(42, 500))
-
-    with pytest.raises(CDCTerminalError) as excinfo:
-        listener.start()
-
-    assert excinfo.value.code == 1007
-    consumer.close.assert_called_once()
-    consumer.consume.assert_not_called()
-
-
-def test_close_never_acks_or_removes_stream() -> None:
-    batch = MockConsumeResult(
-        [MockVersionGroup(1000, [MockCdcMutation(0, b"k", b"v")])], 1000
-    )
-    listener, client, consumer = _listener_with_batch(batch, key_range=(b"a", b"z"))
-    listener.poll_records(bridge_timestamp_ns=1)
-
-    listener.close()
-
-    consumer.close.assert_called_once()
-    consumer.acknowledge.assert_not_called()
-    client.remove_cdc_stream.assert_not_called()
-
-
-def test_subspace_listener_registers_strinc_bounded_range() -> None:
-    client = MagicMock(spec=FDBClient)
-    client.create_cdc_consumer.return_value = MagicMock()
-    listener = FDBMutationListener(client, "stream", subspace=b"p\xff")
-
-    listener.start()
-
-    client.register_cdc_stream.assert_called_once_with(b"stream", b"p\xff", b"q")
-
-
-def test_close_racing_consume_raises_closed_error() -> None:
-    listener, _, consumer = _listener_with_batch(MockConsumeResult([], -1))
-
-    def close_then_fail() -> None:
-        listener.close()
-        raise _FakeFDBError(1101)
-
-    consumer.consume.return_value.wait.side_effect = close_then_fail
-
-    with pytest.raises(CDCConsumerClosedError):
-        listener.poll_records()

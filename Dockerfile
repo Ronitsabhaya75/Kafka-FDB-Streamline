@@ -16,7 +16,7 @@ RUN mkdir -p /var/lib/foundationdb/data \
     /var/log/foundationdb \
     /etc/foundationdb
 
-# Download prebuilt FoundationDB ${FDB_VERSION} x86_64 binaries and client library
+# Download prebuilt FoundationDB 8.0.0 x86_64 binaries and client library
 RUN curl -fsSL -o /usr/local/bin/fdbserver "${FDB_RELEASE_URL}/fdbserver.x86_64" && \
     curl -fsSL -o /usr/local/bin/fdbcli "${FDB_RELEASE_URL}/fdbcli.x86_64" && \
     curl -fsSL -o /usr/local/lib/libfdb_c.so "${FDB_RELEASE_URL}/libfdb_c.x86_64.so" && \

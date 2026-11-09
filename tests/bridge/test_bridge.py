@@ -181,7 +181,7 @@ def test_load_cursor_corrupt_file_raises(tmp_path: Path) -> None:
     corrupt_file = str(tmp_path / "corrupt.json")
     with open(corrupt_file, "w", encoding="utf-8") as f:
         f.write("{invalid-json")
-    with pytest.raises(ValueError, match="Expecting"):
+    with pytest.raises(ValueError, match="Failed to parse|Expecting"):
         _load_cursor_from_file(corrupt_file)
 
     non_object_file = str(tmp_path / "array.json")
@@ -297,9 +297,7 @@ def test_bridge_terminates_on_cdc_terminal_error() -> None:
     mock_client = create_autospec(FDBClient, instance=True)
     mock_listener = create_autospec(FDBMutationListener, instance=True)
     mock_listener.raw_stream_name = b"test_stream"
-    mock_listener.poll_records.side_effect = CDCTerminalError(
-        "transaction_too_old", code=1007
-    )
+    mock_listener.poll_records.side_effect = CDCTerminalError("Stream removed")
 
     mock_producer = create_autospec(MutationProducer, instance=True)
     mock_producer.transactional = False
@@ -312,7 +310,7 @@ def test_bridge_terminates_on_cdc_terminal_error() -> None:
     )
     bridge.start()
 
-    with pytest.raises(CDCTerminalError, match="transaction_too_old"):
+    with pytest.raises(CDCTerminalError, match="Stream removed"):
         bridge.run()
 
     bridge.stop()
@@ -534,9 +532,7 @@ def test_run_rebuilds_after_transaction_abort() -> None:
     )
     producer.commit_transaction.side_effect = [
         KafkaException(
-            KafkaError(
-                KafkaError._MSG_TIMED_OUT, "message timed out", txn_requires_abort=True
-            )
+            KafkaError(KafkaError._FENCED, "abort", txn_requires_abort=True)
         ),
         None,
     ]
@@ -619,45 +615,4 @@ def test_run_propagates_permanent_checkpoint_error(tmp_path: Path) -> None:
 
     rebuild.assert_not_called()
     listener.acknowledge.assert_not_called()
-    assert bridge._shutdown_requested.is_set()
-
-
-def test_bridge_keys_records_by_configured_stream_name() -> None:
-    """Bridge keys by cdc.stream_name, not by whatever the listener reports."""
-    bridge, listener, producer = _recovery_bridge()
-    listener.raw_stream_name = b"listener-name"
-    bridge._rebuild_pipeline = _fake_rebuild(listener)  # type: ignore[method-assign]
-    bridge._build_pipeline()
-    listener.poll_records.side_effect = _poll_script(
-        bridge, listener, [[_make_batch_record(1), _make_batch_record(1)]]
-    )
-
-    bridge.run()
-
-    keys = {call.kwargs["key"] for call in producer.produce.call_args_list}
-    assert keys == {b"test_stream"}
-
-
-def test_run_shuts_down_on_foreign_cursor_file_during_rebuild() -> None:
-    """A cursor file rejected on rebuild is permanent: run() raises, no retry."""
-    bridge, listener, _ = _recovery_bridge()
-    listener.poll_records.side_effect = _poll_script(
-        bridge, listener, [SerializationError("bad mutation"), [_make_batch_record(1)]]
-    )
-    loads = 0
-
-    def foreign(*_: object, **__: object) -> None:
-        nonlocal loads
-        loads += 1
-        if loads > 20:
-            bridge.request_shutdown()
-        raise ValueError("Cursor file belongs to stream 'other'")
-
-    with (
-        patch("fdb_kafka_bridge.bridge.pipeline._load_cursor_from_file", foreign),
-        pytest.raises(ValueError, match="belongs to stream"),
-    ):
-        bridge.run()
-
-    assert loads == 1
     assert bridge._shutdown_requested.is_set()

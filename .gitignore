@@ -25,17 +25,14 @@ ENV/
 .claude/*
 # Symlinks to .agents/skills so Claude Code loads the shared skills.
 !.claude/skills/
-.cursor/skills/*
-# Tracked shared skill; a directory-level ignore would block this negation.
-!.cursor/skills/capstone-trello/
+.cursor/skills/
 CONTEXT.md
 CLAUDE.local.md
 
 # IDE
 .idea/
 .obsidian/
-.vscode/*
-!.vscode/settings.json
+.vscode/
 *.swp
 *.swo
 

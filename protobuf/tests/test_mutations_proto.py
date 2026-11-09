@@ -1,7 +1,7 @@
 """
 Unit tests for fdbkafka.cdc.v1.mutations_pb2
 
-Covers every message type defined in protobuf/proto/fdbkafka/cdc/v1/mutations.proto:
+Covers every message type defined in proto/fdbkafka/cdc/v1/mutations.proto:
   - FDBVersionIndex
   - VersionEnd
   - FDBSingleKeyMutation (all MutationType enum values matching FDB's CDC enum)
@@ -464,14 +464,10 @@ class TestForwardCompatibility(unittest.TestCase):
         self.assertIn(b"\xf8\x06\x2a", reserialized)
 
 
-class TestStreamNameWireEdgeCases(unittest.TestCase):
-    """Raw-proto `stream_name` edge cases.
+class TestEmptyStreamNameValidation(unittest.TestCase):
+    """Validate behavior when stream_name is empty or edge cases."""
 
-    The wire allows any string, including "". The bridge's serializer rejects ""
-    and its deserializer tolerates it (docs/SERIALIZATION-SPEC.md §2.3, §4).
-    """
-
-    def test_empty_stream_name_round_trips_on_the_wire(self) -> None:
+    def test_empty_stream_name_is_valid_proto(self) -> None:
         record = mutations_pb2.FDBMutationRecord(stream_name="")
         data = record.SerializeToString()
         parsed = mutations_pb2.FDBMutationRecord.FromString(data)
@@ -562,11 +558,7 @@ class TestStressAndEdgeCases(unittest.TestCase):
         )
 
     def test_max_uint64_version(self) -> None:
-        """The uint64 wire field round-trips 2**64-1.
-
-        Wire range only: native FDB versions are int64, so the bridge never writes
-        and its reader rejects anything above 2**63-1 (VERSION_OUT_OF_RANGE).
-        """
+        """FDB versions are 64-bit integers — test boundary values."""
         max_u64 = 2**64 - 1
         vi = mutations_pb2.FDBVersionIndex(fdb_version=max_u64, sequence_no=2**32 - 1)
         data = vi.SerializeToString()
