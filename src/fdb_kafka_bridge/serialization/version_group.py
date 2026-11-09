@@ -60,9 +60,7 @@ def serialize_version_group(
         InputTypeError: A keyword or attribute has the wrong Python type, `mutations`
             is not iterable, or an element lacks `type`, `param1` or `param2`.
             `index` is the element's position.
-        InputValueError: A keyword or a type code is out of range, or an assigned
-            position falls outside `0..2**32-1`. The last reports
-            `field == "sequence_no"` with that position as `index`.
+        InputValueError: A keyword or a type code is out of range.
         RecordTooLargeError: One mutation alone, or the version end, does not fit
             `max_record_bytes`. A mutation is never split.
     """

@@ -41,8 +41,7 @@ def _native_error_code(exc: BaseException) -> int | None:
     )
     if fdb_err_type is not None and isinstance(exc, fdb_err_type):
         return getattr(exc, "code", None)
-    # Any other exception with an int ``code`` is treated as native (covers missing
-    # bindings and test doubles).
+    # Offline (no bindings) and in tests, duck-type on FDBError's int ``code``.
     code = getattr(exc, "code", None)
     return code if type(code) is int else None
 
@@ -148,7 +147,7 @@ def init_fdb(api_version: int = DEFAULT_CDC_API_VERSION) -> None:
             f"cannot reinitialize to {api_version}."
         )
     except RuntimeError as exc:
-        # fdb raises "not set" before first selection; the conflict error is ours.
+        # FDB raises RuntimeError if not initialized yet or if conflicting version
         if "API version is not set" in str(exc) or "not set" in str(exc):
             fdb.api_version(api_version)
         else:
@@ -187,7 +186,6 @@ class FDBClient:
 
         Raises:
             CDCNotSupportedError: If 'fdb' is unavailable or api_version is unsupported.
-            RuntimeError: If FDB was already initialized with a different API version.
         """
         if self._db is None:
             init_fdb(self.api_version)
@@ -200,11 +198,7 @@ class FDBClient:
         return self.open()
 
     def close(self) -> None:
-        """Drop the cached database handle; the next ``db`` access reopens it.
-
-        Releases no native resource: ``fdb.open`` caches one ``Database`` per
-        cluster file, and the network thread runs until process exit.
-        """
+        """Close client resources and release database handle."""
         self._db = None
 
     def __enter__(self) -> Self:

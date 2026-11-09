@@ -1,6 +1,6 @@
 """Native CDC mutations to Protobuf `FDBMutationRecord` bytes and back.
 
-Public contract: [`docs/SERIALIZATION-SPEC.md`](../../../docs/SERIALIZATION-SPEC.md).
+Public contract: [`docs/SERIALIZATION-SPEC.md`](../../docs/SERIALIZATION-SPEC.md).
 """
 
 from fdb_kafka_bridge.serialization.deserializer import deserialize_record

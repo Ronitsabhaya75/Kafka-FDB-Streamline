@@ -5,8 +5,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field, fields
 from typing import Any
 
-from fdb_kafka_bridge.cdc.listener import DEFAULT_MAX_RECORD_BYTES
-
 
 @dataclass(frozen=True, slots=True)
 class FDBConfig:
@@ -23,7 +21,7 @@ class CDCConfig:
     stream_name: str = ""
     begin_key: bytes = b""
     end_key: bytes = b""
-    max_record_bytes: int = DEFAULT_MAX_RECORD_BYTES
+    max_record_bytes: int = 1_000_000
     cursor_file: str | None = None
 
 
@@ -96,15 +94,12 @@ def from_dict(data: dict[str, Any]) -> BridgeConfig:
         Structured and typed BridgeConfig instance.
 
     Raises:
-        TypeError: If data or a section is not a dictionary, or api_version,
-            cluster_file, stream_name, begin_key/end_key, max_record_bytes,
-            cursor_file or transactional_id has an invalid type.
-        ValueError: If any section has an unknown key; stream_name, topic,
-            bootstrap_servers or transactional_id is empty or whitespace-only;
-            bootstrap_servers or topic is not a string; a key range is
-            one-sided or has begin_key >= end_key; a hex string is invalid;
-            api_version or max_record_bytes is not positive; or a pipeline
-            interval is not a positive number (wrong types included).
+        TypeError: If data or a sub-configuration section is not a dictionary,
+            or if any string or numeric setting has an invalid type.
+        ValueError: If any section has an unknown key, stream_name, topic or
+            transactional_id is empty or whitespace-only, a key range is
+            one-sided or has begin_key >= end_key, a hex string is invalid, or
+            numeric intervals are not positive.
     """
     if not isinstance(data, dict):
         raise TypeError(
@@ -153,7 +148,7 @@ def from_dict(data: dict[str, Any]) -> BridgeConfig:
     if begin_key and begin_key >= end_key:
         raise ValueError("cdc.begin_key must be less than cdc.end_key")
 
-    max_record_bytes = cdc_dict.get("max_record_bytes", DEFAULT_MAX_RECORD_BYTES)
+    max_record_bytes = cdc_dict.get("max_record_bytes", 1_000_000)
     if not isinstance(max_record_bytes, int) or isinstance(max_record_bytes, bool):
         raise TypeError("cdc.max_record_bytes must be an integer")
     if max_record_bytes < 1:

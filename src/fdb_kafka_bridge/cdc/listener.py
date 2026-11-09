@@ -10,15 +10,13 @@ from fdb_kafka_bridge.cdc.errors import (
     CDCInvalidCursorError,
 )
 from fdb_kafka_bridge.serialization import (
-    RecordTooLargeError,
     serialize_version_end,
     serialize_version_group,
 )
+from fdb_kafka_bridge.serialization.errors import RecordTooLargeError
 from fdbkafka.cdc.v1 import mutations_pb2
 
-# Below librdkafka's default message.max.bytes to leave room for the key and
-# per-message overhead; see KAFKA-PRODUCER-SPEC.md "Record size".
-DEFAULT_MAX_RECORD_BYTES: Final[int] = 999_000
+DEFAULT_MAX_RECORD_BYTES: Final[int] = 1_000_000
 DEFAULT_RESUME_TIMEOUT_SECONDS: Final[float] = 10.0
 DEFAULT_RESUME_POLL_INTERVAL_SECONDS: Final[float] = 0.05
 
@@ -139,26 +137,7 @@ class FDBMutationListener:
         self._delivery_failed = False
 
     def start(self) -> None:
-        """Register when requested, then create or safely resume the consumer.
-
-        A resume waits for a fresh read version to reach the cursor version, then
-        re-acknowledges the cursor; on any failure the partial consumer is closed.
-        No-op once started.
-
-        Raises:
-            CDCConsumerClosedError: If the listener is closed.
-            CDCInvalidRangeError: If the registration range is invalid.
-            CDCInvalidCursorError: If the cursor is malformed, or the read-version
-                wait timed out (possibly transient; resume again later).
-            CDCNotSupportedError: If the client cannot provide native CDC.
-            CDCRetryableError: If the resume re-ack failed with
-                ``server_overloaded``.
-            CDCTerminalError: If the resume re-ack failed with a terminal code.
-            CDCError: If the resume re-ack failed with a non-native exception.
-            RuntimeError: If FDB was initialized with a different API version.
-            FDBError: Raw native errors from open, registration, consumer
-                creation, or any other re-ack code.
-        """
+        """Register when requested, then create or safely resume the consumer."""
         if self._consumer is not None:
             return
         if self._is_closed:
@@ -201,10 +180,7 @@ class FDBMutationListener:
 
     @property
     def delivery_failed(self) -> bool:
-        """Whether a reply failed to serialize; sticky for this listener's life.
-
-        Recovery needs a new listener resumed from the last persisted cursor.
-        """
+        """Whether the last reply failed to serialize; only a resume clears it."""
         return self._delivery_failed
 
     @property
@@ -233,10 +209,8 @@ class FDBMutationListener:
                 "The previous CDC reply must be durably processed and acknowledged "
                 "before polling again."
             )
-        # Resolve outside the try: a lazy start() failure must keep its own class.
-        consumer = self.consumer
         try:
-            return consumer.consume().wait()
+            return self.consumer.consume().wait()
         except Exception as exc:
             if self._is_closed:
                 raise CDCConsumerClosedError("CDC consumer is closed.") from exc
@@ -250,8 +224,7 @@ class FDBMutationListener:
         Each version group produces one or more mutation batches followed by its
         ``VersionEnd``. If the reply watermark advances beyond its last group, an
         additional empty ``VersionEnd`` preserves that progress. Any non-empty
-        result requires an explicit acknowledgement before another poll. The first
-        poll starts the listener if needed and raises as :meth:`start` does.
+        result requires an explicit acknowledgement before another poll.
 
         Args:
             bridge_timestamp_ns: Optional record timestamp in Unix nanoseconds.
@@ -260,17 +233,11 @@ class FDBMutationListener:
             Ordered mutation-batch and version-end records for one native reply.
 
         Raises:
-            CDCConsumerClosedError: If the listener is closed, including when it is
-                closed while the consume is in flight.
-            CDCError: If another reply is unacknowledged, prior serialization
-                failed and the listener must be resumed, or the native consume
-                failed with a non-native exception (original as ``__cause__``).
+            CDCError: If another reply is unacknowledged, or prior serialization
+                failed and the listener must be resumed.
             CDCRetryableError: If the native consume failed with ``server_overloaded``.
             CDCTerminalError: If the native consume failed with a terminal code.
-            FDBError: Any other native consume error, re-raised unchanged.
-            SerializationError: If a native mutation or record cannot be serialized
-                (``RecordTooLargeError`` for an over-budget record); the listener
-                then rejects every later poll and ack.
+            SerializationError: If a native mutation or record cannot be serialized.
         """
         batch = self._consume_batch()
         self._delivery_failed = True
@@ -322,18 +289,11 @@ class FDBMutationListener:
     def acknowledge(self) -> None:
         """Acknowledge the last fully delivered reply after durable processing.
 
-        A failed native ack leaves the reply awaiting acknowledgement, so the
-        ack may be retried in place when the error class permits.
-
         Raises:
-            CDCError: If no reply awaits acknowledgement, serialization failed, or
-                the native ack failed with a non-native exception (original as
-                ``__cause__``).
+            CDCError: If no reply awaits acknowledgement or serialization failed.
             CDCRetryableError: If the native ack failed with ``server_overloaded``.
             CDCTerminalError: If the native ack failed with a terminal code.
-            CDCConsumerClosedError: If the listener is closed, including when it is
-                closed while the ack is in flight.
-            FDBError: Any other native ack error, re-raised unchanged.
+            CDCConsumerClosedError: If the listener is closed.
         """
         if self._is_closed:
             raise CDCConsumerClosedError("CDC consumer is closed.")
