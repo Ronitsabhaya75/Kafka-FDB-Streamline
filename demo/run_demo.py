@@ -5,9 +5,10 @@ Demonstrates the Kafka Bridge running as an autonomous streaming daemon:
 2. Initializes and launches the Kafka Bridge daemon using declarative configuration.
 3. Upstream application commits representative writes and atomic mutations.
 4. Bridge autonomously captures CDC mutations, serializes them to Protobuf,
-   delivers them to Kafka (acks=all), and advances the FDB retention watermark.
-5. Downstream consumer verifies every record against the committed workload.
-6. Gracefully terminates the Bridge daemon with queue drainage.
+   delivers them to Kafka (acks=all), and acknowledges them to FDB.
+5. Downstream consumer reads the records back from the Kafka topic.
+6. Verifies every record against the committed workload.
+7. Gracefully terminates the Bridge daemon with queue drainage.
 """
 
 from __future__ import annotations
@@ -344,7 +345,6 @@ def run_demo(bootstrap_servers: str, timeout: float, count: int) -> None:
                     "stream_name": stream_name,
                     "begin_key": prefix.hex(),
                     "end_key": strinc(prefix).hex(),
-                    "max_record_bytes": 1_000_000,
                     "cursor_file": cursor_file,
                 },
                 "kafka": {

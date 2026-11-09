@@ -39,7 +39,7 @@ from fdb_kafka_bridge.bridge.config import BridgeConfig
 from fdb_kafka_bridge.cdc.client import FDBClient
 from fdb_kafka_bridge.cdc.errors import CDCRetryableError, CDCTerminalError
 from fdb_kafka_bridge.cdc.listener import FDBMutationListener
-from fdb_kafka_bridge.kafka import MutationProducer, is_fatal_kafka_error
+from fdb_kafka_bridge.kafka import FatalCause, MutationProducer, is_fatal_kafka_error
 from fdb_kafka_bridge.serialization.errors import SerializationError
 from fdbkafka.cdc.v1 import mutations_pb2
 
@@ -95,8 +95,9 @@ class BridgePipeline:
     next :meth:`step` retries the checkpoint without polling or producing.
 
     A retriable ``commit_transaction()`` failure is retried. The transaction
-    is aborted only when the error is fatal-free and either not retriable or
-    ``txn_requires_abort()`` is true. If the retriable budget runs out, the
+    is aborted only when the error is not fatal and either carries no
+    ``KafkaError``, is not retriable, or has ``txn_requires_abort()`` true.
+    If the retriable budget runs out, the
     transaction stays open and the next :meth:`step` retries the commit.
     Closing the producer in that state aborts a commit that may still be
     finishing on the broker.
@@ -136,8 +137,9 @@ class BridgePipeline:
             flush_timeout_seconds: Maximum wait for message delivery during flush.
 
         Raises:
-            ValueError: If the partition key is empty, or a retry count is
-                less than 1, or a delay/timeout is negative or zero.
+            ValueError: If the partition key is empty, a retry count is less
+                than 1, a delay is negative, or ``flush_timeout_seconds`` is
+                not positive.
             TypeError: If a delay or timeout is not a number, or partition_key
                 is not bytes or None.
         """
@@ -182,11 +184,12 @@ class BridgePipeline:
             KafkaException: Delivery or transaction failure. FDB was not
                 acknowledged. A fatal error means the producer must be
                 replaced and the listener closed. A non-fatal transactional
-                abort aborts the transaction; close the listener and resume
-                from the last checkpoint (the transactional producer is
-                reusable). A retriable commit whose budget is exhausted leaves
-                the transaction open; call ``step`` again and do not close
-                the producer.
+                failure aborts the transaction; close the listener and resume
+                from the last checkpoint. The producer is reusable unless the
+                abort itself failed, in which case ``producer.fatal`` is true
+                and it must be replaced. A retriable commit whose budget is
+                exhausted leaves the transaction open; call ``step`` again and
+                do not close the producer.
             BufferError: The local produce queue was full. The idempotent
                 producer has been closed. A transactional batch was aborted
                 (close the listener and resume from the last checkpoint).
@@ -196,9 +199,11 @@ class BridgePipeline:
                 The producer must be replaced and the listener closed.
             CDCRetryableError: Transient FDB error. If raised during
                 ``poll_records()``, nothing was delivered. If raised after
-                Kafka delivery and checkpoint, all acknowledgement retries
-                were exhausted (call ``step`` again to retry the ack).
-            CDCTerminalError: Non-recoverable CDC error (e.g. stream removed).
+                Kafka delivery and checkpoint, all acknowledgement attempts
+                failed (call ``step`` again to retry the ack).
+            CDCTerminalError: Non-recoverable CDC error (e.g.
+                ``transaction_too_old``). Do not call ``step`` again; close
+                the listener and resume from the last checkpoint.
             CDCConsumerClosedError: The listener was closed.
             CDCError: Underlying FDB CDC error.
             SerializationError: Mutation could not be serialized into a valid
@@ -656,7 +661,11 @@ class Bridge:
         return self.metrics.batches_acked
 
     def start(self) -> None:
-        """Initialize FDB client, register CDC stream, and start listener.
+        """Open the FDB client, start the listener and build the pipeline.
+
+        The listener registers the CDC stream only when ``cdc.begin_key`` and
+        ``cdc.end_key`` are set; otherwise it consumes an existing stream.
+        With an injected listener the cursor file is not read.
 
         Raises:
             ValueError: If stream_name is empty or cursor file is corrupt or
@@ -793,9 +802,11 @@ class Bridge:
     def run(self) -> None:
         """Execute continuous streaming run loop until shutdown is requested.
 
-        Other errors are retried with backoff. When one leaves the producer
-        closed or fatal, or the listener unable to poll, the pipeline is rebuilt
-        from the last checkpoint; a failed rebuild is itself retried.
+        Errors not listed under Raises are retried with backoff. When one
+        leaves the producer closed or fatal because ``abort_transaction()``
+        failed (``FatalCause.ABORT_FAILED``), or the listener unable to poll,
+        the pipeline is rebuilt from the last checkpoint; a failed rebuild is
+        itself retried.
 
         Raises:
             RuntimeError: If called before :meth:`start`.
@@ -803,6 +814,9 @@ class Bridge:
             KafkaException: If Kafka encounters a fatal unrecoverable error.
             ValueError: If a checkpoint or cursor file is permanently invalid
                 (``SerializationError`` excepted, which triggers a rebuild).
+            Exception: Any step error once the producer is fatal with
+                ``FatalCause.KAFKA``. A rebuild would reuse the
+                ``transactional_id`` and could fence a live peer.
         """
         if (
             self._listener is None
@@ -873,12 +887,27 @@ class Bridge:
                     self.request_shutdown()
                     raise
 
+                with self._step_lock:
+                    # A librdkafka fatal may surface only via error_cb, behind a
+                    # non-fatal exception. Rebuilding would reuse the
+                    # transactional_id and could fence a live peer.
+                    kafka_fatal = (
+                        self._producer is not None
+                        and self._producer.fatal_cause is FatalCause.KAFKA
+                    )
+                    if not kafka_fatal:
+                        rebuild_pending = rebuild_pending or self._needs_rebuild(exc)
+                if kafka_fatal:
+                    logger.error(
+                        "Kafka producer is fatal; shutting down: %s", exc, exc_info=True
+                    )
+                    self.request_shutdown()
+                    raise
+
                 self.metrics.errors_retried += 1
                 logger.warning(
                     "Recoverable error in bridge loop: %s", exc, exc_info=True
                 )
-                with self._step_lock:
-                    rebuild_pending = rebuild_pending or self._needs_rebuild(exc)
 
                 self._shutdown_requested.wait(timeout=backoff)
                 backoff = min(backoff * 1.5, self.config.pipeline.backoff_max_seconds)

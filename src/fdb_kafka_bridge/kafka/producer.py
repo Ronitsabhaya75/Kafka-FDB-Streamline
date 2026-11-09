@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
+from enum import StrEnum
 from typing import Any
 
 from confluent_kafka import KafkaError, KafkaException, Message, Producer
@@ -43,8 +44,15 @@ _DEFAULT_PERFORMANCE_CONFIG: dict[str, Any] = {
     "compression.type": "lz4",
 }
 
+# librdkafka accepts these aliases of mandatory keys.
+_MANDATORY_CONFIG_ALIASES = frozenset(
+    {"request.required.acks", "max.in.flight", "delivery.timeout.ms"}
+)
+
 # Keys callers must not sneak in through extra_config.
-_FORBIDDEN_EXTRA_KEYS = frozenset(_MANDATORY_CONFIG) | {"transactional.id"}
+_FORBIDDEN_EXTRA_KEYS = (
+    frozenset(_MANDATORY_CONFIG) | _MANDATORY_CONFIG_ALIASES | {"transactional.id"}
+)
 
 
 def is_fatal_kafka_error(exc: Exception) -> bool:
@@ -67,21 +75,21 @@ def is_fatal_kafka_error(exc: Exception) -> bool:
 _is_fatal_kafka_error = is_fatal_kafka_error
 
 
-def _default_error_cb(err: KafkaError) -> None:
-    """Log asynchronous client and broker errors.
+class FatalCause(StrEnum):
+    """Why a :class:`MutationProducer` became fatal.
 
-    Per-message delivery failures are not handled here: in nontransactional
-    mode they are recorded by the delivery callback and raised by every later
-    :meth:`MutationProducer.produce` and :meth:`MutationProducer.flush`.  In
-    transactional mode, delivery failures do not block subsequent
-    :meth:`MutationProducer.produce` calls within the transaction, but are
-    raised by :meth:`MutationProducer.flush` and transaction completion.
-
-    Args:
-        err: Error reported by librdkafka.
+    Attributes:
+        KAFKA: librdkafka reported a fatal error (``error_cb`` fatal, or a fatal
+            ``KafkaException`` from a transaction method), or :meth:`mark_fatal`
+            was called.  A replacement is not expected to help (e.g. the
+            transactional id is fenced).
+        ABORT_FAILED: ``abort_transaction()`` raised an exception that is not a
+            fatal Kafka error.  The transaction state is unknown, so this
+            producer is unusable, but a replacement may succeed.
     """
-    level = logging.ERROR if err.fatal() else logging.WARNING
-    logger.log(level, "Kafka producer error: %s", err)
+
+    KAFKA = "kafka"
+    ABORT_FAILED = "abort_failed"
 
 
 class MutationProducer:
@@ -164,7 +172,7 @@ class MutationProducer:
         self._txn_initialized: bool = False
         self._txn_open: bool = False
         self._closed: bool = False
-        self._fatal: bool = False
+        self._fatal_cause: FatalCause | None = None
 
     def _error_cb(self, err: KafkaError) -> None:
         """Handle librdkafka asynchronous client and broker errors.
@@ -181,7 +189,7 @@ class MutationProducer:
             is_fatal = res is True or (isinstance(res, bool) and res)
 
         if is_fatal:
-            self._fatal = True
+            self._fatal_cause = FatalCause.KAFKA
             logger.error("Kafka producer fatal error: %s", err)
         else:
             logger.warning("Kafka producer error: %s", err)
@@ -204,8 +212,18 @@ class MutationProducer:
 
     @property
     def fatal(self) -> bool:
-        """Whether a fatal error was seen; a fatal producer must be replaced."""
-        return self._fatal
+        """Whether the producer is fatal; equals ``fatal_cause is not None``.
+
+        A fatal producer cannot be used again.  A nontransactional sticky
+        delivery error does not set this flag: callers must also replace a
+        producer that raised one.
+        """
+        return self._fatal_cause is not None
+
+    @property
+    def fatal_cause(self) -> FatalCause | None:
+        """Why the producer became fatal, or ``None`` if it has not."""
+        return self._fatal_cause
 
     def _require_transactional(self, method: str) -> None:
         """Guard for transaction methods.
@@ -216,7 +234,7 @@ class MutationProducer:
         """
         if self._closed:
             raise RuntimeError(f"{method} cannot proceed: producer is closed")
-        if self._fatal:
+        if self.fatal:
             raise RuntimeError(
                 f"{method} cannot proceed: producer is in a fatal error state"
             )
@@ -247,7 +265,7 @@ class MutationProducer:
             self._producer.init_transactions(timeout)
         except KafkaException as exc:
             if _is_fatal_kafka_error(exc):
-                self._fatal = True
+                self._fatal_cause = FatalCause.KAFKA
             raise
         self._txn_initialized = True
 
@@ -267,7 +285,7 @@ class MutationProducer:
             self._producer.begin_transaction()
         except KafkaException as exc:
             if _is_fatal_kafka_error(exc):
-                self._fatal = True
+                self._fatal_cause = FatalCause.KAFKA
             raise
         self._txn_open = True
 
@@ -295,7 +313,7 @@ class MutationProducer:
             self._producer.commit_transaction(timeout)
         except KafkaException as exc:
             if _is_fatal_kafka_error(exc):
-                self._fatal = True
+                self._fatal_cause = FatalCause.KAFKA
             raise
         self._txn_open = False
         self._delivery_errors.clear()
@@ -304,13 +322,17 @@ class MutationProducer:
         """Abort the current Kafka transaction.
 
         Clears transaction-scoped delivery errors on success.  If the abort
-        itself fails, the errors are preserved and the producer is marked fatal.
+        itself fails for any reason, the errors are preserved, the transaction
+        stays open, and the producer becomes fatal: :attr:`fatal_cause` is
+        :attr:`FatalCause.KAFKA` for a fatal Kafka error, otherwise
+        :attr:`FatalCause.ABORT_FAILED` (unless already ``KAFKA``).
 
         Args:
             timeout: Maximum seconds to wait for abort.
 
         Raises:
             KafkaException: On abort failure.
+            Exception: Any other exception raised by the underlying abort.
             RuntimeError: If the producer is closed, fatal, not transactional,
                 not initialized, or no transaction is open.
         """
@@ -319,11 +341,13 @@ class MutationProducer:
             raise RuntimeError("abort_transaction() called without an open transaction")
         try:
             self._producer.abort_transaction(timeout)
-        except KafkaException:
-            self._fatal = True
-            raise
-        except Exception:
-            self._fatal = True
+        except Exception as exc:
+            # Abort failure leaves the txn state unknown even when retriable;
+            # marking fatal is stricter than needed but never unsafe.
+            if _is_fatal_kafka_error(exc):
+                self._fatal_cause = FatalCause.KAFKA
+            elif self._fatal_cause is None:
+                self._fatal_cause = FatalCause.ABORT_FAILED
             raise
         self._txn_open = False
         self._delivery_errors.clear()
@@ -361,7 +385,7 @@ class MutationProducer:
         """
         if self._closed:
             raise RuntimeError("Producer is closed")
-        if self._fatal:
+        if self.fatal:
             raise RuntimeError("Producer is in a fatal error state")
         if self._transactional and not self._txn_open:
             raise RuntimeError(
@@ -404,7 +428,7 @@ class MutationProducer:
         """
         if self._closed:
             raise RuntimeError("Producer is closed")
-        if self._fatal:
+        if self.fatal:
             raise RuntimeError("Producer is in a fatal error state")
         remaining = self._producer.flush(timeout)
         if self._delivery_errors:
@@ -439,9 +463,9 @@ class MutationProducer:
 
         After this call, all operations except :meth:`close` will raise
         ``RuntimeError``.  The caller should discard this producer and create
-        a new one.
+        a new one.  Sets :attr:`fatal_cause` to :attr:`FatalCause.KAFKA`.
         """
-        self._fatal = True
+        self._fatal_cause = FatalCause.KAFKA
 
     def close(self, timeout: float = 10.0) -> None:
         """Flush remaining messages and release the underlying producer.
@@ -508,7 +532,7 @@ class MutationProducer:
         """
         if self._closed:
             raise RuntimeError("Producer is closed")
-        if self._fatal:
+        if self.fatal:
             raise RuntimeError("Producer is in a fatal error state")
         return len(self._producer)
 
