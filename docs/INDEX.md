@@ -19,6 +19,7 @@ Map of the project's docs. Check here before reading docs wholesale, then open o
 |-----|--------|-------------|
 | [`conventions.md`](conventions.md) | Normative | Repo layout, branching, specs, code style, local setup (incl. Trello MCP), PRs, CI checks. |
 | [PR review skill](../.agents/skills/review-streamline-pr/SKILL.md) | Normative | Agent workflow for reviewing a PR and drafting source-linked feedback. |
+| [Doc sync skill](../.agents/skills/doc-sync/SKILL.md) | Normative | Agent workflow for syncing specs with a branch diff before a PR: owning-spec updates, new specs, code/spec contradictions. |
 | [`../demo/README.md`](../demo/README.md) | Normative | Running the live 10,000-mutation FDB → Kafka demo. |
 | [`../Proposal.md`](../Proposal.md) | Historical | Sponsor proposal: scope, goals, original architecture; its as-built banner lists what changed. |
 

@@ -23,6 +23,8 @@ ENV/
 .mcp.json
 .cursor/mcp.json
 .claude/*
+# Symlinks to .agents/skills so Claude Code loads the shared skills.
+!.claude/skills/
 .cursor/skills/*
 # Tracked shared skill; a directory-level ignore would block this negation.
 !.cursor/skills/capstone-trello/
