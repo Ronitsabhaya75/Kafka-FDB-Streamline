@@ -6,7 +6,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from confluent_kafka import KafkaError, KafkaException
 
-from fdb_kafka_bridge.kafka.producer import MutationProducer
+from fdb_kafka_bridge.kafka.producer import FatalCause, MutationProducer
 from fdbkafka.cdc.v1 import mutations_pb2
 
 
@@ -463,7 +463,8 @@ def test_failed_abort_preserves_errors_and_marks_fatal(
     with pytest.raises(KafkaException):
         producer.abort_transaction()
     assert len(producer._delivery_errors) == 1
-    assert producer._fatal is True
+    assert producer.fatal is True
+    assert producer._txn_open is True
 
 
 def test_produce_abort_then_clean_flush(producer_class: MagicMock) -> None:
@@ -517,15 +518,6 @@ def test_fatal_blocks_transaction_methods(
         producer.begin_transaction()
 
 
-def test_error_cb_fatal_marks_producer_fatal(producer_class: MagicMock) -> None:
-    producer = MutationProducer("broker:9092")
-    err = MagicMock(spec=KafkaError)
-    err.fatal.return_value = True
-
-    producer._error_cb(err)
-    assert producer._fatal is True
-
-
 def test_error_cb_non_fatal_does_not_mark_fatal(
     producer_class: MagicMock,
 ) -> None:
@@ -534,7 +526,7 @@ def test_error_cb_non_fatal_does_not_mark_fatal(
     err.fatal.return_value = False
 
     producer._error_cb(err)
-    assert producer._fatal is False
+    assert producer.fatal is False
 
 
 def test_user_error_cb_is_chained(producer_class: MagicMock) -> None:
@@ -546,7 +538,7 @@ def test_user_error_cb_is_chained(producer_class: MagicMock) -> None:
     producer._error_cb(err)
 
     user_cb.assert_called_once_with(err)
-    assert producer._fatal is True
+    assert producer.fatal is True
 
 
 def test_user_error_cb_exception_is_swallowed(
@@ -559,24 +551,6 @@ def test_user_error_cb_exception_is_swallowed(
 
     producer._error_cb(err)
     user_cb.assert_called_once_with(err)
-
-
-def test_commit_fatal_kafka_error_marks_producer_fatal(
-    producer_class: MagicMock,
-) -> None:
-    kafka_client = producer_class.return_value
-    err = MagicMock(spec=KafkaError)
-    err.fatal.return_value = True
-    kafka_client.commit_transaction.side_effect = KafkaException(err)
-
-    producer = MutationProducer("broker:9092", transactional_id="txn-1")
-    producer.init_transactions()
-    producer.begin_transaction()
-
-    with pytest.raises(KafkaException):
-        producer.commit_transaction()
-
-    assert producer._fatal is True
 
 
 def test_use_after_close_raises_closed_error(producer_class: MagicMock) -> None:
@@ -638,7 +612,7 @@ def test_close_marks_closed(producer_class: MagicMock) -> None:
     producer = MutationProducer("broker:9092")
     producer.close()
     assert producer._closed is True
-    assert producer._fatal is False
+    assert producer.fatal is False
 
 
 def test_close_aborts_open_transaction(producer_class: MagicMock) -> None:
@@ -682,3 +656,187 @@ def test_close_logs_warning_when_flush_raises(
 
     assert "3 message(s) could not be delivered during close" in caplog.text
     assert producer._closed is True
+
+
+def _fatal_kafka_exception() -> KafkaException:
+    err = MagicMock(spec=KafkaError)
+    err.fatal.return_value = True
+    return KafkaException(err)
+
+
+def _non_fatal_kafka_exception() -> KafkaException:
+    err = MagicMock(spec=KafkaError)
+    err.fatal.return_value = False
+    return KafkaException(err)
+
+
+def _open_txn_producer() -> MutationProducer:
+    producer = MutationProducer("broker:9092", transactional_id="txn-1")
+    producer.init_transactions()
+    producer.begin_transaction()
+    return producer
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("request.required.acks", 1),
+        ("delivery.timeout.ms", 1000),
+        ("max.in.flight", 100),
+    ],
+)
+def test_librdkafka_alias_keys_rejected_in_extra_config(
+    producer_class: MagicMock, key: str, value: int
+) -> None:
+    with pytest.raises(ValueError, match=key):
+        MutationProducer("broker:9092", extra_config={key: value})
+
+
+def test_fatal_cause_none_initially(producer_class: MagicMock) -> None:
+    producer = MutationProducer("broker:9092")
+    assert producer.fatal_cause is None
+    assert producer.fatal is False
+
+
+def test_fatal_cause_exported_from_package() -> None:
+    import fdb_kafka_bridge.kafka as kafka_pkg
+
+    assert kafka_pkg.FatalCause is FatalCause
+    assert "FatalCause" in kafka_pkg.__all__
+
+
+def test_fatal_cause_values() -> None:
+    assert FatalCause.KAFKA == "kafka"
+    assert FatalCause.ABORT_FAILED == "abort_failed"
+
+
+def test_error_cb_fatal_sets_kafka_cause(producer_class: MagicMock) -> None:
+    producer = MutationProducer("broker:9092")
+    err = MagicMock(spec=KafkaError)
+    err.fatal.return_value = True
+
+    producer._error_cb(err)
+
+    assert producer.fatal_cause is FatalCause.KAFKA
+    assert producer.fatal is True
+
+
+def test_mark_fatal_sets_kafka_cause(producer_class: MagicMock) -> None:
+    producer = MutationProducer("broker:9092")
+    producer.mark_fatal()
+    assert producer.fatal_cause is FatalCause.KAFKA
+
+
+def test_init_fatal_kafka_error_sets_kafka_cause(producer_class: MagicMock) -> None:
+    producer_class.return_value.init_transactions.side_effect = _fatal_kafka_exception()
+    producer = MutationProducer("broker:9092", transactional_id="txn-1")
+
+    with pytest.raises(KafkaException):
+        producer.init_transactions()
+
+    assert producer.fatal_cause is FatalCause.KAFKA
+
+
+def test_begin_fatal_kafka_error_sets_kafka_cause(producer_class: MagicMock) -> None:
+    producer_class.return_value.begin_transaction.side_effect = _fatal_kafka_exception()
+    producer = MutationProducer("broker:9092", transactional_id="txn-1")
+    producer.init_transactions()
+
+    with pytest.raises(KafkaException):
+        producer.begin_transaction()
+
+    assert producer.fatal_cause is FatalCause.KAFKA
+
+
+def test_commit_fatal_kafka_error_sets_kafka_cause(producer_class: MagicMock) -> None:
+    producer_class.return_value.commit_transaction.side_effect = (
+        _fatal_kafka_exception()
+    )
+    producer = _open_txn_producer()
+
+    with pytest.raises(KafkaException):
+        producer.commit_transaction()
+
+    assert producer.fatal_cause is FatalCause.KAFKA
+
+
+def test_abort_fatal_kafka_error_sets_kafka_cause(producer_class: MagicMock) -> None:
+    producer_class.return_value.abort_transaction.side_effect = _fatal_kafka_exception()
+    producer = _open_txn_producer()
+
+    with pytest.raises(KafkaException):
+        producer.abort_transaction()
+
+    assert producer.fatal_cause is FatalCause.KAFKA
+
+
+def test_abort_non_fatal_kafka_error_sets_abort_failed_cause(
+    producer_class: MagicMock,
+) -> None:
+    producer_class.return_value.abort_transaction.side_effect = (
+        _non_fatal_kafka_exception()
+    )
+    producer = _open_txn_producer()
+
+    with pytest.raises(KafkaException):
+        producer.abort_transaction()
+
+    assert producer.fatal_cause is FatalCause.ABORT_FAILED
+    assert producer.fatal is True
+
+
+def test_abort_non_kafka_exception_sets_abort_failed_cause(
+    producer_class: MagicMock,
+) -> None:
+    producer_class.return_value.abort_transaction.side_effect = OSError("boom")
+    producer = _open_txn_producer()
+
+    with pytest.raises(OSError, match="boom"):
+        producer.abort_transaction()
+
+    assert producer.fatal_cause is FatalCause.ABORT_FAILED
+    assert producer._txn_open is True
+
+
+def test_kafka_cause_overrides_abort_failed(producer_class: MagicMock) -> None:
+    producer_class.return_value.abort_transaction.side_effect = (
+        _non_fatal_kafka_exception()
+    )
+    producer = _open_txn_producer()
+    with pytest.raises(KafkaException):
+        producer.abort_transaction()
+    err = MagicMock(spec=KafkaError)
+    err.fatal.return_value = True
+
+    producer._error_cb(err)
+
+    assert producer.fatal_cause is FatalCause.KAFKA
+
+
+def test_mark_fatal_overrides_abort_failed(producer_class: MagicMock) -> None:
+    producer_class.return_value.abort_transaction.side_effect = OSError("boom")
+    producer = _open_txn_producer()
+    with pytest.raises(OSError):
+        producer.abort_transaction()
+
+    producer.mark_fatal()
+
+    assert producer.fatal_cause is FatalCause.KAFKA
+
+
+def test_abort_failed_never_downgrades_kafka(producer_class: MagicMock) -> None:
+    producer = _open_txn_producer()
+    err = MagicMock(spec=KafkaError)
+    err.fatal.return_value = True
+
+    # librdkafka can report a fatal error_cb while abort is in progress.
+    def abort(timeout: float) -> None:
+        producer._error_cb(err)
+        raise OSError("boom")
+
+    producer_class.return_value.abort_transaction.side_effect = abort
+
+    with pytest.raises(OSError):
+        producer.abort_transaction()
+
+    assert producer.fatal_cause is FatalCause.KAFKA
