@@ -104,7 +104,6 @@ class TestIdempotentPath:
         checkpoint.assert_called_once_with(cursor)
         listener.acknowledge.assert_called_once()
 
-    # Pins INV-BRIDGE-1.
     def test_delivery_order(self) -> None:
         pipeline, producer, listener, checkpoint, _cursor = _make_pipeline(
             records=[_make_record()]
@@ -135,7 +134,6 @@ class TestIdempotentPath:
         checkpoint.assert_not_called()
         listener.acknowledge.assert_not_called()
 
-    # Pins INV-BRIDGE-15.
     def test_flush_exception_closes_producer_and_skips_ack(self) -> None:
         pipeline, producer, listener, checkpoint, _cursor = _make_pipeline(
             records=[_make_record()]
@@ -186,7 +184,6 @@ class TestIdempotentPath:
 
 
 class TestTransactionalPath:
-    # Pins INV-BRIDGE-1.
     def test_wraps_in_transaction_then_checkpoints(self) -> None:
         pipeline, producer, listener, checkpoint, _cursor = _make_pipeline(
             transactional=True, records=[_make_record()]
@@ -212,7 +209,6 @@ class TestTransactionalPath:
         ]
         producer.flush_or_raise.assert_not_called()
 
-    # Pins INV-BRIDGE-15.
     def test_abortable_error_aborts_no_ack(self) -> None:
         pipeline, producer, listener, _checkpoint, _cursor = _make_pipeline(
             transactional=True, records=[_make_record()]
@@ -227,7 +223,6 @@ class TestTransactionalPath:
         producer.abort_transaction.assert_called_once()
         listener.acknowledge.assert_not_called()
 
-    # Pins INV-BRIDGE-4.
     def test_retriable_commit_is_retried_then_succeeds(self) -> None:
         pipeline, producer, listener, _checkpoint, _cursor = _make_pipeline(
             transactional=True, records=[_make_record()]
@@ -284,7 +279,6 @@ class TestTransactionalPath:
         producer.abort_transaction.assert_called_once()
         listener.acknowledge.assert_not_called()
 
-    # Pins INV-BRIDGE-2, INV-BRIDGE-4.
     def test_exhausted_retriable_commit_retries_on_next_step(self) -> None:
         pipeline, producer, listener, _checkpoint, _cursor = _make_pipeline(
             transactional=True,
@@ -312,7 +306,6 @@ class TestTransactionalPath:
         assert producer.commit_transaction.call_count == 3
         listener.acknowledge.assert_called_once()
 
-    # Pins INV-BRIDGE-7.
     def test_fatal_error_propagates_and_marks_fatal(self) -> None:
         pipeline, producer, listener, _checkpoint, _cursor = _make_pipeline(
             transactional=True, records=[_make_record()]
@@ -328,7 +321,6 @@ class TestTransactionalPath:
         producer.abort_transaction.assert_not_called()
         listener.acknowledge.assert_not_called()
 
-    # Pins INV-BRIDGE-7.
     def test_fatal_produce_does_not_abort(self) -> None:
         pipeline, producer, listener, _checkpoint, _cursor = _make_pipeline(
             transactional=True, records=[_make_record()]
@@ -399,7 +391,6 @@ class TestTransactionalPath:
 
 class TestCheckpoint:
     @pytest.mark.parametrize("transactional", [False, True])
-    # Pins INV-BRIDGE-1.
     def test_checkpoint_failure_skips_ack_and_retries_without_republish(
         self, transactional: bool
     ) -> None:
@@ -435,7 +426,6 @@ class TestAckRetry:
         assert pipeline.step() == 1
         assert listener.acknowledge.call_count == 2
 
-    # Pins INV-BRIDGE-2, INV-BRIDGE-3.
     def test_retry_budget_exhausted_then_step_retries_ack_only(self) -> None:
         pipeline, producer, listener, checkpoint, _cursor = _make_pipeline(
             records=[_make_record()], ack_retries=2
@@ -460,7 +450,6 @@ class TestAckRetry:
         assert checkpoint.call_count == 1
         assert listener.acknowledge.call_count == 3
 
-    # Pins INV-BRIDGE-17.
     def test_terminal_ack_error_propagates_without_retry(self) -> None:
         pipeline, producer, listener, checkpoint, cursor = _make_pipeline(
             records=[_make_record()], ack_retries=3
@@ -548,7 +537,6 @@ class TestAckRetry:
 
 
 class TestPartitionKey:
-    # Pins INV-BRIDGE-10.
     def test_stable_key_for_stream(self) -> None:
         pipeline, producer, _listener, _checkpoint, _cursor = _make_pipeline(
             records=[_make_record(), _make_record()],
@@ -582,7 +570,6 @@ class TestPartitionKey:
 
         assert producer.produce.call_args.kwargs["key"] == b"orders"
 
-    # Pins INV-BRIDGE-10.
     def test_empty_key_rejected(self) -> None:
         with pytest.raises(ValueError, match="partition_key"):
             _make_pipeline(partition_key=b"")

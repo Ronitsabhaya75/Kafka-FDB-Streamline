@@ -173,7 +173,6 @@ def test_wire_type_code_outside_uint8_is_type_code_out_of_range(code: int) -> No
     assert excinfo.value.index is None
 
 
-# Pins INV-SER-16.
 def test_version_index_beyond_int64_is_version_out_of_range() -> None:
     data = mutations_pb2.FDBMutationRecord(
         mutation=wire_set(2**63, 0)
@@ -335,7 +334,6 @@ def test_non_canonical_clear_normalises_to_the_canonical_mutation() -> None:
         ),
     ],
 )
-# Pins INV-SER-9.
 def test_envelope_is_returned_as_found_and_never_raises(
     envelope: dict[str, Any], stream_name: str, bridge_timestamp_ns: int | None
 ) -> None:
@@ -378,7 +376,6 @@ def test_version_end_inner_timestamp_is_read_independently() -> None:
         ),
     ],
 )
-# Pins INV-SER-9.
 def test_version_end_inner_timestamp_is_returned_as_found_and_never_raises(
     inner: dict[str, Any], bridge_timestamp_ns: int | None
 ) -> None:
@@ -432,7 +429,6 @@ def test_arbitrary_bytes_give_a_record_or_a_record_decode_error(data: bytes) -> 
     assert isinstance(record, Record)
 
 
-# Pins INV-SER-16.
 def test_version_end_beyond_int64_is_version_out_of_range() -> None:
     data = mutations_pb2.FDBMutationRecord(
         version_end=mutations_pb2.VersionEnd(fdb_version=2**63, total_mutations=1)
@@ -496,7 +492,6 @@ def secret_single(
         ),
     ],
 )
-# Pins INV-SER-12.
 def test_decode_error_message_never_contains_key_value_or_stream_content(
     data: bytes,
 ) -> None:
@@ -546,7 +541,6 @@ def test_decode_error_message_never_contains_key_value_or_stream_content(
         ),
     ],
 )
-# Pins INV-SER-8.
 def test_decode_checks_run_in_their_documented_order(
     data: bytes, reason: DecodeFailure, index: int | None
 ) -> None:

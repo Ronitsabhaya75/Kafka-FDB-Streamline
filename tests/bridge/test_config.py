@@ -12,7 +12,6 @@ from fdb_kafka_bridge.bridge.config import (
     PipelineConfig,
     from_dict,
 )
-from fdb_kafka_bridge.cdc.listener import DEFAULT_MAX_RECORD_BYTES
 
 _CDC = {"stream_name": "s"}
 
@@ -25,7 +24,7 @@ def test_default_config() -> None:
     assert cfg.cdc.stream_name == ""
     assert cfg.cdc.begin_key == b""
     assert cfg.cdc.end_key == b""
-    assert cfg.cdc.max_record_bytes == DEFAULT_MAX_RECORD_BYTES
+    assert cfg.cdc.max_record_bytes == 1_000_000
     assert cfg.cdc.cursor_file is None
     assert cfg.kafka.bootstrap_servers == "localhost:9092"
     assert cfg.kafka.topic == "fdb-cdc"

@@ -27,6 +27,8 @@ Import from `fdb_kafka_bridge.serialization`; everything in its `__all__` is con
 in `_`-modules. Runtime dependency: `protobuf>=7.34,<8` (the committed gencode is 6.30.2,
 which protobuf 8 will not load); generated code is imported as
 `from fdbkafka.cdc.v1 import mutations_pb2` (installed with the wheel; from a checkout, `protobuf/gen` on the path).
+The `buf.gen.yaml` plugins (`v30.2`) produce that gencode, and the `requirements-dev.txt`
+protobuf pin must sit in the runtime range.
 
 ### 2.1 Input
 
@@ -35,7 +37,9 @@ Upstream `CdcMutation` conforms. Attributes are read by name, once each; the obj
 indexed or unpacked, so a bare tuple is rejected.
 
 `MutationType` is an `IntEnum` of the 16 declared type codes (mirrors upstream
-`CdcMutationType`). It is a convenience for callers; neither path looks a type code up in it.
+`CdcMutationType`; names, minus `MUTATION_TYPE_`, and values match the proto
+`FDBSingleKeyMutation.MutationType`). It is a convenience for callers; neither path looks a
+type code up in it.
 
 Ranges (inclusive; the limits are not exported):
 
@@ -72,12 +76,13 @@ serialize_version_group(mutations, *, fdb_version, max_record_bytes, stream_name
   (fdb_version, n-1)` in order, then exactly one version end with `total_mutations == n`. An
   empty group returns only the version end. *Caller precondition:* `mutations` is the whole
   group.
-  - `max_record_bytes` bounds `len()` of each returned value only; Kafka key, headers and
-    framing are the caller's to subtract.
+  - `max_record_bytes` bounds `len()` of each returned value only, inclusively; Kafka key,
+    headers and framing are the caller's to subtract.
   - Slicing is greedy in native order; each batch record is byte-identical to
     `serialize_batch` of its slice.
   - A mutation is never split. If one mutation's one-element batch record, or the version-end
-    record, exceeds the budget → `RecordTooLargeError`.
+    record, exceeds the budget → `RecordTooLargeError`. If both do, the mutation's error
+    (`index = i`) is raised.
   - Returns a list, so an invalid mutation anywhere raises before any record is produced.
 
 The primitives have no size cap. Sizing: FDB caps keys at 10,000 B and values at 100,000 B, so
@@ -142,8 +147,9 @@ surfaces as `VersionEnd.bridge_timestamp_ns`. Unknown fields are ignored. An abs
 - The type code alone accepts `IntEnum` (upstream `CdcMutationType`), normalized to plain `int`.
 - Not checked: FDB key/value size limits, system keys, empty keys/values, clear-range order,
   operand widths, legacy/undeclared type codes. All are forwarded as-is.
-- Keyword checks run before `mutations` is iterated, so a bad keyword leaves a generator
-  unconsumed.
+- Keyword checks run in signature order before `mutations` is iterated, so a bad keyword
+  leaves a generator unconsumed. The position assigned to batch element `i` is checked before
+  element `i` is read.
 
 ## 5. Errors
 
@@ -179,6 +185,10 @@ SerializationError(Exception)
 | `EMPTY_BATCH` | `batch` arm with no mutations |
 | `INCONSISTENT_BATCH` | mixed `fdb_version`, or `sequence_no[i] != sequence_no[0] + i`; `index` = first offender |
 
+Checks run in a fixed order: per mutation, `version_index` presence → version range →
+mutation arm → type range. In a batch, any element's own fault outranks `INCONSISTENT_BATCH`,
+even when it sits after the first inconsistent position.
+
 Arms that are present but all-default (e.g. empty `version_end` → `VersionEnd(0, 0, None)`) are
 accepted: presence is checked, not content.
 
@@ -203,82 +213,3 @@ across calls, and `deserialize_record` checks one record at a time.
 - Identity is the version index. Never dedup on bytes or on either bridge timestamp; a
   redelivered group gets new timestamps. The record value names its stream only by
   `stream_name`, so any stronger stream identity must travel outside it.
-
-## Invariants
-
-Symbols are relative to `fdb_kafka_bridge.serialization`.
-
-- <a id="inv-ser-1"></a>**INV-SER-1.** Type code 1 is always written as `clear_range`, never into
-  `single_key_mutation`. Enforced by: `_wire.mutation_message`. Pinned by:
-  `tests/serialization/test_serialize.py::test_clear_range_lands_in_clear_range_arm`.
-- <a id="inv-ser-2"></a>**INV-SER-2.** A `param1` / `param2` that is not `bytes` (incl. `None`)
-  never reaches protobuf, which would silently write `None` as `b""`. Enforced by:
-  `_checks.param`. Pinned by:
-  `tests/serialization/test_serialize.py::test_param_that_is_not_bytes_is_a_type_error`.
-- <a id="inv-ser-3"></a>**INV-SER-3.** A `bool` type code is rejected, so `True` never becomes a
-  silent `CLEAR_RANGE`. Enforced by: `_checks.type_code`. Pinned by:
-  `tests/serialization/test_serialize.py::test_type_code_that_is_not_an_int_is_a_type_error`.
-- <a id="inv-ser-4"></a>**INV-SER-4.** The position assigned to batch element `i` is checked to fit
-  `uint32` before element `i` is read. Enforced by: `_checks.natives`. Pinned by:
-  `tests/serialization/test_serialize.py::test_assigned_position_is_checked_before_the_element_is_read`.
-- <a id="inv-ser-5"></a>**INV-SER-5.** Record sizes in `serialize_version_group` are computed
-  arithmetically and equal the real `len()` of the bytes returned; the budget is inclusive and
-  each slice is greedy. Enforced by: `version_group.serialize_version_group`. Pinned by:
-  `tests/serialization/test_version_group.py::test_budget_boundary_is_inclusive`,
-  `tests/serialization/test_version_group.py::test_no_slice_could_have_taken_the_next_mutation`.
-- <a id="inv-ser-6"></a>**INV-SER-6.** `serialize_version_group` is all-or-nothing: an invalid
-  mutation anywhere raises before any record is returned. Enforced by:
-  `version_group.serialize_version_group`. Pinned by:
-  `tests/serialization/test_version_group.py::test_invalid_mutation_late_in_the_group_raises_and_returns_nothing`.
-- <a id="inv-ser-7"></a>**INV-SER-7.** When a mutation and the version end both exceed the budget,
-  the mutation's `RecordTooLargeError` (`index = i`) is raised, not the version end's. Enforced
-  by: `version_group.serialize_version_group`. Pinned by:
-  `tests/serialization/test_version_group.py::test_oversized_mutation_wins_over_an_oversized_version_end`.
-- <a id="inv-ser-8"></a>**INV-SER-8.** Decode checks run in a fixed order: per mutation,
-  `version_index` presence → version range → mutation arm → type range; in a batch, any
-  element's own fault outranks `INCONSISTENT_BATCH`, even when it sits after the first
-  inconsistent position. Enforced by: `deserializer._mutation`, `deserializer._batch`. Pinned by:
-  `tests/serialization/test_deserialize.py::test_decode_checks_run_in_their_documented_order`.
-- <a id="inv-ser-9"></a>**INV-SER-9.** Reads never range-check timestamps; neither bridge
-  timestamp can fail a read. Enforced by: `deserializer._bridge_timestamp_ns`. Pinned by:
-  `tests/serialization/test_deserialize.py::test_envelope_is_returned_as_found_and_never_raises`,
-  `tests/serialization/test_deserialize.py::test_version_end_inner_timestamp_is_returned_as_found_and_never_raises`.
-- <a id="inv-ser-10"></a>**INV-SER-10.** `MutationType` has exactly the names (minus
-  `MUTATION_TYPE_`) and values of the proto `FDBSingleKeyMutation.MutationType`. Enforced by:
-  `model.MutationType`. Pinned by:
-  `tests/serialization/test_serialize.py::test_mutation_type_mirrors_the_declared_type_codes`.
-- <a id="inv-ser-11"></a>**INV-SER-11.** Protobuf versions agree: the `buf.gen.yaml` plugins
-  (`v30.2`) produce the committed gencode (`6.30.2`), which the runtime range
-  `protobuf>=7.34,<8` in `pyproject.toml` loads, and the `requirements-dev.txt` pin sits in that
-  range. Enforced by: the `pyproject.toml` dependency and the gencode's
-  `ValidateProtobufRuntimeVersion` call. Pinned
-  by: `tests/serialization/test_environment.py::test_runtime_version_in_supported_range`,
-  `tests/serialization/test_environment.py::test_protobuf_version_pins_agree`.
-- <a id="inv-ser-12"></a>**INV-SER-12.** Error messages, on both paths, never contain key, value
-  or stream-name content. Enforced by: `_checks`, `deserializer`. Pinned by:
-  `tests/serialization/test_serialize.py::test_error_message_never_contains_key_content`,
-  `tests/serialization/test_serialize.py::test_error_message_never_contains_name_or_param_content`,
-  `tests/serialization/test_deserialize.py::test_decode_error_message_never_contains_key_value_or_stream_content`.
-- <a id="inv-ser-13"></a>**INV-SER-13.** Keyword checks run in signature order before `mutations`
-  is iterated. Enforced by: `serializer.serialize_batch`,
-  `version_group.serialize_version_group`. Pinned by:
-  `tests/serialization/test_serialize.py::test_invalid_scalar_leaves_the_generator_unconsumed`,
-  `tests/serialization/test_version_group.py::test_scalars_are_checked_in_signature_order_before_mutations_are_touched`.
-- <a id="inv-ser-14"></a>**INV-SER-14.** Serialization is pure: equal arguments give equal bytes.
-  Enforced by: `serializer`, `version_group`. Pinned by:
-  `tests/serialization/test_serialize.py::test_equal_arguments_give_equal_bytes`,
-  `tests/serialization/test_version_group.py::test_equal_arguments_give_equal_records_and_a_generator_works`.
-- <a id="inv-ser-15"></a>**INV-SER-15.** `version_index` and `bridge_timestamp` are always present
-  on the wire, including `(0, 0)` and `0`. Enforced by: `_wire.mutation_message`,
-  `_wire.record`, `serializer.serialize_version_end`. Pinned by:
-  `tests/serialization/test_serialize.py::test_zero_version_index_is_present_on_the_wire`,
-  `tests/serialization/test_serialize.py::test_zero_bridge_timestamp_is_present_on_the_wire`.
-- <a id="inv-ser-16"></a>**INV-SER-16.** No returned value carries a version above `2**63-1`, in a
-  version index or a version end. Enforced by: `deserializer._check_version`. Pinned by:
-  `tests/serialization/test_deserialize.py::test_version_index_beyond_int64_is_version_out_of_range`,
-  `tests/serialization/test_deserialize.py::test_version_end_beyond_int64_is_version_out_of_range`.
-- <a id="inv-ser-17"></a>**INV-SER-17.** `serialize_version_group` returns batch records covering
-  `(V, 0) … (V, n-1)` in order, then exactly one `VersionEnd(V, n)`; an empty group returns only
-  the version end. Enforced by: `version_group.serialize_version_group`. Pinned by:
-  `tests/serialization/test_version_group.py::test_any_group_survives_slicing_under_any_sufficient_budget`,
-  `tests/serialization/test_version_group.py::test_empty_group_is_exactly_the_version_end`.

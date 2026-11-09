@@ -120,7 +120,6 @@ def test_pipeline_execution_order(tmp_path: Path) -> None:
     assert os.path.exists(cursor_file)
 
 
-# Pins INV-BRIDGE-12.
 def test_checkpoint_persistence_failure_blocks_ack(tmp_path: Path) -> None:
     """Verify that a checkpoint failure raises and prevents FDB acknowledgement."""
     mock_listener = create_autospec(FDBMutationListener, instance=True)
@@ -287,7 +286,6 @@ def test_bridge_lifecycle_and_metrics() -> None:
     mock_client.close.assert_called_once()
 
 
-# Pins INV-BRIDGE-17.
 def test_bridge_terminates_on_cdc_terminal_error() -> None:
     """Verify Bridge terminates immediately and re-raises on CDCTerminalError."""
     cfg = from_dict(
@@ -467,7 +465,6 @@ def test_run_retries_retryable_cdc_error() -> None:
     assert bridge.mutations_published == 3
 
 
-# Pins INV-BRIDGE-9.
 def test_run_reraises_fatal_kafka_error() -> None:
     """A fatal Kafka error escapes run() and requests shutdown, no rebuild."""
     bridge, listener, producer = _recovery_bridge()
@@ -570,7 +567,6 @@ def test_run_rebuilds_after_transaction_abort() -> None:
     assert bridge.batches_acked == 1
 
 
-# Pins INV-BRIDGE-16.
 def test_run_retries_failed_rebuild_until_it_succeeds() -> None:
     """A rebuild failure backs off and retries; run() never exits silently."""
     bridge, listener, _ = _recovery_bridge()
@@ -626,7 +622,6 @@ def test_run_propagates_permanent_checkpoint_error(tmp_path: Path) -> None:
     assert bridge._shutdown_requested.is_set()
 
 
-# Pins INV-BRIDGE-10.
 def test_bridge_keys_records_by_configured_stream_name() -> None:
     """Bridge keys by cdc.stream_name, not by whatever the listener reports."""
     bridge, listener, producer = _recovery_bridge()
@@ -643,7 +638,6 @@ def test_bridge_keys_records_by_configured_stream_name() -> None:
     assert keys == {b"test_stream"}
 
 
-# Pins INV-BRIDGE-13.
 def test_run_shuts_down_on_foreign_cursor_file_during_rebuild() -> None:
     """A cursor file rejected on rebuild is permanent: run() raises, no retry."""
     bridge, listener, _ = _recovery_bridge()

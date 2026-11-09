@@ -46,7 +46,6 @@ def test_group_within_budget_is_one_batch_then_the_version_end() -> None:
     ]
 
 
-# Pins INV-SER-17.
 def test_empty_group_is_exactly_the_version_end() -> None:
     records = serialize_version_group([], fdb_version=V, max_record_bytes=1_000, **ENV)
 
@@ -103,7 +102,6 @@ VARIED = [doubles.NativeMutation(0, bytes([i]), bytes(7 * i)) for i in range(12)
 
 
 @pytest.mark.parametrize("budget", range(130, 400, 9))
-# Pins INV-SER-5.
 def test_no_slice_could_have_taken_the_next_mutation(budget: int) -> None:
     records = serialize_version_group(
         VARIED, fdb_version=V, max_record_bytes=budget, **ENV
@@ -119,7 +117,6 @@ def test_no_slice_could_have_taken_the_next_mutation(budget: int) -> None:
 
 
 @pytest.mark.parametrize("group", [TEN, VARIED], ids=["ten", "varied"])
-# Pins INV-SER-5.
 def test_budget_boundary_is_inclusive(group: list[doubles.NativeMutation]) -> None:
     exact = len(serialize_batch(group, fdb_version=V, **ENV))
 
@@ -132,7 +129,6 @@ def test_budget_boundary_is_inclusive(group: list[doubles.NativeMutation]) -> No
     assert len(one_less) == 3
 
 
-# Pins INV-SER-14.
 def test_equal_arguments_give_equal_records_and_a_generator_works() -> None:
     first = serialize_version_group(
         tuple(TEN), fdb_version=V, max_record_bytes=150, **ENV
@@ -228,7 +224,6 @@ def test_budget_below_the_version_end_raises_record_too_large() -> None:
     assert excinfo.value.max_record_bytes == 1
 
 
-# Pins INV-SER-7.
 def test_oversized_mutation_wins_over_an_oversized_version_end() -> None:
     with pytest.raises(RecordTooLargeError) as excinfo:
         serialize_version_group([SET, ADD], fdb_version=V, max_record_bytes=1, **ENV)
@@ -340,7 +335,6 @@ def test_non_iterable_mutations_is_a_type_error(mutations: Any) -> None:
     assert excinfo.value.index is None
 
 
-# Pins INV-SER-6.
 def test_invalid_mutation_late_in_the_group_raises_and_returns_nothing() -> None:
     group: list[Any] = [SET] * 100
     group[90] = doubles.NativeMutation(0, b"k", None)  # type: ignore[arg-type]  # bad type on purpose
@@ -370,7 +364,6 @@ def test_invalid_mutation_late_in_the_group_raises_and_returns_nothing() -> None
         ),
     ],
 )
-# Pins INV-SER-13.
 def test_scalars_are_checked_in_signature_order_before_mutations_are_touched(
     valid: dict[str, Any], first_reported: str
 ) -> None:
@@ -396,7 +389,6 @@ def test_scalars_are_checked_in_signature_order_before_mutations_are_touched(
     bridge_timestamp_ns=strategies.bridge_timestamps_ns,
     headroom=st.integers(min_value=0, max_value=2_000),
 )
-# Pins INV-SER-17.
 def test_any_group_survives_slicing_under_any_sufficient_budget(
     group: list[doubles.NativeMutation],
     fdb_version: int,

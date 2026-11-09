@@ -205,7 +205,6 @@ class TestProduceAndConsume:
 class TestTransactionalProducerIntegration:
     """Integration tests for transactional MutationProducer against live Kafka."""
 
-    # Pins INV-KAFKA-12.
     def test_produce_abort_then_clean_flush(self) -> None:
         """Producing then aborting in a transaction leaves no delivery errors.
 

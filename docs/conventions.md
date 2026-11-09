@@ -38,20 +38,13 @@ A `develop` integration branch is planned but does not exist yet; until it does,
 - Nothing is pushed directly to `main`; every merge goes through a PR (see [Pull requests](#pull-requests)). This is team practice: branch protection is not yet enabled (see [Enforcement](#enforcement)).
 - All commits must be **signed and verified** (see [Signed commits](#signed-commits)).
 
-## Specs and invariants
+## Specs
 
 Docs are either **Normative** (component specs, this file) or **Research / Historical** (deep dives, [`Proposal.md`](../Proposal.md), schema validation). Code must match normative docs; research docs carry a status banner naming the normative doc that supersedes them. [`INDEX.md`](INDEX.md) records each doc's status.
 
-- **Same-PR rule.** A behaviour change updates the owning spec, including its `## Invariants` section, in the same PR.
+- **Same-PR rule.** A behaviour change updates the owning spec in the same PR.
 - **Single owner per error rule.** Each error class's handling rule lives in the spec of the component that raises it; other specs link to that anchor instead of restating it.
-- **Invariant entries.** Component specs carry a `## Invariants` section. `<COMP>` is one of `BRIDGE`, `CDC`, `KAFKA`, `SER`. Name symbols, never line numbers. IDs are never reused or renumbered; a retired invariant stays listed as retired.
-
-  ```markdown
-  - <a id="inv-cdc-3"></a>**INV-CDC-3.** <statement>. Enforced by: `<module>.<Symbol>`. Pinned by: `tests/cdc/test_x.py::test_name`.
-  ```
-
-  Use `Pinned by: **Unpinned.**` when no test pins it yet.
-- **Pinning tests cite the ID.** A test that pins an invariant carries `# Pins INV-<COMP>-N.` on the line directly above its `def`. A test must not assert behaviour a normative spec forbids.
+- A test must not assert behaviour a normative spec forbids.
 
 ## Code style
 
@@ -180,4 +173,4 @@ There is no single `pytest` job: a new test directory needs its own CI job or it
 | Proto lint, compatibility, committed codegen | `buf` check on PRs |
 | Signed commits | `signed-commits` check on PRs |
 | `main` protected: PR required, 1 approval, CI green | Intended, **not enabled**: `main` has no branch protection. A repo admin enables it under Settings → Branches; until then this is team practice |
-| Branch naming, linked issue and Trello card, spec + invariants updated with behaviour changes | PR template + review |
+| Branch naming, linked issue and Trello card, spec updated with behaviour changes | PR template + review |

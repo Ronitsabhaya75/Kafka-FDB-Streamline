@@ -38,7 +38,6 @@ def _collected(ref: weakref.ref[MutationProducer]) -> bool:
     return ref() is None
 
 
-# Pins INV-KAFKA-11.
 def test_close_purges_queued_message_and_releases_producer() -> None:
     producer = _make_producer()
     reports: list[KafkaError | None] = []
@@ -57,7 +56,6 @@ def test_close_purges_queued_message_and_releases_producer() -> None:
     assert _collected(ref)
 
 
-# Pins INV-KAFKA-11.
 def test_close_with_nothing_queued_releases_without_reports() -> None:
     producer = _make_producer()
     reports: list[KafkaError | None] = []

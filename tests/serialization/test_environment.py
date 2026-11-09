@@ -18,13 +18,11 @@ def test_backend_is_upb() -> None:
     assert api_implementation.Type() == "upb"
 
 
-# Pins INV-SER-11.
 def test_runtime_version_in_supported_range() -> None:
     low, high = RUNTIME_RANGE
     assert low <= _major_minor(google.protobuf.__version__) < high
 
 
-# Pins INV-SER-11.
 def test_protobuf_version_pins_agree() -> None:
     (low_major, low_minor), (high_major, _) = RUNTIME_RANGE
     plugins = re.findall(

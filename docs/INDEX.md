@@ -2,24 +2,22 @@
 
 Map of the project's docs. Check here before reading docs wholesale, then open only what the task needs. Adding or substantially changing a doc means updating its row.
 
-**Status:** *Normative* docs define what the code must do; code and tests must match them. *Research* and *Historical* docs record investigation or original intent and may lag the code; where they disagree, the normative doc wins. See [Specs and invariants](conventions.md#specs-and-invariants).
+**Status:** *Normative* docs define what the code must do; code and tests must match them. *Research* and *Historical* docs record investigation or original intent and may lag the code; where they disagree, the normative doc wins. See [Specs](conventions.md#specs).
 
 ## Component specs
 
-Each spec ends with an `## Invariants` section of stable `INV-<COMP>-N` IDs that pinning tests cite.
-
 | Doc | Status | Read it for |
 |-----|--------|-------------|
-| [`CDC-CONSUMER-SPEC.md`](CDC-CONSUMER-SPEC.md) | Normative | `fdb_kafka_bridge.cdc`: FDB client, CDC stream lifecycle, polling, resume and acknowledgement (`INV-CDC-*`). |
-| [`SERIALIZATION-SPEC.md`](SERIALIZATION-SPEC.md) | Normative | `fdb_kafka_bridge.serialization`: public API, wire mapping, errors, version-group reader contract (`INV-SER-*`). |
-| [`KAFKA-PRODUCER-SPEC.md`](KAFKA-PRODUCER-SPEC.md) | Normative | `fdb_kafka_bridge.kafka.MutationProducer`: producer contract and local Kafka verification (`INV-KAFKA-*`). |
-| [`BRIDGE-PIPELINE-SPEC.md`](BRIDGE-PIPELINE-SPEC.md) | Normative | `fdb_kafka_bridge.bridge`: `BridgePipeline`, `Bridge` daemon, config, cursor, recovery and shutdown (`INV-BRIDGE-*`). |
+| [`CDC-CONSUMER-SPEC.md`](CDC-CONSUMER-SPEC.md) | Normative | `fdb_kafka_bridge.cdc`: FDB client, CDC stream lifecycle, polling, resume and acknowledgement. |
+| [`SERIALIZATION-SPEC.md`](SERIALIZATION-SPEC.md) | Normative | `fdb_kafka_bridge.serialization`: public API, wire mapping, errors, version-group reader contract. |
+| [`KAFKA-PRODUCER-SPEC.md`](KAFKA-PRODUCER-SPEC.md) | Normative | `fdb_kafka_bridge.kafka.MutationProducer`: producer contract and local Kafka verification. |
+| [`BRIDGE-PIPELINE-SPEC.md`](BRIDGE-PIPELINE-SPEC.md) | Normative | `fdb_kafka_bridge.bridge`: `BridgePipeline`, `Bridge` daemon, config, cursor, recovery and shutdown. |
 
 ## Project and process
 
 | Doc | Status | Read it for |
 |-----|--------|-------------|
-| [`conventions.md`](conventions.md) | Normative | Repo layout, branching, specs and invariants, code style, local setup (incl. Trello MCP), PRs, CI checks. |
+| [`conventions.md`](conventions.md) | Normative | Repo layout, branching, specs, code style, local setup (incl. Trello MCP), PRs, CI checks. |
 | [PR review skill](../.agents/skills/review-streamline-pr/SKILL.md) | Normative | Agent workflow for reviewing a PR and drafting source-linked feedback. |
 | [`../demo/README.md`](../demo/README.md) | Normative | Running the live 10,000-mutation FDB → Kafka demo. |
 | [`../Proposal.md`](../Proposal.md) | Historical | Sponsor proposal: scope, goals, original architecture; its as-built banner lists what changed. |
