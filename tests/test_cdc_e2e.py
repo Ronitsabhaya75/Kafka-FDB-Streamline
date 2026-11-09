@@ -4,6 +4,8 @@ import time
 
 import fdb
 
+from fdb_kafka_bridge.cdc import strinc
+
 
 def main() -> None:
     print("Initializing FDB API version 800...")
@@ -15,7 +17,7 @@ def main() -> None:
 
     # 1. Register CDC stream over key range
     try:
-        db.register_cdc_stream(stream_name, key_prefix, key_prefix + b"\xff").wait()
+        db.register_cdc_stream(stream_name, key_prefix, strinc(key_prefix)).wait()
         print("1. Stream registered successfully!")
     except Exception as e:
         print("Stream registration note:", e)

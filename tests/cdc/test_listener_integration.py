@@ -89,7 +89,7 @@ def test_live_cdc_mutation_listener() -> None:
 
         assert found_clear
 
-        # Verify the acknowledged position
+        # Delivered position; equals the acked one only because every reply was acked.
         pos = listener.get_position()
         assert pos is not None
         assert pos.last_consumed_version > 0

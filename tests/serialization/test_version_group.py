@@ -224,6 +224,16 @@ def test_budget_below_the_version_end_raises_record_too_large() -> None:
     assert excinfo.value.max_record_bytes == 1
 
 
+def test_oversized_mutation_wins_over_an_oversized_version_end() -> None:
+    with pytest.raises(RecordTooLargeError) as excinfo:
+        serialize_version_group([SET, ADD], fdb_version=V, max_record_bytes=1, **ENV)
+
+    assert excinfo.value.index == 0
+    assert excinfo.value.record_bytes == len(
+        serialize_batch([SET], fdb_version=V, **ENV)
+    )
+
+
 @pytest.mark.parametrize("budget", [0, -1])
 def test_budget_below_one_is_a_value_error_not_record_too_large(budget: int) -> None:
     with pytest.raises(InputValueError) as excinfo:

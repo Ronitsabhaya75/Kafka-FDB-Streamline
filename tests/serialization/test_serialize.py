@@ -442,6 +442,16 @@ def test_assigned_position_past_uint32_is_a_value_error_at_that_position() -> No
     assert excinfo.value.index == 2
 
 
+def test_assigned_position_is_checked_before_the_element_is_read() -> None:
+    with pytest.raises(InputValueError) as excinfo:
+        serialize_batch(
+            [SET, ADD, object()], fdb_version=V, first_sequence_no=2**32 - 2, **ENV
+        )
+
+    assert excinfo.value.field == "sequence_no"
+    assert excinfo.value.index == 2
+
+
 @pytest.mark.parametrize(
     "overrides",
     [

@@ -450,27 +450,24 @@ class TestAckRetry:
         assert checkpoint.call_count == 1
         assert listener.acknowledge.call_count == 3
 
-    def test_terminal_ack_error_propagates_immediately(self) -> None:
-        pipeline, producer, listener, checkpoint, _cursor = _make_pipeline(
+    def test_terminal_ack_error_propagates_without_retry(self) -> None:
+        pipeline, producer, listener, checkpoint, cursor = _make_pipeline(
             records=[_make_record()], ack_retries=3
         )
-        listener.acknowledge.side_effect = CDCTerminalError("stream removed")
+        listener.acknowledge.side_effect = CDCTerminalError(
+            "transaction_too_old", code=1007
+        )
 
-        with pytest.raises(CDCTerminalError, match="stream removed"):
+        with pytest.raises(CDCTerminalError, match="transaction_too_old"):
             pipeline.step()
 
+        # Delivered and checkpointed, FDB unacked: recovery is a resume from
+        # that checkpoint, not another step().
         assert listener.acknowledge.call_count == 1
-        assert checkpoint.call_count == 1
-        assert producer.produce.call_count == 1
-
-        # Pipeline remains delivered_unacked: next step retries ack
-        # without re-producing.
-        listener.acknowledge.side_effect = None
-        assert pipeline.step() == 1
-        listener.poll_records.assert_called_once()
-        assert producer.produce.call_count == 1
-        assert checkpoint.call_count == 1
-        assert listener.acknowledge.call_count == 2
+        producer.flush_or_raise.assert_called_once()
+        checkpoint.assert_called_once_with(cursor)
+        assert pipeline._delivered_unacked
+        assert pipeline._checkpointed
 
     def test_no_republish_during_ack_retry(self) -> None:
         pipeline, producer, listener, _checkpoint, _cursor = _make_pipeline(

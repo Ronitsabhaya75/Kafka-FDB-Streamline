@@ -184,6 +184,7 @@ def test_flush_raises_delivery_failure(producer_class: MagicMock) -> None:
         producer.flush()
 
     assert raised.value.args == (error,)
+    kafka_client.flush.assert_called_once()
 
 
 def test_sticky_error_persists_across_flushes(
@@ -202,6 +203,7 @@ def test_sticky_error_persists_across_flushes(
     with pytest.raises(KafkaException) as raised:
         producer.flush()
     assert raised.value.args == (error,)
+    assert producer.fatal is False
 
 
 def test_sticky_error_blocks_produce(producer_class: MagicMock) -> None:
@@ -425,6 +427,7 @@ def test_commit_clears_delivery_errors(producer_class: MagicMock) -> None:
     error = MagicMock(spec=KafkaError)
     report(error, MagicMock())
 
+    # Real librdkafka fails this commit; the mock isolates the clear-on-success path.
     producer.commit_transaction()
     assert producer._delivery_errors == []
 
@@ -840,3 +843,91 @@ def test_abort_failed_never_downgrades_kafka(producer_class: MagicMock) -> None:
         producer.abort_transaction()
 
     assert producer.fatal_cause is FatalCause.KAFKA
+
+
+def test_close_twice_is_noop(producer_class: MagicMock) -> None:
+    kafka_client = producer_class.return_value
+    kafka_client.flush.return_value = 0
+    producer = MutationProducer("broker:9092")
+
+    producer.close()
+    producer.close()
+
+    kafka_client.flush.assert_called_once_with(10.0)
+    assert producer.closed is True
+
+
+def test_close_swallows_failed_abort(
+    producer_class: MagicMock, caplog: pytest.LogCaptureFixture
+) -> None:
+    kafka_client = producer_class.return_value
+    kafka_client.flush.return_value = 0
+    kafka_client.abort_transaction.side_effect = _non_fatal_kafka_exception()
+    producer = _open_txn_producer()
+
+    with caplog.at_level("DEBUG", logger="fdb_kafka_bridge.kafka.producer"):
+        producer.close()
+
+    assert producer.closed is True
+    assert "Abort during close" in caplog.text
+
+
+# ── Commit failure and closed/fatal precedence ────────────────────
+
+
+def test_non_fatal_failed_commit_leaves_transaction_open(
+    producer_class: MagicMock,
+) -> None:
+    kafka_client = producer_class.return_value
+    kafka_client.commit_transaction.side_effect = _non_fatal_kafka_exception()
+    producer = _open_txn_producer()
+    producer.produce("t", mutations_pb2.FDBMutationRecord())
+    report = kafka_client.produce.call_args.kwargs["on_delivery"]
+    error = MagicMock(spec=KafkaError)
+    report(error, MagicMock())
+
+    with pytest.raises(KafkaException):
+        producer.commit_transaction()
+
+    assert producer.fatal is False
+    assert producer._delivery_errors == [error]
+    kafka_client.abort_transaction.side_effect = None
+    producer.abort_transaction()
+    kafka_client.abort_transaction.assert_called_once()
+
+
+def test_closed_reported_before_fatal(producer_class: MagicMock) -> None:
+    producer_class.return_value.flush.return_value = 0
+    producer = MutationProducer("broker:9092", transactional_id="txn-1")
+    producer.init_transactions()
+    producer.mark_fatal()
+    producer.close()
+
+    with pytest.raises(RuntimeError, match="closed"):
+        producer.produce("t", mutations_pb2.FDBMutationRecord())
+    with pytest.raises(RuntimeError, match="closed"):
+        producer.flush()
+    with pytest.raises(RuntimeError, match="closed"):
+        producer.begin_transaction()
+
+
+@pytest.mark.parametrize(
+    "method",
+    [
+        "init_transactions",
+        "begin_transaction",
+        "commit_transaction",
+        "abort_transaction",
+    ],
+)
+def test_closed_blocks_transaction_methods(
+    producer_class: MagicMock, method: str
+) -> None:
+    producer_class.return_value.flush.return_value = 0
+    producer = MutationProducer("broker:9092", transactional_id="txn-1")
+    producer.close()
+
+    with pytest.raises(
+        RuntimeError, match=f"{method} cannot proceed: producer is closed"
+    ):
+        getattr(producer, method)()
