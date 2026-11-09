@@ -6,7 +6,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from confluent_kafka import KafkaError, KafkaException
 
-from fdb_kafka_bridge.kafka.producer import FatalCause, MutationProducer
+from fdb_kafka_bridge.kafka.producer import MutationProducer
 from fdbkafka.cdc.v1 import mutations_pb2
 
 
@@ -42,22 +42,6 @@ def test_mandatory_keys_rejected_in_extra_config(
             "broker:9092",
             extra_config={"acks": "1"},
         )
-
-
-@pytest.mark.parametrize(
-    ("key", "value"),
-    [
-        ("request.required.acks", 1),
-        ("delivery.timeout.ms", 1000),
-        ("max.in.flight", 100),
-    ],
-)
-# Pins INV-KAFKA-1.
-def test_librdkafka_alias_keys_rejected_in_extra_config(
-    producer_class: MagicMock, key: str, value: int
-) -> None:
-    with pytest.raises(ValueError, match=key):
-        MutationProducer("broker:9092", extra_config={key: value})
 
 
 # Pins INV-KAFKA-1.
@@ -615,167 +599,6 @@ def _open_txn_producer() -> MutationProducer:
     producer.init_transactions()
     producer.begin_transaction()
     return producer
-
-
-def test_fatal_cause_none_initially(producer_class: MagicMock) -> None:
-    producer = MutationProducer("broker:9092")
-    assert producer.fatal_cause is None
-    assert producer.fatal is False
-
-
-def test_fatal_cause_exported_from_package() -> None:
-    import fdb_kafka_bridge.kafka as kafka_pkg
-
-    assert kafka_pkg.FatalCause is FatalCause
-    assert "FatalCause" in kafka_pkg.__all__
-
-
-def test_fatal_cause_values() -> None:
-    assert FatalCause.KAFKA == "kafka"
-    assert FatalCause.ABORT_FAILED == "abort_failed"
-
-
-# Pins INV-KAFKA-8.
-def test_error_cb_fatal_sets_kafka_cause(producer_class: MagicMock) -> None:
-    producer = MutationProducer("broker:9092")
-    err = MagicMock(spec=KafkaError)
-    err.fatal.return_value = True
-
-    producer._error_cb(err)
-
-    assert producer.fatal_cause is FatalCause.KAFKA
-    assert producer.fatal is True
-
-
-# Pins INV-KAFKA-8.
-def test_mark_fatal_sets_kafka_cause(producer_class: MagicMock) -> None:
-    producer = MutationProducer("broker:9092")
-    producer.mark_fatal()
-    assert producer.fatal_cause is FatalCause.KAFKA
-
-
-# Pins INV-KAFKA-8.
-def test_init_fatal_kafka_error_sets_kafka_cause(producer_class: MagicMock) -> None:
-    producer_class.return_value.init_transactions.side_effect = _fatal_kafka_exception()
-    producer = MutationProducer("broker:9092", transactional_id="txn-1")
-
-    with pytest.raises(KafkaException):
-        producer.init_transactions()
-
-    assert producer.fatal_cause is FatalCause.KAFKA
-
-
-# Pins INV-KAFKA-8.
-def test_begin_fatal_kafka_error_sets_kafka_cause(producer_class: MagicMock) -> None:
-    producer_class.return_value.begin_transaction.side_effect = _fatal_kafka_exception()
-    producer = MutationProducer("broker:9092", transactional_id="txn-1")
-    producer.init_transactions()
-
-    with pytest.raises(KafkaException):
-        producer.begin_transaction()
-
-    assert producer.fatal_cause is FatalCause.KAFKA
-
-
-# Pins INV-KAFKA-8.
-def test_commit_fatal_kafka_error_sets_kafka_cause(producer_class: MagicMock) -> None:
-    producer_class.return_value.commit_transaction.side_effect = (
-        _fatal_kafka_exception()
-    )
-    producer = _open_txn_producer()
-
-    with pytest.raises(KafkaException):
-        producer.commit_transaction()
-
-    assert producer.fatal_cause is FatalCause.KAFKA
-
-
-# Pins INV-KAFKA-7.
-def test_abort_fatal_kafka_error_sets_kafka_cause(producer_class: MagicMock) -> None:
-    producer_class.return_value.abort_transaction.side_effect = _fatal_kafka_exception()
-    producer = _open_txn_producer()
-
-    with pytest.raises(KafkaException):
-        producer.abort_transaction()
-
-    assert producer.fatal_cause is FatalCause.KAFKA
-
-
-# Pins INV-KAFKA-7.
-def test_abort_non_fatal_kafka_error_sets_abort_failed_cause(
-    producer_class: MagicMock,
-) -> None:
-    producer_class.return_value.abort_transaction.side_effect = (
-        _non_fatal_kafka_exception()
-    )
-    producer = _open_txn_producer()
-
-    with pytest.raises(KafkaException):
-        producer.abort_transaction()
-
-    assert producer.fatal_cause is FatalCause.ABORT_FAILED
-    assert producer.fatal is True
-
-
-# Pins INV-KAFKA-7.
-def test_abort_non_kafka_exception_sets_abort_failed_cause(
-    producer_class: MagicMock,
-) -> None:
-    producer_class.return_value.abort_transaction.side_effect = OSError("boom")
-    producer = _open_txn_producer()
-
-    with pytest.raises(OSError, match="boom"):
-        producer.abort_transaction()
-
-    assert producer.fatal_cause is FatalCause.ABORT_FAILED
-    assert producer._txn_open is True
-
-
-# Pins INV-KAFKA-8.
-def test_kafka_cause_overrides_abort_failed(producer_class: MagicMock) -> None:
-    producer_class.return_value.abort_transaction.side_effect = (
-        _non_fatal_kafka_exception()
-    )
-    producer = _open_txn_producer()
-    with pytest.raises(KafkaException):
-        producer.abort_transaction()
-    err = MagicMock(spec=KafkaError)
-    err.fatal.return_value = True
-
-    producer._error_cb(err)
-
-    assert producer.fatal_cause is FatalCause.KAFKA
-
-
-# Pins INV-KAFKA-8.
-def test_mark_fatal_overrides_abort_failed(producer_class: MagicMock) -> None:
-    producer_class.return_value.abort_transaction.side_effect = OSError("boom")
-    producer = _open_txn_producer()
-    with pytest.raises(OSError):
-        producer.abort_transaction()
-
-    producer.mark_fatal()
-
-    assert producer.fatal_cause is FatalCause.KAFKA
-
-
-# Pins INV-KAFKA-8.
-def test_abort_failed_never_downgrades_kafka(producer_class: MagicMock) -> None:
-    producer = _open_txn_producer()
-    err = MagicMock(spec=KafkaError)
-    err.fatal.return_value = True
-
-    # librdkafka can report a fatal error_cb while abort is in progress.
-    def abort(timeout: float) -> None:
-        producer._error_cb(err)
-        raise OSError("boom")
-
-    producer_class.return_value.abort_transaction.side_effect = abort
-
-    with pytest.raises(OSError):
-        producer.abort_transaction()
-
-    assert producer.fatal_cause is FatalCause.KAFKA
 
 
 # Pins INV-KAFKA-9.

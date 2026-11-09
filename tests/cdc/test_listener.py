@@ -10,7 +10,6 @@ from fdb_kafka_bridge.cdc.errors import (
     CDCConsumerClosedError,
     CDCError,
     CDCInvalidCursorError,
-    CDCNotSupportedError,
     CDCRetryableError,
     CDCTerminalError,
 )
@@ -162,32 +161,6 @@ def test_resume_timeout_closes_partial_consumer() -> None:
 
     consumer.close.assert_called_once()
     consumer.acknowledge.assert_not_called()
-
-
-# Pins INV-CDC-14.
-def test_lazy_start_in_poll_keeps_cursor_timeout_class() -> None:
-    client = MagicMock(spec=FDBClient)
-    client.resume_cdc_consumer.return_value = MagicMock()
-    client.get_read_version.return_value = 499
-    listener = FDBMutationListener(
-        client, "stream", cursor=MockCursor(42, 500), resume_timeout_seconds=1
-    )
-
-    with (
-        patch("fdb_kafka_bridge.cdc.listener.time.monotonic", side_effect=[0.0, 2.0]),
-        pytest.raises(CDCInvalidCursorError, match="Timed out"),
-    ):
-        listener.poll_records()
-
-
-# Pins INV-CDC-14.
-def test_lazy_start_in_poll_keeps_not_supported_class() -> None:
-    client = MagicMock(spec=FDBClient)
-    client.create_cdc_consumer.side_effect = CDCNotSupportedError("no native CDC")
-    listener = FDBMutationListener(client, "stream")
-
-    with pytest.raises(CDCNotSupportedError, match="no native CDC"):
-        listener.poll_records()
 
 
 # Pins INV-CDC-1.

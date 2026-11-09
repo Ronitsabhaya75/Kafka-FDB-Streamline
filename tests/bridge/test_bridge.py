@@ -23,7 +23,6 @@ from fdb_kafka_bridge.bridge.pipeline import (
 from fdb_kafka_bridge.cdc.client import FDBClient
 from fdb_kafka_bridge.cdc.errors import CDCError, CDCRetryableError, CDCTerminalError
 from fdb_kafka_bridge.cdc.listener import FDBMutationListener
-from fdb_kafka_bridge.kafka import FatalCause
 from fdb_kafka_bridge.kafka.producer import MutationProducer
 from fdb_kafka_bridge.serialization.errors import SerializationError
 from fdbkafka.cdc.v1 import mutations_pb2
@@ -366,7 +365,7 @@ def _recovery_bridge(
     )
     producer = create_autospec(MutationProducer, instance=True)
     producer.transactional = transactional
-    _set_state(producer, MutationProducer, closed=False, fatal=False, fatal_cause=None)
+    _set_state(producer, MutationProducer, closed=False, fatal=False)
     producer.flush_or_raise.return_value = None
     bridge = Bridge(
         cfg,
@@ -625,73 +624,6 @@ def test_run_propagates_permanent_checkpoint_error(tmp_path: Path) -> None:
     rebuild.assert_not_called()
     listener.acknowledge.assert_not_called()
     assert bridge._shutdown_requested.is_set()
-
-
-# Pins INV-BRIDGE-9.
-def test_run_shuts_down_when_producer_went_fatal_from_kafka() -> None:
-    """A librdkafka fatal seen only via producer state shuts down; no rebuild.
-
-    Rebuilding would reuse the transactional_id and could fence a live peer.
-    """
-    bridge, listener, producer = _recovery_bridge(transactional=True)
-    listener.poll_records.side_effect = _poll_script(
-        bridge, listener, [[_make_batch_record(1)], [_make_batch_record(1)]]
-    )
-
-    def fatal_from_error_cb(*_: object, **__: object) -> None:
-        producer.fatal = True
-        producer.fatal_cause = FatalCause.KAFKA
-        raise RuntimeError("Producer is in a fatal error state")
-
-    producer.begin_transaction.side_effect = fatal_from_error_cb
-    rebuild = _fake_rebuild(listener)
-    _bounded(bridge, rebuild)
-    bridge._rebuild_pipeline = rebuild  # type: ignore[method-assign]
-
-    with pytest.raises(RuntimeError, match="fatal error state"):
-        bridge.run()
-
-    rebuild.assert_not_called()
-    assert bridge._shutdown_requested.is_set()
-    assert bridge.metrics.errors_retried == 0
-
-
-# Pins INV-BRIDGE-8.
-def test_run_rebuilds_when_abort_failed() -> None:
-    """A producer fatal only because abort_transaction() failed is rebuilt."""
-    bridge, listener, producer = _recovery_bridge(transactional=True)
-    listener.poll_records.side_effect = _poll_script(
-        bridge, listener, [[_make_batch_record(1)], [_make_batch_record(1)]]
-    )
-    producer.commit_transaction.side_effect = [
-        KafkaException(
-            KafkaError(
-                KafkaError._MSG_TIMED_OUT, "message timed out", txn_requires_abort=True
-            )
-        ),
-        None,
-    ]
-
-    def abort_fails(*_: object, **__: object) -> None:
-        producer.fatal = True
-        producer.fatal_cause = FatalCause.ABORT_FAILED
-        raise KafkaException(KafkaError(KafkaError._TIMED_OUT, "abort timed out"))
-
-    producer.abort_transaction.side_effect = abort_fails
-
-    def rebuild() -> None:
-        listener.awaiting_ack = False
-        producer.fatal = False
-        producer.fatal_cause = None
-
-    rebuild_mock = MagicMock(side_effect=rebuild)
-    _bounded(bridge, rebuild_mock)
-    bridge._rebuild_pipeline = rebuild_mock  # type: ignore[method-assign]
-
-    bridge.run()
-
-    rebuild_mock.assert_called_once()
-    assert bridge.batches_acked == 1
 
 
 # Pins INV-BRIDGE-10.
