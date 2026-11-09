@@ -1,6 +1,9 @@
 # FoundationDB Directory Layer & Key Range Mapping
 ## A Practical Guide for the FoundationDB → Kafka CDC Bridge
 
+> [!NOTE]
+> **Status: Research.** Decisions taken: one topic per bridge, a raw key range (`begin_key`/`end_key`) rather than a directory, the stream name as the Kafka record key, and no tuple decoding or metadata filtering in the bridge. The normative contract is [`BRIDGE-PIPELINE-SPEC.md`](BRIDGE-PIPELINE-SPEC.md). This guide cites the FDB 7.4.7 developer guide; the repo pins FDB 8.0 (`FDB_VERSION` in the [`Dockerfile`](../Dockerfile)).
+
 This document explains the FoundationDB (FDB) **Directory Layer**, **subspaces**, **key ranges**, and **key range mapping** in simple terms, with a focus on how these concepts affect our **FoundationDB CDC → Kafka bridge**.
 
 ---

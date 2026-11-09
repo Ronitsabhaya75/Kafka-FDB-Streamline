@@ -87,6 +87,7 @@ def test_start_passes_stream_name_to_cursor_load(
     )
 
 
+# Pins INV-BRIDGE-11.
 def test_rebuild_keeps_transactional_mode_from_config(
     wiring: dict[str, MagicMock],
 ) -> None:
@@ -118,6 +119,7 @@ def test_rebuild_uses_producer_factory(wiring: dict[str, MagicMock]) -> None:
     wiring["producer_cls"].assert_not_called()
 
 
+# Pins INV-BRIDGE-11.
 def test_injected_transactional_producer_without_rebuild_source_rejected() -> None:
     with pytest.raises(ValueError, match="transactional"):
         Bridge(_config(), producer=_producer(transactional=True))
@@ -164,6 +166,7 @@ def test_failed_producer_build_closes_new_listener(
     assert bridge._pipeline is None
 
 
+# Pins INV-BRIDGE-5.
 def test_rebuild_skipped_while_commit_outstanding(
     wiring: dict[str, MagicMock],
 ) -> None:
@@ -179,6 +182,7 @@ def test_rebuild_skipped_while_commit_outstanding(
     assert bridge._pipeline is pipeline
 
 
+# Pins INV-BRIDGE-5.
 def test_stop_finishes_outstanding_commit_before_closing(
     wiring: dict[str, MagicMock],
 ) -> None:
@@ -264,6 +268,7 @@ def test_stop_does_not_hang_behind_idle_step(wiring: dict[str, MagicMock]) -> No
     assert bridge._client is None
 
 
+# Pins INV-BRIDGE-6.
 def test_stop_skips_commit_retry_while_step_still_running(
     wiring: dict[str, MagicMock],
 ) -> None:

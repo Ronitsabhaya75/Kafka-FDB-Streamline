@@ -23,14 +23,17 @@ ENV/
 .mcp.json
 .cursor/mcp.json
 .claude/*
-.cursor/skills/
+.cursor/skills/*
+# Tracked shared skill; a directory-level ignore would block this negation.
+!.cursor/skills/capstone-trello/
 CONTEXT.md
 CLAUDE.local.md
 
 # IDE
 .idea/
 .obsidian/
-.vscode/
+.vscode/*
+!.vscode/settings.json
 *.swp
 *.swo
 

@@ -1,18 +1,19 @@
 # Kafka-FDB-Streamline
 
-Streams changes from a FoundationDB directory to a Kafka topic using FDB's native CDC. See [`Proposal.md`](Proposal.md) for scope and design.
+Streams changes in a FoundationDB key range (configured as hex `begin_key`/`end_key`, e.g. a directory's prefix range) to a Kafka topic using FDB's native CDC. See [`Proposal.md`](Proposal.md) for scope; the as-built design is in the specs listed in [`docs/INDEX.md`](docs/INDEX.md).
 
 ## Getting started
 
 ```bash
 make setup && source .venv/bin/activate
 make lint
+make test        # unit tests; FDB and Kafka integration tests skip without a live stack
 ```
 
 Requires Python 3.12. Commits must be signed — see [Signed commits](docs/conventions.md#signed-commits).
 
-Kafka producer behavior and local verification are documented in the
-[`Kafka producer specification`](docs/KAFKA-PRODUCER-SPEC.md).
+Docs map: [`docs/INDEX.md`](docs/INDEX.md). Live end-to-end demo against the Docker
+Compose FDB + Kafka stack: [`demo/README.md`](demo/README.md).
 
 ## Install
 

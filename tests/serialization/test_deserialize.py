@@ -173,6 +173,7 @@ def test_wire_type_code_outside_uint8_is_type_code_out_of_range(code: int) -> No
     assert excinfo.value.index is None
 
 
+# Pins INV-SER-16.
 def test_version_index_beyond_int64_is_version_out_of_range() -> None:
     data = mutations_pb2.FDBMutationRecord(
         mutation=wire_set(2**63, 0)
@@ -334,6 +335,7 @@ def test_non_canonical_clear_normalises_to_the_canonical_mutation() -> None:
         ),
     ],
 )
+# Pins INV-SER-9.
 def test_envelope_is_returned_as_found_and_never_raises(
     envelope: dict[str, Any], stream_name: str, bridge_timestamp_ns: int | None
 ) -> None:
@@ -376,6 +378,7 @@ def test_version_end_inner_timestamp_is_read_independently() -> None:
         ),
     ],
 )
+# Pins INV-SER-9.
 def test_version_end_inner_timestamp_is_returned_as_found_and_never_raises(
     inner: dict[str, Any], bridge_timestamp_ns: int | None
 ) -> None:
@@ -429,6 +432,7 @@ def test_arbitrary_bytes_give_a_record_or_a_record_decode_error(data: bytes) -> 
     assert isinstance(record, Record)
 
 
+# Pins INV-SER-16.
 def test_version_end_beyond_int64_is_version_out_of_range() -> None:
     data = mutations_pb2.FDBMutationRecord(
         version_end=mutations_pb2.VersionEnd(fdb_version=2**63, total_mutations=1)
@@ -439,3 +443,115 @@ def test_version_end_beyond_int64_is_version_out_of_range() -> None:
 
     assert excinfo.value.reason is DecodeFailure.VERSION_OUT_OF_RANGE
     assert excinfo.value.index is None
+
+
+SECRET = bytes.fromhex("9f3c07e1a2b44d5688c1f0e39a7b2d14")
+SECRET_STREAM = "hunter2"
+
+
+def secret_single(
+    code: int, fdb_version: int, sequence_no: int
+) -> mutations_pb2.FDBMutation:
+    return mutations_pb2.FDBMutation(
+        version_index=mutations_pb2.FDBVersionIndex(
+            fdb_version=fdb_version, sequence_no=sequence_no
+        ),
+        single_key_mutation=mutations_pb2.FDBSingleKeyMutation(
+            key=SECRET,
+            value=SECRET,
+            mutation_type=code,  # type: ignore[arg-type]  # raw int, open enum
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        pytest.param(
+            mutations_pb2.FDBMutationRecord(
+                stream_name=SECRET_STREAM, mutation=secret_single(300, V, 0)
+            ).SerializeToString(),
+            id="type-code",
+        ),
+        pytest.param(
+            mutations_pb2.FDBMutationRecord(
+                stream_name=SECRET_STREAM, mutation=secret_single(0, 2**63, 0)
+            ).SerializeToString(),
+            id="version",
+        ),
+        pytest.param(
+            mutations_pb2.FDBMutationRecord(
+                stream_name=SECRET_STREAM,
+                batch=mutations_pb2.FDBMutationBatch(
+                    mutations=[secret_single(0, V, 0), secret_single(0, V, 5)]
+                ),
+            ).SerializeToString(),
+            id="inconsistent-batch",
+        ),
+        pytest.param(
+            mutations_pb2.FDBMutationRecord(
+                stream_name=SECRET_STREAM, mutation=secret_single(0, V, 0)
+            ).SerializeToString()[:-1],
+            id="truncated",
+        ),
+    ],
+)
+# Pins INV-SER-12.
+def test_decode_error_message_never_contains_key_value_or_stream_content(
+    data: bytes,
+) -> None:
+    with pytest.raises(RecordDecodeError) as excinfo:
+        deserialize_record(data)
+
+    message = str(excinfo.value)
+    assert SECRET_STREAM not in message
+    assert SECRET.hex() not in message
+    assert repr(SECRET)[2:-1] not in message
+
+
+@pytest.mark.parametrize(
+    ("data", "reason", "index"),
+    [
+        pytest.param(
+            mutations_pb2.FDBMutationRecord(
+                mutation=mutations_pb2.FDBMutation()
+            ).SerializeToString(),
+            DecodeFailure.MISSING_VERSION_INDEX,
+            None,
+            id="version-index-before-arm",
+        ),
+        pytest.param(
+            mutations_pb2.FDBMutationRecord(
+                mutation=mutations_pb2.FDBMutation(
+                    version_index=mutations_pb2.FDBVersionIndex(fdb_version=2**63)
+                )
+            ).SerializeToString(),
+            DecodeFailure.VERSION_OUT_OF_RANGE,
+            None,
+            id="version-range-before-arm",
+        ),
+        pytest.param(
+            mutations_pb2.FDBMutationRecord(
+                mutation=wire_single(300, 2**63, 0)
+            ).SerializeToString(),
+            DecodeFailure.VERSION_OUT_OF_RANGE,
+            None,
+            id="version-range-before-type-range",
+        ),
+        pytest.param(
+            batch_record(wire_set(V, 0), wire_set(V + 1, 1), wire_single(300, V, 2)),
+            DecodeFailure.TYPE_CODE_OUT_OF_RANGE,
+            2,
+            id="element-fault-before-inconsistent-batch",
+        ),
+    ],
+)
+# Pins INV-SER-8.
+def test_decode_checks_run_in_their_documented_order(
+    data: bytes, reason: DecodeFailure, index: int | None
+) -> None:
+    with pytest.raises(RecordDecodeError) as excinfo:
+        deserialize_record(data)
+
+    assert excinfo.value.reason is reason
+    assert excinfo.value.index == index

@@ -4,6 +4,13 @@
 **Project:** Kafka-FDB Streamline  
 **Focus:** Kafka producer durability, ordering, transactions, exactly-once semantics, Python client selection, batching, error handling, and Protobuf serialization.
 
+> **Status:** research write-up, not a spec. Recommendations below predate the
+> implementation and may differ from it. [`KAFKA-PRODUCER-SPEC.md`](KAFKA-PRODUCER-SPEC.md)
+> is authoritative for current behaviour: the code uses
+> `max.in.flight.requests.per.connection=5`, `enable.gapless.guarantee=true` and
+> `message.timeout.ms=0`, and acknowledges FDB outside the Kafka transaction
+> (no cursor topic), so delivery is at-least-once end to end.
+
 ---
 
 # 1. Why This Research Matters
@@ -1102,7 +1109,10 @@ while running:
         else:
             raise
 
-    acknowledge_fdb(cursor)
+        # Nothing was committed: do not acknowledge; re-read and retry.
+        continue
+
+    acknowledge_fdb(cursor)  # only reached after a successful commit
 ```
 
 This is conceptual rather than final production code.

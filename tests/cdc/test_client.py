@@ -20,6 +20,7 @@ def test_init_fdb_version_too_low() -> None:
         init_fdb(api_version=730)
 
 
+# Pins INV-CDC-10.
 def test_init_fdb_version_too_low_without_fdb() -> None:
     with patch("fdb_kafka_bridge.cdc.client.fdb", None):
         with pytest.raises(CDCNotSupportedError, match="API version 800 or later"):
@@ -129,12 +130,15 @@ def test_fdb_client_cdc_delegates() -> None:
     ("begin_key", "end_key"),
     [(b"z", b"a"), (b"a", b"a"), ("a", b"z")],
 )
+# Pins INV-CDC-11.
 def test_register_cdc_stream_rejects_invalid_range(
     begin_key: object, end_key: object
 ) -> None:
     client = FDBClient()
+    client._db = MagicMock()
     with pytest.raises(CDCInvalidRangeError):
         client.register_cdc_stream("stream", begin_key, end_key)  # type: ignore[arg-type]
+    client._db.register_cdc_stream.assert_not_called()
 
 
 @pytest.mark.parametrize(
@@ -147,10 +151,13 @@ def test_register_cdc_stream_rejects_invalid_range(
         MockCursor(True, 100),
     ],
 )
+# Pins INV-CDC-11.
 def test_resume_cdc_consumer_rejects_invalid_cursor(cursor: object) -> None:
     client = FDBClient()
+    client._db = MagicMock()
     with pytest.raises(CDCInvalidCursorError):
         client.resume_cdc_consumer(cursor)
+    client._db.resume_cdc_consumer.assert_not_called()
 
 
 def test_native_cdc_unavailable_is_mapped_to_package_error() -> None:

@@ -23,6 +23,7 @@ from fdb_kafka_bridge.bridge.pipeline import (
 from fdb_kafka_bridge.cdc.client import FDBClient
 from fdb_kafka_bridge.cdc.errors import CDCError, CDCRetryableError, CDCTerminalError
 from fdb_kafka_bridge.cdc.listener import FDBMutationListener
+from fdb_kafka_bridge.kafka import FatalCause
 from fdb_kafka_bridge.kafka.producer import MutationProducer
 from fdb_kafka_bridge.serialization.errors import SerializationError
 from fdbkafka.cdc.v1 import mutations_pb2
@@ -120,6 +121,7 @@ def test_pipeline_execution_order(tmp_path: Path) -> None:
     assert os.path.exists(cursor_file)
 
 
+# Pins INV-BRIDGE-12.
 def test_checkpoint_persistence_failure_blocks_ack(tmp_path: Path) -> None:
     """Verify that a checkpoint failure raises and prevents FDB acknowledgement."""
     mock_listener = create_autospec(FDBMutationListener, instance=True)
@@ -181,7 +183,7 @@ def test_load_cursor_corrupt_file_raises(tmp_path: Path) -> None:
     corrupt_file = str(tmp_path / "corrupt.json")
     with open(corrupt_file, "w", encoding="utf-8") as f:
         f.write("{invalid-json")
-    with pytest.raises(ValueError, match="Failed to parse|Expecting"):
+    with pytest.raises(ValueError, match="Expecting"):
         _load_cursor_from_file(corrupt_file)
 
     non_object_file = str(tmp_path / "array.json")
@@ -286,6 +288,7 @@ def test_bridge_lifecycle_and_metrics() -> None:
     mock_client.close.assert_called_once()
 
 
+# Pins INV-BRIDGE-17.
 def test_bridge_terminates_on_cdc_terminal_error() -> None:
     """Verify Bridge terminates immediately and re-raises on CDCTerminalError."""
     cfg = from_dict(
@@ -297,7 +300,9 @@ def test_bridge_terminates_on_cdc_terminal_error() -> None:
     mock_client = create_autospec(FDBClient, instance=True)
     mock_listener = create_autospec(FDBMutationListener, instance=True)
     mock_listener.raw_stream_name = b"test_stream"
-    mock_listener.poll_records.side_effect = CDCTerminalError("Stream removed")
+    mock_listener.poll_records.side_effect = CDCTerminalError(
+        "transaction_too_old", code=1007
+    )
 
     mock_producer = create_autospec(MutationProducer, instance=True)
     mock_producer.transactional = False
@@ -310,7 +315,7 @@ def test_bridge_terminates_on_cdc_terminal_error() -> None:
     )
     bridge.start()
 
-    with pytest.raises(CDCTerminalError, match="Stream removed"):
+    with pytest.raises(CDCTerminalError, match="transaction_too_old"):
         bridge.run()
 
     bridge.stop()
@@ -361,7 +366,7 @@ def _recovery_bridge(
     )
     producer = create_autospec(MutationProducer, instance=True)
     producer.transactional = transactional
-    _set_state(producer, MutationProducer, closed=False, fatal=False)
+    _set_state(producer, MutationProducer, closed=False, fatal=False, fatal_cause=None)
     producer.flush_or_raise.return_value = None
     bridge = Bridge(
         cfg,
@@ -463,6 +468,7 @@ def test_run_retries_retryable_cdc_error() -> None:
     assert bridge.mutations_published == 3
 
 
+# Pins INV-BRIDGE-9.
 def test_run_reraises_fatal_kafka_error() -> None:
     """A fatal Kafka error escapes run() and requests shutdown, no rebuild."""
     bridge, listener, producer = _recovery_bridge()
@@ -532,7 +538,9 @@ def test_run_rebuilds_after_transaction_abort() -> None:
     )
     producer.commit_transaction.side_effect = [
         KafkaException(
-            KafkaError(KafkaError._FENCED, "abort", txn_requires_abort=True)
+            KafkaError(
+                KafkaError._MSG_TIMED_OUT, "message timed out", txn_requires_abort=True
+            )
         ),
         None,
     ]
@@ -563,6 +571,7 @@ def test_run_rebuilds_after_transaction_abort() -> None:
     assert bridge.batches_acked == 1
 
 
+# Pins INV-BRIDGE-16.
 def test_run_retries_failed_rebuild_until_it_succeeds() -> None:
     """A rebuild failure backs off and retries; run() never exits silently."""
     bridge, listener, _ = _recovery_bridge()
@@ -615,4 +624,114 @@ def test_run_propagates_permanent_checkpoint_error(tmp_path: Path) -> None:
 
     rebuild.assert_not_called()
     listener.acknowledge.assert_not_called()
+    assert bridge._shutdown_requested.is_set()
+
+
+# Pins INV-BRIDGE-9.
+def test_run_shuts_down_when_producer_went_fatal_from_kafka() -> None:
+    """A librdkafka fatal seen only via producer state shuts down; no rebuild.
+
+    Rebuilding would reuse the transactional_id and could fence a live peer.
+    """
+    bridge, listener, producer = _recovery_bridge(transactional=True)
+    listener.poll_records.side_effect = _poll_script(
+        bridge, listener, [[_make_batch_record(1)], [_make_batch_record(1)]]
+    )
+
+    def fatal_from_error_cb(*_: object, **__: object) -> None:
+        producer.fatal = True
+        producer.fatal_cause = FatalCause.KAFKA
+        raise RuntimeError("Producer is in a fatal error state")
+
+    producer.begin_transaction.side_effect = fatal_from_error_cb
+    rebuild = _fake_rebuild(listener)
+    _bounded(bridge, rebuild)
+    bridge._rebuild_pipeline = rebuild  # type: ignore[method-assign]
+
+    with pytest.raises(RuntimeError, match="fatal error state"):
+        bridge.run()
+
+    rebuild.assert_not_called()
+    assert bridge._shutdown_requested.is_set()
+    assert bridge.metrics.errors_retried == 0
+
+
+# Pins INV-BRIDGE-8.
+def test_run_rebuilds_when_abort_failed() -> None:
+    """A producer fatal only because abort_transaction() failed is rebuilt."""
+    bridge, listener, producer = _recovery_bridge(transactional=True)
+    listener.poll_records.side_effect = _poll_script(
+        bridge, listener, [[_make_batch_record(1)], [_make_batch_record(1)]]
+    )
+    producer.commit_transaction.side_effect = [
+        KafkaException(
+            KafkaError(
+                KafkaError._MSG_TIMED_OUT, "message timed out", txn_requires_abort=True
+            )
+        ),
+        None,
+    ]
+
+    def abort_fails(*_: object, **__: object) -> None:
+        producer.fatal = True
+        producer.fatal_cause = FatalCause.ABORT_FAILED
+        raise KafkaException(KafkaError(KafkaError._TIMED_OUT, "abort timed out"))
+
+    producer.abort_transaction.side_effect = abort_fails
+
+    def rebuild() -> None:
+        listener.awaiting_ack = False
+        producer.fatal = False
+        producer.fatal_cause = None
+
+    rebuild_mock = MagicMock(side_effect=rebuild)
+    _bounded(bridge, rebuild_mock)
+    bridge._rebuild_pipeline = rebuild_mock  # type: ignore[method-assign]
+
+    bridge.run()
+
+    rebuild_mock.assert_called_once()
+    assert bridge.batches_acked == 1
+
+
+# Pins INV-BRIDGE-10.
+def test_bridge_keys_records_by_configured_stream_name() -> None:
+    """Bridge keys by cdc.stream_name, not by whatever the listener reports."""
+    bridge, listener, producer = _recovery_bridge()
+    listener.raw_stream_name = b"listener-name"
+    bridge._rebuild_pipeline = _fake_rebuild(listener)  # type: ignore[method-assign]
+    bridge._build_pipeline()
+    listener.poll_records.side_effect = _poll_script(
+        bridge, listener, [[_make_batch_record(1), _make_batch_record(1)]]
+    )
+
+    bridge.run()
+
+    keys = {call.kwargs["key"] for call in producer.produce.call_args_list}
+    assert keys == {b"test_stream"}
+
+
+# Pins INV-BRIDGE-13.
+def test_run_shuts_down_on_foreign_cursor_file_during_rebuild() -> None:
+    """A cursor file rejected on rebuild is permanent: run() raises, no retry."""
+    bridge, listener, _ = _recovery_bridge()
+    listener.poll_records.side_effect = _poll_script(
+        bridge, listener, [SerializationError("bad mutation"), [_make_batch_record(1)]]
+    )
+    loads = 0
+
+    def foreign(*_: object, **__: object) -> None:
+        nonlocal loads
+        loads += 1
+        if loads > 20:
+            bridge.request_shutdown()
+        raise ValueError("Cursor file belongs to stream 'other'")
+
+    with (
+        patch("fdb_kafka_bridge.bridge.pipeline._load_cursor_from_file", foreign),
+        pytest.raises(ValueError, match="belongs to stream"),
+    ):
+        bridge.run()
+
+    assert loads == 1
     assert bridge._shutdown_requested.is_set()

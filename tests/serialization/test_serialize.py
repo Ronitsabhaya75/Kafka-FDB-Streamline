@@ -45,6 +45,7 @@ def test_mutation_record_uses_the_real_wire_encoding() -> None:
     assert record.bridge_timestamp.nanos == 123_456_789
 
 
+# Pins INV-SER-1.
 def test_clear_range_lands_in_clear_range_arm() -> None:
     data = serialize_mutation(CLEAR, fdb_version=V, sequence_no=0, **ENV)
 
@@ -71,6 +72,7 @@ def test_declared_type_code_is_forwarded_verbatim(code: int) -> None:
     )
 
 
+# Pins INV-SER-15.
 def test_zero_version_index_is_present_on_the_wire() -> None:
     data = serialize_mutation(SET, fdb_version=0, sequence_no=0, **ENV)
 
@@ -78,6 +80,7 @@ def test_zero_version_index_is_present_on_the_wire() -> None:
     assert mutation.HasField("version_index")
 
 
+# Pins INV-SER-15.
 def test_zero_bridge_timestamp_is_present_on_the_wire() -> None:
     data = serialize_mutation(
         SET, fdb_version=V, sequence_no=0, stream_name=STREAM, bridge_timestamp_ns=0
@@ -95,6 +98,7 @@ def test_zero_bridge_timestamp_is_present_on_the_wire() -> None:
     ],
     ids=["mutation", "batch", "version_end"],
 )
+# Pins INV-SER-14.
 def test_equal_arguments_give_equal_bytes(call: Callable[[], bytes]) -> None:
     assert call() == call()
 
@@ -142,6 +146,7 @@ def test_version_end_sets_both_timestamps_equal() -> None:
     )
 
 
+# Pins INV-SER-10.
 def test_mutation_type_mirrors_the_declared_type_codes() -> None:
     proto_enum = mutations_pb2.FDBSingleKeyMutation.MutationType
 
@@ -182,6 +187,7 @@ def test_type_code_outside_uint8_is_a_value_error(code: int) -> None:
     [None, bytearray(b"k"), memoryview(b"k"), "k", 5],
     ids=["None", "bytearray", "memoryview", "str", "int"],
 )
+# Pins INV-SER-2.
 def test_param_that_is_not_bytes_is_a_type_error(field: str, value: Any) -> None:
     native = doubles.NativeMutation(
         **{"type": 0, "param1": b"k", "param2": b"v"} | {field: value}
@@ -442,6 +448,17 @@ def test_assigned_position_past_uint32_is_a_value_error_at_that_position() -> No
     assert excinfo.value.index == 2
 
 
+# Pins INV-SER-4.
+def test_assigned_position_is_checked_before_the_element_is_read() -> None:
+    with pytest.raises(InputValueError) as excinfo:
+        serialize_batch(
+            [SET, ADD, object()], fdb_version=V, first_sequence_no=2**32 - 2, **ENV
+        )
+
+    assert excinfo.value.field == "sequence_no"
+    assert excinfo.value.index == 2
+
+
 @pytest.mark.parametrize(
     "overrides",
     [
@@ -449,6 +466,7 @@ def test_assigned_position_past_uint32_is_a_value_error_at_that_position() -> No
         pytest.param({"bridge_timestamp_ns": -1}, id="last-scalar"),
     ],
 )
+# Pins INV-SER-13.
 def test_invalid_scalar_leaves_the_generator_unconsumed(
     overrides: dict[str, Any],
 ) -> None:
@@ -480,6 +498,7 @@ SECRET_KEY = bytes.fromhex(
         ),
     ],
 )
+# Pins INV-SER-12.
 def test_error_message_never_contains_key_content(
     call: Callable[[doubles.NativeMutation], bytes],
 ) -> None:
@@ -512,6 +531,7 @@ def test_error_message_never_contains_key_content(
         ),
     ],
 )
+# Pins INV-SER-12.
 def test_error_message_never_contains_name_or_param_content(
     call: Callable[[], bytes],
 ) -> None:
@@ -522,6 +542,7 @@ def test_error_message_never_contains_name_or_param_content(
 
 
 @pytest.mark.parametrize("code", [True, False, 1.0, "1", None])
+# Pins INV-SER-3.
 def test_type_code_that_is_not_an_int_is_a_type_error(code: Any) -> None:
     native = doubles.NativeMutation(code, b"k", b"v")
 

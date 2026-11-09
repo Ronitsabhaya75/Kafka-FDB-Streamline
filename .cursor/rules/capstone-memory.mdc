@@ -9,5 +9,5 @@ Cursor twin of `CLAUDE.md`; keep the two identical apart from how they load file
 
 Read and follow first:
 
-1. [`AGENTS.md`](AGENTS.md)
-2. [`docs/conventions.md`](docs/conventions.md)
+1. [`AGENTS.md`](../../AGENTS.md)
+2. [`docs/conventions.md`](../../docs/conventions.md)

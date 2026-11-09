@@ -59,6 +59,7 @@ def test_save_none_position_raises(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("path", [None, ""])
+# Pins INV-BRIDGE-14.
 def test_save_without_path_is_noop(path: str | None) -> None:
     _save_cursor_to_file(path, _Pos())
     _save_cursor_to_file(path, None)
@@ -66,6 +67,7 @@ def test_save_without_path_is_noop(path: str | None) -> None:
 
 @pytest.mark.parametrize("on_open", [True, False])
 @pytest.mark.parametrize("err", [errno.EIO, errno.EACCES])
+# Pins INV-BRIDGE-12.
 def test_save_dir_sync_failure_propagates(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, on_open: bool, err: int
 ) -> None:
@@ -101,6 +103,7 @@ def test_round_trip_with_stream_name(tmp_path: Path) -> None:
     assert (loaded.stream_id, loaded.last_consumed_version) == (42, 123)
 
 
+# Pins INV-BRIDGE-13.
 def test_load_stream_name_mismatch_raises(tmp_path: Path) -> None:
     path = str(tmp_path / "c.cursor")
     _save_cursor_to_file(path, _Pos(), stream_name="orders")

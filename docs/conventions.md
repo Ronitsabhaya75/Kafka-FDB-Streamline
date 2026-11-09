@@ -4,51 +4,54 @@ How the team lays out the repo, branches, writes Python, and merges. Tooling enf
 
 ## Repo layout
 
-```
-.
-├── src/
-│   └── fdb_kafka_bridge/     # Import package (distribution: fdb-kafka-bridge)
-│       ├── bridge/           # Core bridge pipeline (CDC → Kafka)
-│       ├── cdc/              # FDB CDC consumer wrapper
-│       ├── kafka/            # Kafka producer module
-│       └── serialization/    # Protobuf serialization
-├── protobuf/
-│   ├── proto/            # .proto schema definitions
-│   ├── gen/              # buf generate output (committed)
-│   └── tests/            # Schema and serialization tests
-├── tests/                # Unit and integration tests
-├── config/               # Configuration files
-├── docs/                 # Documentation: INDEX.md (doc map), this file, research write-ups
-├── scripts/              # Helper scripts
-├── .devcontainer/        # devcontainer.json + docker-compose.yml (FDB + Kafka stack)
-├── .github/              # PR template, CI workflows
-├── Dockerfile            # FDB + CDC runtime image
-├── buf.yaml              # buf module, lint and breaking-change config
-├── buf.gen.yaml          # buf codegen → protobuf/gen
-├── Makefile              # setup / lint / format / test
-├── pyproject.toml        # Project metadata + black/ruff/pytest config
-└── README.md
-```
+| Path | Purpose |
+|------|---------|
+| `src/fdb_kafka_bridge/` | Import package (distribution `fdb-kafka-bridge`): `bridge/`, `cdc/`, `kafka/`, `serialization/` |
+| `protobuf/` | `proto/` schema, `gen/` committed `buf generate` output, `tests/` schema and pipeline-simulation tests |
+| `tests/` | Unit and integration tests; subdirectories mirror the `src` packages, plus `demo/` |
+| `demo/` | Live FDB → Kafka demo ([`demo/README.md`](../demo/README.md)) |
+| `docs/` | Specs, conventions and research; map in [`INDEX.md`](INDEX.md) |
+| `scripts/` | CI and dev helper scripts |
+| `config/` | Placeholder (`.gitkeep`); nothing reads it yet |
+| `.github/` | CI workflows, PR template, issue templates |
+| `.devcontainer/` | Dev container + `docker-compose.yml` (FDB + Kafka stack) |
+| `.agents/`, `.cursor/` | Agent skills and Cursor rules |
+| `Dockerfile` | FDB + native CDC runtime image; `FDB_VERSION` is the canonical FDB version |
+| `buf.yaml`, `buf.gen.yaml` | buf module, lint/breaking config, codegen → `protobuf/gen` |
+| `pyproject.toml`, `requirements-dev.txt`, `.pre-commit-config.yaml`, `Makefile` | Project metadata and tool config, pinned dev tools, hooks, dev commands |
 
 - Empty directories hold a `.gitkeep` until real files land.
-- `.devcontainer/` and `Dockerfile` land with PR #2; `protobuf/` and `buf*.yaml` with PR #6.
-- Generated code (`buf generate` → `protobuf/gen/`) is committed but excluded from ruff and black. It ships in the wheel as the separate top-level package `fdbkafka`.
+- Generated code (`buf generate` → `protobuf/gen/`) is committed but excluded from ruff and black. It ships in the wheel as the separate top-level package `fdbkafka`. Changing a `.proto` means committing the regenerated output; CI fails on drift.
 - Running from a checkout needs the repo root, `src` and `protobuf/gen` on the import path (`PYTHONPATH=.:src:protobuf/gen`); pytest configures this itself.
 
 ## Branching
 
 | Branch | Purpose |
 |--------|---------|
-| `main` | Stable, protected. Only receives PRs from `develop` (or hotfixes). |
-| `develop` | Integration branch. Work branches are cut from and merged back into it. |
-| `<type>/<name>` | Work branches. `<name>` is short kebab-case. |
+| `main` | Stable. Every merge arrives by PR. |
+| `<type>/<name>` | Work branches, cut from and merged back into `main`. `<name>` is short kebab-case. |
 
-Work branch types: `feature/` (product code), `fix/`, `dev/` (tooling, CI, repo infra), `research/` (spikes, write-ups), `docs/`. E.g. `feature/cdc-consumer`, `dev/scaffolding`.
+Work branch types: `feature/` (product code), `fix/`, `dev/` (tooling, CI, repo infra), `research/` (spikes, write-ups), `docs/`, `chore/` (reverts, housekeeping), `release/`. E.g. `feature/cdc-consumer`, `dev/scaffolding`.
 
-The integration branch is `develop`, not `dev`: git cannot hold a branch named `dev` alongside `dev/<name>` branches.
+A `develop` integration branch is planned but does not exist yet; until it does, PRs target `main`. It is `develop`, not `dev`, because git cannot hold `dev` alongside `dev/<name>` branches.
 
-- Nothing is pushed directly to `main` or `develop`; every merge goes through a PR (see [Pull requests](#pull-requests)).
+- Nothing is pushed directly to `main`; every merge goes through a PR (see [Pull requests](#pull-requests)). This is team practice: branch protection is not yet enabled (see [Enforcement](#enforcement)).
 - All commits must be **signed and verified** (see [Signed commits](#signed-commits)).
+
+## Specs and invariants
+
+Docs are either **Normative** (component specs, this file) or **Research / Historical** (deep dives, [`Proposal.md`](../Proposal.md), schema validation). Code must match normative docs; research docs carry a status banner naming the normative doc that supersedes them. [`INDEX.md`](INDEX.md) records each doc's status.
+
+- **Same-PR rule.** A behaviour change updates the owning spec, including its `## Invariants` section, in the same PR.
+- **Single owner per error rule.** Each error class's handling rule lives in the spec of the component that raises it; other specs link to that anchor instead of restating it.
+- **Invariant entries.** Component specs carry a `## Invariants` section. `<COMP>` is one of `BRIDGE`, `CDC`, `KAFKA`, `SER`. Name symbols, never line numbers. IDs are never reused or renumbered; a retired invariant stays listed as retired.
+
+  ```markdown
+  - <a id="inv-cdc-3"></a>**INV-CDC-3.** <statement>. Enforced by: `<module>.<Symbol>`. Pinned by: `tests/cdc/test_x.py::test_name`.
+  ```
+
+  Use `Pinned by: **Unpinned.**` when no test pins it yet.
+- **Pinning tests cite the ID.** A test that pins an invariant carries `# Pins INV-<COMP>-N.` on the line directly above its `def`. A test must not assert behaviour a normative spec forbids.
 
 ## Code style
 
@@ -146,19 +149,35 @@ Then add the same public key on GitHub under Settings → SSH and GPG keys → N
 
 ## Pull requests
 
-- Open from a work branch against `develop` (against `main` until `develop` exists). The [PR template](../.github/pull_request_template.md) fills in automatically.
+- Open from a work branch against `main`. The [PR template](../.github/pull_request_template.md) fills in automatically.
+- For anything beyond a trivial fix, open a GitHub issue first and link it; large PRs with no justifying issue are closed.
 - Link the Trello card in the description.
-- At least 1 approval required.
-- CI must pass: the [`Lint`](../.github/workflows/lint.yml) workflow runs `ruff check` and `black --check` on every PR. It is check-only — it never edits files or pushes commits.
-- CI must pass: the [`Tests`](../.github/workflows/tests.yml) workflow runs `pytest` on every PR.
-- CI must pass: the [`Packaging`](../.github/workflows/packaging.yml) workflow runs `tests/test_packaging.py` on every PR with `PACKAGING_INTEGRATION=1`: it builds the wheel, installs it into a fresh venv from the network, and needs no `libfdb_c`. The job fails if any test skips or none run.
+- At least 1 approval.
+- All [CI](#ci) checks must pass.
+
+## CI
+
+[`main-ci.yml`](../.github/workflows/main-ci.yml) (`CI`) is the only workflow triggered by PRs (and by pushes to `main`). Every other workflow is a reusable `workflow_call` job nested under it (also runnable by hand via `workflow_dispatch`), and all of them wait on `signed-commits`. Check names below are as GitHub shows them.
+
+| Check | Workflow | What it does |
+|-------|----------|--------------|
+| `signed-commits` | `main-ci.yml` | Fails if any PR commit is not GitHub-verified |
+| `lint / lint` | [`lint.yml`](../.github/workflows/lint.yml) | `ruff check` and `black --check` at the pinned versions; check-only, never edits or pushes |
+| `packaging / packaging` | [`packaging.yml`](../.github/workflows/packaging.yml) | `tests/test_packaging.py` with `PACKAGING_INTEGRATION=1`: builds the wheel and installs it into a fresh venv (no `libfdb_c`); fails if any test skips or none run |
+| `buf / buf` | [`buf-ci.yaml`](../.github/workflows/buf-ci.yaml) | `buf lint`, `buf breaking` against the PR base, `buf build`, and a `buf generate` drift check on `protobuf/gen` |
+| `container-setup / build-and-verify` | [`Container-setup.yml`](../.github/workflows/Container-setup.yml) | Builds the `Dockerfile` image, checks FDB binaries and bindings, waits for the cluster, runs a read/write check |
+| `container-setup / test-protobuf`, `test-serialization`, `test-cdc-mutations`, `test-kafka`, `test-bridge` | `Container-setup.yml` | `pytest` per directory inside that image: `protobuf/tests`, `tests/serialization`, `tests/cdc` (live FDB), `tests/kafka` and `tests/bridge` + `tests/demo` (unit, then live Kafka integration), plus the Kafka smoke script |
+
+There is no single `pytest` job: a new test directory needs its own CI job or it never runs in CI. `tests/test_cdc_e2e.py` is currently run by no job.
 
 ## Enforcement
 
 | Convention | Enforced by |
 |------------|-------------|
-| Formatting, lint, naming, type hints, docstrings | pre-commit locally; `Lint` workflow on PRs |
-| Tests pass | `make test` locally; `Tests` workflow on PRs |
-| Wheel builds, installs and imports | `make test-packaging` locally; `Packaging` workflow on PRs, which fails on skipped or missing tests |
-| `main`/`develop` protected, PR required, 1 approval, CI green, signed commits | GitHub branch protection — a repo admin enables it under Settings → Branches |
-| Branch naming, Trello link | PR template + review |
+| Formatting, lint, naming, type hints, docstrings | pre-commit locally; `lint` check on PRs |
+| Tests pass | `make test` locally; `container-setup` test jobs on PRs |
+| Wheel builds, installs and imports | `make test-packaging` locally; `packaging` check on PRs |
+| Proto lint, compatibility, committed codegen | `buf` check on PRs |
+| Signed commits | `signed-commits` check on PRs |
+| `main` protected: PR required, 1 approval, CI green | Intended, **not enabled**: `main` has no branch protection. A repo admin enables it under Settings → Branches; until then this is team practice |
+| Branch naming, linked issue and Trello card, spec + invariants updated with behaviour changes | PR template + review |

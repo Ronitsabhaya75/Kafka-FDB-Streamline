@@ -6,7 +6,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from confluent_kafka import KafkaError, KafkaException
 
-from fdb_kafka_bridge.kafka.producer import MutationProducer
+from fdb_kafka_bridge.kafka.producer import FatalCause, MutationProducer
 from fdbkafka.cdc.v1 import mutations_pb2
 
 
@@ -19,6 +19,7 @@ def producer_class() -> Iterator[MagicMock]:
 # ── Durability config ──────────────────────────────────────────────
 
 
+# Pins INV-KAFKA-1.
 def test_enforces_durability_config(producer_class: MagicMock) -> None:
     MutationProducer("broker:9092", extra_config={"linger.ms": 20})
 
@@ -32,6 +33,7 @@ def test_enforces_durability_config(producer_class: MagicMock) -> None:
     assert config["linger.ms"] == 20
 
 
+# Pins INV-KAFKA-1.
 def test_mandatory_keys_rejected_in_extra_config(
     producer_class: MagicMock,
 ) -> None:
@@ -42,6 +44,23 @@ def test_mandatory_keys_rejected_in_extra_config(
         )
 
 
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("request.required.acks", 1),
+        ("delivery.timeout.ms", 1000),
+        ("max.in.flight", 100),
+    ],
+)
+# Pins INV-KAFKA-1.
+def test_librdkafka_alias_keys_rejected_in_extra_config(
+    producer_class: MagicMock, key: str, value: int
+) -> None:
+    with pytest.raises(ValueError, match=key):
+        MutationProducer("broker:9092", extra_config={key: value})
+
+
+# Pins INV-KAFKA-1.
 def test_transactional_id_in_extra_config_rejected(
     producer_class: MagicMock,
 ) -> None:
@@ -130,6 +149,7 @@ def test_delivery_callback_is_forwarded(producer_class: MagicMock) -> None:
     callback.assert_called_once_with(None, message)
 
 
+# Pins INV-KAFKA-13.
 def test_user_on_delivery_exception_does_not_escape(
     producer_class: MagicMock,
 ) -> None:
@@ -154,6 +174,7 @@ def test_user_on_delivery_exception_does_not_escape(
 # ── Sticky delivery errors (nontransactional) ────────────────────
 
 
+# Pins INV-KAFKA-2.
 def test_produce_raises_after_delivery_failure(
     producer_class: MagicMock,
 ) -> None:
@@ -172,6 +193,7 @@ def test_produce_raises_after_delivery_failure(
     assert kafka_client.produce.call_count == 1
 
 
+# Pins INV-KAFKA-2.
 def test_flush_raises_delivery_failure(producer_class: MagicMock) -> None:
     kafka_client = producer_class.return_value
     producer = MutationProducer("broker:9092")
@@ -184,8 +206,10 @@ def test_flush_raises_delivery_failure(producer_class: MagicMock) -> None:
         producer.flush()
 
     assert raised.value.args == (error,)
+    kafka_client.flush.assert_called_once()
 
 
+# Pins INV-KAFKA-3.
 def test_sticky_error_persists_across_flushes(
     producer_class: MagicMock,
 ) -> None:
@@ -202,8 +226,10 @@ def test_sticky_error_persists_across_flushes(
     with pytest.raises(KafkaException) as raised:
         producer.flush()
     assert raised.value.args == (error,)
+    assert producer.fatal is False
 
 
+# Pins INV-KAFKA-2, INV-KAFKA-3.
 def test_sticky_error_blocks_produce(producer_class: MagicMock) -> None:
     kafka_client = producer_class.return_value
     producer = MutationProducer("broker:9092")
@@ -264,6 +290,7 @@ def test_len_delegates_to_client(producer_class: MagicMock) -> None:
     assert len(producer) == 4
 
 
+# Pins INV-KAFKA-9.
 def test_len_raises_when_fatal(producer_class: MagicMock) -> None:
     producer = MutationProducer("broker:9092")
     producer.mark_fatal()
@@ -271,6 +298,7 @@ def test_len_raises_when_fatal(producer_class: MagicMock) -> None:
         len(producer)
 
 
+# Pins INV-KAFKA-9.
 def test_len_raises_when_closed(producer_class: MagicMock) -> None:
     kafka_client = producer_class.return_value
     kafka_client.flush.return_value = 0
@@ -283,24 +311,28 @@ def test_len_raises_when_closed(producer_class: MagicMock) -> None:
 # ── Transaction initialization tracking ──────────────────────────
 
 
+# Pins INV-KAFKA-10.
 def test_begin_before_init_fails(producer_class: MagicMock) -> None:
     producer = MutationProducer("broker:9092", transactional_id="txn-1")
     with pytest.raises(RuntimeError, match="init_transactions"):
         producer.begin_transaction()
 
 
+# Pins INV-KAFKA-10.
 def test_commit_before_init_fails(producer_class: MagicMock) -> None:
     producer = MutationProducer("broker:9092", transactional_id="txn-1")
     with pytest.raises(RuntimeError, match="init_transactions"):
         producer.commit_transaction()
 
 
+# Pins INV-KAFKA-10.
 def test_abort_before_init_fails(producer_class: MagicMock) -> None:
     producer = MutationProducer("broker:9092", transactional_id="txn-1")
     with pytest.raises(RuntimeError, match="init_transactions"):
         producer.abort_transaction()
 
 
+# Pins INV-KAFKA-10.
 def test_failed_init_does_not_mark_initialized(
     producer_class: MagicMock,
 ) -> None:
@@ -330,6 +362,7 @@ def test_successful_init_enables_transactions(
     kafka_client.begin_transaction.assert_called_once()
 
 
+# Pins INV-KAFKA-10.
 def test_init_transactions_cannot_be_called_twice(
     producer_class: MagicMock,
 ) -> None:
@@ -374,6 +407,7 @@ def test_abort_transaction_rejects_non_transactional(
         producer.abort_transaction()
 
 
+# Pins INV-KAFKA-4.
 def test_produce_in_transactional_mode_requires_open_transaction(
     producer_class: MagicMock,
 ) -> None:
@@ -414,6 +448,7 @@ def test_abort_without_open_transaction_raises(
 # ── Transaction-scoped error handling ─────────────────────────────
 
 
+# Pins INV-KAFKA-5.
 def test_commit_clears_delivery_errors(producer_class: MagicMock) -> None:
     kafka_client = producer_class.return_value
     producer = MutationProducer("broker:9092", transactional_id="txn-1")
@@ -425,10 +460,12 @@ def test_commit_clears_delivery_errors(producer_class: MagicMock) -> None:
     error = MagicMock(spec=KafkaError)
     report(error, MagicMock())
 
+    # Real librdkafka fails the commit here; this pins the clear on success only.
     producer.commit_transaction()
     assert producer._delivery_errors == []
 
 
+# Pins INV-KAFKA-5.
 def test_abort_clears_delivery_errors(producer_class: MagicMock) -> None:
     kafka_client = producer_class.return_value
     producer = MutationProducer("broker:9092", transactional_id="txn-1")
@@ -444,6 +481,7 @@ def test_abort_clears_delivery_errors(producer_class: MagicMock) -> None:
     assert producer._delivery_errors == []
 
 
+# Pins INV-KAFKA-5, INV-KAFKA-7.
 def test_failed_abort_preserves_errors_and_marks_fatal(
     producer_class: MagicMock,
 ) -> None:
@@ -463,9 +501,11 @@ def test_failed_abort_preserves_errors_and_marks_fatal(
     with pytest.raises(KafkaException):
         producer.abort_transaction()
     assert len(producer._delivery_errors) == 1
-    assert producer._fatal is True
+    assert producer.fatal is True
+    assert producer._txn_open is True
 
 
+# Pins INV-KAFKA-5.
 def test_produce_abort_then_clean_flush(producer_class: MagicMock) -> None:
     kafka_client = producer_class.return_value
     kafka_client.flush.return_value = 0
@@ -493,6 +533,7 @@ def test_produce_abort_then_clean_flush(producer_class: MagicMock) -> None:
 # ── Fatal and closed states ───────────────────────────────────────
 
 
+# Pins INV-KAFKA-9.
 def test_fatal_blocks_produce(producer_class: MagicMock) -> None:
     producer = MutationProducer("broker:9092")
     producer.mark_fatal()
@@ -500,6 +541,7 @@ def test_fatal_blocks_produce(producer_class: MagicMock) -> None:
         producer.produce("t", mutations_pb2.FDBMutationRecord())
 
 
+# Pins INV-KAFKA-9.
 def test_fatal_blocks_flush(producer_class: MagicMock) -> None:
     producer = MutationProducer("broker:9092")
     producer.mark_fatal()
@@ -507,6 +549,7 @@ def test_fatal_blocks_flush(producer_class: MagicMock) -> None:
         producer.flush()
 
 
+# Pins INV-KAFKA-9.
 def test_fatal_blocks_transaction_methods(
     producer_class: MagicMock,
 ) -> None:
@@ -517,15 +560,7 @@ def test_fatal_blocks_transaction_methods(
         producer.begin_transaction()
 
 
-def test_error_cb_fatal_marks_producer_fatal(producer_class: MagicMock) -> None:
-    producer = MutationProducer("broker:9092")
-    err = MagicMock(spec=KafkaError)
-    err.fatal.return_value = True
-
-    producer._error_cb(err)
-    assert producer._fatal is True
-
-
+# Pins INV-KAFKA-8.
 def test_error_cb_non_fatal_does_not_mark_fatal(
     producer_class: MagicMock,
 ) -> None:
@@ -534,9 +569,10 @@ def test_error_cb_non_fatal_does_not_mark_fatal(
     err.fatal.return_value = False
 
     producer._error_cb(err)
-    assert producer._fatal is False
+    assert producer.fatal is False
 
 
+# Pins INV-KAFKA-13.
 def test_user_error_cb_is_chained(producer_class: MagicMock) -> None:
     user_cb = MagicMock()
     producer = MutationProducer("broker:9092", extra_config={"error_cb": user_cb})
@@ -546,9 +582,10 @@ def test_user_error_cb_is_chained(producer_class: MagicMock) -> None:
     producer._error_cb(err)
 
     user_cb.assert_called_once_with(err)
-    assert producer._fatal is True
+    assert producer.fatal is True
 
 
+# Pins INV-KAFKA-13.
 def test_user_error_cb_exception_is_swallowed(
     producer_class: MagicMock,
 ) -> None:
@@ -561,24 +598,187 @@ def test_user_error_cb_exception_is_swallowed(
     user_cb.assert_called_once_with(err)
 
 
-def test_commit_fatal_kafka_error_marks_producer_fatal(
-    producer_class: MagicMock,
-) -> None:
-    kafka_client = producer_class.return_value
+def _fatal_kafka_exception() -> KafkaException:
     err = MagicMock(spec=KafkaError)
     err.fatal.return_value = True
-    kafka_client.commit_transaction.side_effect = KafkaException(err)
+    return KafkaException(err)
 
+
+def _non_fatal_kafka_exception() -> KafkaException:
+    err = MagicMock(spec=KafkaError)
+    err.fatal.return_value = False
+    return KafkaException(err)
+
+
+def _open_txn_producer() -> MutationProducer:
     producer = MutationProducer("broker:9092", transactional_id="txn-1")
     producer.init_transactions()
     producer.begin_transaction()
+    return producer
+
+
+def test_fatal_cause_none_initially(producer_class: MagicMock) -> None:
+    producer = MutationProducer("broker:9092")
+    assert producer.fatal_cause is None
+    assert producer.fatal is False
+
+
+def test_fatal_cause_exported_from_package() -> None:
+    import fdb_kafka_bridge.kafka as kafka_pkg
+
+    assert kafka_pkg.FatalCause is FatalCause
+    assert "FatalCause" in kafka_pkg.__all__
+
+
+def test_fatal_cause_values() -> None:
+    assert FatalCause.KAFKA == "kafka"
+    assert FatalCause.ABORT_FAILED == "abort_failed"
+
+
+# Pins INV-KAFKA-8.
+def test_error_cb_fatal_sets_kafka_cause(producer_class: MagicMock) -> None:
+    producer = MutationProducer("broker:9092")
+    err = MagicMock(spec=KafkaError)
+    err.fatal.return_value = True
+
+    producer._error_cb(err)
+
+    assert producer.fatal_cause is FatalCause.KAFKA
+    assert producer.fatal is True
+
+
+# Pins INV-KAFKA-8.
+def test_mark_fatal_sets_kafka_cause(producer_class: MagicMock) -> None:
+    producer = MutationProducer("broker:9092")
+    producer.mark_fatal()
+    assert producer.fatal_cause is FatalCause.KAFKA
+
+
+# Pins INV-KAFKA-8.
+def test_init_fatal_kafka_error_sets_kafka_cause(producer_class: MagicMock) -> None:
+    producer_class.return_value.init_transactions.side_effect = _fatal_kafka_exception()
+    producer = MutationProducer("broker:9092", transactional_id="txn-1")
+
+    with pytest.raises(KafkaException):
+        producer.init_transactions()
+
+    assert producer.fatal_cause is FatalCause.KAFKA
+
+
+# Pins INV-KAFKA-8.
+def test_begin_fatal_kafka_error_sets_kafka_cause(producer_class: MagicMock) -> None:
+    producer_class.return_value.begin_transaction.side_effect = _fatal_kafka_exception()
+    producer = MutationProducer("broker:9092", transactional_id="txn-1")
+    producer.init_transactions()
+
+    with pytest.raises(KafkaException):
+        producer.begin_transaction()
+
+    assert producer.fatal_cause is FatalCause.KAFKA
+
+
+# Pins INV-KAFKA-8.
+def test_commit_fatal_kafka_error_sets_kafka_cause(producer_class: MagicMock) -> None:
+    producer_class.return_value.commit_transaction.side_effect = (
+        _fatal_kafka_exception()
+    )
+    producer = _open_txn_producer()
 
     with pytest.raises(KafkaException):
         producer.commit_transaction()
 
-    assert producer._fatal is True
+    assert producer.fatal_cause is FatalCause.KAFKA
 
 
+# Pins INV-KAFKA-7.
+def test_abort_fatal_kafka_error_sets_kafka_cause(producer_class: MagicMock) -> None:
+    producer_class.return_value.abort_transaction.side_effect = _fatal_kafka_exception()
+    producer = _open_txn_producer()
+
+    with pytest.raises(KafkaException):
+        producer.abort_transaction()
+
+    assert producer.fatal_cause is FatalCause.KAFKA
+
+
+# Pins INV-KAFKA-7.
+def test_abort_non_fatal_kafka_error_sets_abort_failed_cause(
+    producer_class: MagicMock,
+) -> None:
+    producer_class.return_value.abort_transaction.side_effect = (
+        _non_fatal_kafka_exception()
+    )
+    producer = _open_txn_producer()
+
+    with pytest.raises(KafkaException):
+        producer.abort_transaction()
+
+    assert producer.fatal_cause is FatalCause.ABORT_FAILED
+    assert producer.fatal is True
+
+
+# Pins INV-KAFKA-7.
+def test_abort_non_kafka_exception_sets_abort_failed_cause(
+    producer_class: MagicMock,
+) -> None:
+    producer_class.return_value.abort_transaction.side_effect = OSError("boom")
+    producer = _open_txn_producer()
+
+    with pytest.raises(OSError, match="boom"):
+        producer.abort_transaction()
+
+    assert producer.fatal_cause is FatalCause.ABORT_FAILED
+    assert producer._txn_open is True
+
+
+# Pins INV-KAFKA-8.
+def test_kafka_cause_overrides_abort_failed(producer_class: MagicMock) -> None:
+    producer_class.return_value.abort_transaction.side_effect = (
+        _non_fatal_kafka_exception()
+    )
+    producer = _open_txn_producer()
+    with pytest.raises(KafkaException):
+        producer.abort_transaction()
+    err = MagicMock(spec=KafkaError)
+    err.fatal.return_value = True
+
+    producer._error_cb(err)
+
+    assert producer.fatal_cause is FatalCause.KAFKA
+
+
+# Pins INV-KAFKA-8.
+def test_mark_fatal_overrides_abort_failed(producer_class: MagicMock) -> None:
+    producer_class.return_value.abort_transaction.side_effect = OSError("boom")
+    producer = _open_txn_producer()
+    with pytest.raises(OSError):
+        producer.abort_transaction()
+
+    producer.mark_fatal()
+
+    assert producer.fatal_cause is FatalCause.KAFKA
+
+
+# Pins INV-KAFKA-8.
+def test_abort_failed_never_downgrades_kafka(producer_class: MagicMock) -> None:
+    producer = _open_txn_producer()
+    err = MagicMock(spec=KafkaError)
+    err.fatal.return_value = True
+
+    # librdkafka can report a fatal error_cb while abort is in progress.
+    def abort(timeout: float) -> None:
+        producer._error_cb(err)
+        raise OSError("boom")
+
+    producer_class.return_value.abort_transaction.side_effect = abort
+
+    with pytest.raises(OSError):
+        producer.abort_transaction()
+
+    assert producer.fatal_cause is FatalCause.KAFKA
+
+
+# Pins INV-KAFKA-9.
 def test_use_after_close_raises_closed_error(producer_class: MagicMock) -> None:
     kafka_client = producer_class.return_value
     kafka_client.flush.return_value = 0
@@ -638,9 +838,10 @@ def test_close_marks_closed(producer_class: MagicMock) -> None:
     producer = MutationProducer("broker:9092")
     producer.close()
     assert producer._closed is True
-    assert producer._fatal is False
+    assert producer.fatal is False
 
 
+# Pins INV-KAFKA-11.
 def test_close_aborts_open_transaction(producer_class: MagicMock) -> None:
     kafka_client = producer_class.return_value
     kafka_client.flush.return_value = 0
@@ -670,6 +871,7 @@ def test_close_does_not_abort_when_no_transaction_open(
     kafka_client.flush.assert_called_once_with(10.0)
 
 
+# Pins INV-KAFKA-11.
 def test_close_logs_warning_when_flush_raises(
     producer_class: MagicMock, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -682,3 +884,96 @@ def test_close_logs_warning_when_flush_raises(
 
     assert "3 message(s) could not be delivered during close" in caplog.text
     assert producer._closed is True
+
+
+# Pins INV-KAFKA-11.
+def test_close_twice_is_noop(producer_class: MagicMock) -> None:
+    kafka_client = producer_class.return_value
+    kafka_client.flush.return_value = 0
+    producer = MutationProducer("broker:9092")
+
+    producer.close()
+    producer.close()
+
+    kafka_client.flush.assert_called_once_with(10.0)
+    assert producer.closed is True
+
+
+# Pins INV-KAFKA-11.
+def test_close_swallows_failed_abort(
+    producer_class: MagicMock, caplog: pytest.LogCaptureFixture
+) -> None:
+    kafka_client = producer_class.return_value
+    kafka_client.flush.return_value = 0
+    kafka_client.abort_transaction.side_effect = _non_fatal_kafka_exception()
+    producer = _open_txn_producer()
+
+    with caplog.at_level("DEBUG", logger="fdb_kafka_bridge.kafka.producer"):
+        producer.close()
+
+    assert producer.closed is True
+    assert "Abort during close" in caplog.text
+
+
+# ── Commit failure and closed/fatal precedence ────────────────────
+
+
+# Pins INV-KAFKA-5, INV-KAFKA-6.
+def test_non_fatal_failed_commit_leaves_transaction_open(
+    producer_class: MagicMock,
+) -> None:
+    kafka_client = producer_class.return_value
+    kafka_client.commit_transaction.side_effect = _non_fatal_kafka_exception()
+    producer = _open_txn_producer()
+    producer.produce("t", mutations_pb2.FDBMutationRecord())
+    report = kafka_client.produce.call_args.kwargs["on_delivery"]
+    error = MagicMock(spec=KafkaError)
+    report(error, MagicMock())
+
+    with pytest.raises(KafkaException):
+        producer.commit_transaction()
+
+    assert producer.fatal is False
+    assert producer._delivery_errors == [error]
+    kafka_client.abort_transaction.side_effect = None
+    producer.abort_transaction()
+    kafka_client.abort_transaction.assert_called_once()
+
+
+# Pins INV-KAFKA-9.
+def test_closed_reported_before_fatal(producer_class: MagicMock) -> None:
+    producer_class.return_value.flush.return_value = 0
+    producer = MutationProducer("broker:9092", transactional_id="txn-1")
+    producer.init_transactions()
+    producer.mark_fatal()
+    producer.close()
+
+    with pytest.raises(RuntimeError, match="closed"):
+        producer.produce("t", mutations_pb2.FDBMutationRecord())
+    with pytest.raises(RuntimeError, match="closed"):
+        producer.flush()
+    with pytest.raises(RuntimeError, match="closed"):
+        producer.begin_transaction()
+
+
+@pytest.mark.parametrize(
+    "method",
+    [
+        "init_transactions",
+        "begin_transaction",
+        "commit_transaction",
+        "abort_transaction",
+    ],
+)
+# Pins INV-KAFKA-9.
+def test_closed_blocks_transaction_methods(
+    producer_class: MagicMock, method: str
+) -> None:
+    producer_class.return_value.flush.return_value = 0
+    producer = MutationProducer("broker:9092", transactional_id="txn-1")
+    producer.close()
+
+    with pytest.raises(
+        RuntimeError, match=f"{method} cannot proceed: producer is closed"
+    ):
+        getattr(producer, method)()
