@@ -7,7 +7,7 @@ Streams changes in a FoundationDB key range (configured as hex `begin_key`/`end_
 ```bash
 make setup && source .venv/bin/activate
 make lint
-make test        # unit tests; FDB and Kafka integration tests skip without a live stack
+make test        # unit tests; FDB/Kafka integration tests skip unless FDB_CDC_INTEGRATION=1 / KAFKA_INTEGRATION=1
 ```
 
 Requires Python 3.12. Commits must be signed — see [Signed commits](docs/conventions.md#signed-commits).

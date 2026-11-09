@@ -1102,15 +1102,17 @@ while running:
 
         if error.txn_requires_abort():
             producer.abort_transaction()
+            # Nothing was committed: do not acknowledge; re-read and retry.
+            continue
 
         elif error.retriable():
+            # Transaction still open, outcome unknown: retry commit_transaction()
+            # until it succeeds (fall through) or requires abort. Never begin a
+            # new transaction here.
             ...
 
         else:
             raise
-
-        # Nothing was committed: do not acknowledge; re-read and retry.
-        continue
 
     acknowledge_fdb(cursor)  # only reached after a successful commit
 ```

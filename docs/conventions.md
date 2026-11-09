@@ -16,6 +16,7 @@ How the team lays out the repo, branches, writes Python, and merges. Tooling enf
 | `.github/` | CI workflows, PR template, issue templates |
 | `.devcontainer/` | Dev container + `docker-compose.yml` (FDB + Kafka stack) |
 | `.agents/`, `.cursor/` | Agent skills and Cursor rules |
+| `.claude/skills/` | Symlinks to `.agents/skills/` so Claude Code loads the shared skills; the rest of `.claude/` is gitignored |
 | `Dockerfile` | FDB + native CDC runtime image; `FDB_VERSION` is the canonical FDB version |
 | `buf.yaml`, `buf.gen.yaml` | buf module, lint/breaking config, codegen → `protobuf/gen` |
 | `pyproject.toml`, `requirements-dev.txt`, `.pre-commit-config.yaml`, `Makefile` | Project metadata and tool config, pinned dev tools, hooks, dev commands |
@@ -40,7 +41,7 @@ A `develop` integration branch is planned but does not exist yet; until it does,
 
 ## Specs
 
-Docs are either **Normative** (component specs, this file) or **Research / Historical** (deep dives, [`Proposal.md`](../Proposal.md), schema validation). Code must match normative docs; research docs carry a status banner naming the normative doc that supersedes them. [`INDEX.md`](INDEX.md) records each doc's status.
+Docs are either **Normative** (component specs, this file, `AGENTS.md` and agent skills, [`demo/README.md`](../demo/README.md)) or **Research / Historical** (deep dives, [`Proposal.md`](../Proposal.md), schema validation). Code must match normative docs; research docs carry a status banner naming the normative doc that supersedes them. [`INDEX.md`](INDEX.md) records each doc's status.
 
 - **Same-PR rule.** A behaviour change updates the owning spec in the same PR.
 - **Single owner per error rule.** Each error class's handling rule lives in the spec of the component that raises it; other specs link to that anchor instead of restating it.

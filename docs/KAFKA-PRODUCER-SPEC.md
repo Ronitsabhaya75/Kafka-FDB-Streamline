@@ -18,9 +18,9 @@ message.timeout.ms=0
 
 These settings are applied after `extra_config`, and `extra_config` may not
 contain these exact keys. Their librdkafka aliases (`request.required.acks`,
-`max.in.flight`, `delivery.timeout.ms`) are not rejected and could weaken them,
-so callers must not pass them. Five
-in-flight requests preserves ordering because idempotence is enabled. The
+`max.in.flight`, `delivery.timeout.ms`) are not rejected; they are overridden,
+because the mandatory settings are set last and librdkafka keeps the last value
+set. Five in-flight requests preserves ordering because idempotence is enabled. The
 gapless guarantee makes librdkafka raise a fatal error rather than commit later messages past a
 permanently failed one. Setting `message.timeout.ms=0` (infinite timeout) is
 required because librdkafka's gapless guarantee does not cover messages that time
@@ -154,8 +154,8 @@ a producer that is both reports closed. Blocked methods raise `RuntimeError`:
 | `init_transactions()`, `begin_transaction()`, `commit_transaction()`, `abort_transaction()` | `<method> cannot proceed: producer is closed` | `<method> cannot proceed: producer is in a fatal error state` |
 
 Transaction methods additionally raise `<method> requires a transactional_id`
-on a nontransactional producer and `<method> requires init_transactions() to be
-called first` before initialisation.
+on a nontransactional producer and, except `init_transactions()` itself,
+`<method> requires init_transactions() to be called first` before initialisation.
 
 ## Flushing and close behaviour
 

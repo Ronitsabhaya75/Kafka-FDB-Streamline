@@ -148,8 +148,8 @@ surfaces as `VersionEnd.bridge_timestamp_ns`. Unknown fields are ignored. An abs
 - Not checked: FDB key/value size limits, system keys, empty keys/values, clear-range order,
   operand widths, legacy/undeclared type codes. All are forwarded as-is.
 - Keyword checks run in signature order before `mutations` is iterated, so a bad keyword
-  leaves a generator unconsumed. The position assigned to batch element `i` is checked before
-  element `i` is read.
+  leaves a generator unconsumed. The position assigned to batch element `i` is checked after
+  element `i` is pulled from the iterator but before any of its attributes are read.
 
 ## 5. Errors
 

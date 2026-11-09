@@ -73,9 +73,9 @@ A caller driving `BridgePipeline` directly must follow these rules. `Bridge` fol
 #### Deviations in `Bridge`
 
 - Rule 5: `Bridge` never reuses the producer after an abort. A rebuild always closes and replaces it.
-- Rule 6: `Bridge` treats 2000 as terminal everywhere and does not implement retry-once, so a restart within ~5 s of a crash can fail `start()` while the predecessor's lease is held.
+- Rule 6: `Bridge` treats 2000 as terminal everywhere and does not implement retry-once, so a restart within ~5 s of a crash can fail `start()` (resume re-ack) or, without a resume cursor, the first `step()` while the predecessor's lease is held.
 - Rule 7: `Bridge.stop()` gives up on the first exception of any kind, or after `shutdown_timeout_seconds`, then closes the producer. Each `step()` already spends the full commit budget.
-- Rule 8: a fatal Kafka error raised by `step()` shuts `Bridge` down rather than replacing the producer. A producer that is `fatal` without one being raised (a failed `abort_transaction()`, or a librdkafka fatal seen only by `error_cb`) is replaced by a rebuild.
+- Rule 8: a fatal Kafka error raised by `step()` shuts `Bridge` down rather than replacing the producer. A producer that is `fatal` without one being raised (a failed `abort_transaction()` whose own error is not fatal, or a librdkafka fatal seen only by `error_cb`) is replaced by a rebuild. A fatal abort error (e.g. fenced) is raised by `step()` and shuts `Bridge` down.
 
 ---
 

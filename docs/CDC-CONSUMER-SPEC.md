@@ -128,8 +128,10 @@ class FDBMutationListener:
 Supply exactly one of `key_range` or `subspace` to register a stream when the listener
 starts. Omit both to consume a stream registered elsewhere. Supplying both is invalid.
 
-`get_position()` returns the native cursor for the last **delivered** reply, which may be ahead
-of the last acknowledged one. Persist it only after the records it covers are durable.
+`get_position()` returns the native cursor for the last **consumed** reply, which may be ahead
+of the last acknowledged one. That includes a reply that failed to serialize and was never
+returned. Persist it only after the records it covers are durable, and never while
+`delivery_failed` is set: resuming from it would skip that reply.
 
 `close()` closes the native consumer only: it never acknowledges and never removes the stream.
 Only `acknowledge()` and the resume re-ack acknowledge.
@@ -137,16 +139,18 @@ Only `acknowledge()` and the resume re-ack acknowledge.
 `poll_records()` and `consumer` start the listener lazily. `consumer` raises whatever `start()`
 raises, unchanged. `poll_records()` starts inside its consume failure handling, so a `start()`
 failure is classified like a native consume failure (§2.4): `CDCRetryableError` /
-`CDCTerminalError` keep their class, a raw `FDBError` propagates unchanged, and anything else
-(`CDCInvalidCursorError`, `CDCNotSupportedError`, `CDCInvalidRangeError`, `RuntimeError`, …)
-is wrapped as `CDCError` with the original as `__cause__`. Call `start()` first to get its
-exceptions unwrapped.
+`CDCTerminalError` keep their class, a raw `FDBError` with code 1007, 1211 or 2000 becomes
+`CDCTerminalError` / `CDCRetryableError`, any other raw `FDBError` propagates unchanged, and
+anything else (`CDCInvalidCursorError`, `CDCNotSupportedError`, `CDCInvalidRangeError`,
+`RuntimeError`, …) is wrapped as `CDCError` with the original as `__cause__`. Call `start()`
+first to get its exceptions unwrapped.
 
 | Method | Raises |
 |---|---|
-| `start()` | `CDCConsumerClosedError` (closed listener); `CDCInvalidRangeError`; `CDCInvalidCursorError` (malformed cursor, or read-version wait timed out); `CDCNotSupportedError`; `RuntimeError` (API-version conflict); `CDCRetryableError` / `CDCTerminalError` / `CDCError` from the resume re-ack, classified per §2.4; raw native `FDBError` from open, registration, consumer creation, or any other re-ack code. |
+| `start()` | `CDCConsumerClosedError` (closed listener); `CDCInvalidRangeError`; `CDCInvalidCursorError` (malformed cursor, or read-version wait timed out); `CDCNotSupportedError`; `RuntimeError` (API-version conflict, or any binding `RuntimeError` not about CDC support); `CDCRetryableError` / `CDCTerminalError` / `CDCError` from the resume re-ack, classified per §2.4; raw native `FDBError` from open, registration, consumer creation, the resume read-version wait, or any other re-ack code. |
 | `poll_records()` | `CDCConsumerClosedError` (closed, including closed while the consume was in flight); `CDCError` (reply awaiting ack, prior serialization failure, or wrapped non-native consume failure); `CDCRetryableError` / `CDCTerminalError`; raw native `FDBError` for any other code; `SerializationError` subclasses including `RecordTooLargeError`; a first-call `start()` failure, classified as above. |
 | `acknowledge()` | `CDCConsumerClosedError` (closed, including closed while the ack was in flight); `CDCError` (nothing awaiting ack, prior serialization failure, or wrapped non-native ack failure); `CDCRetryableError` / `CDCTerminalError`; raw native `FDBError` for any other code. |
+| `get_position()` | `CDCConsumerClosedError` (closed listener); starts the listener lazily, so whatever `start()` raises, unchanged. |
 | `close()` | Whatever the native `close()` raises. |
 
 ### 2.3 Prefix Utilities (`src/fdb_kafka_bridge/cdc/listener.py`)
