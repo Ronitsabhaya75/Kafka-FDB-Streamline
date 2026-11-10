@@ -13,8 +13,9 @@ producing, idle-watermark policy.
 
 - The serializer forwards native mutations unchanged: no rewriting, merging or validation of
   operands, keys or type-code semantics
-  ([deep-dive §5](CDC-DEEP-DIVE.md#5-mapping-onto-the-kafka-proposal)). With real CDC input and
-  a valid stream name, no serializer error can fire.
+  ([deep-dive §5](CDC-DEEP-DIVE.md#5-mapping-onto-the-kafka-proposal)). With real CDC input, a
+  valid stream name, in-range keywords (§2.1) and a `max_record_bytes` sized per §2.2, no
+  serializer error can fire.
 - Pure: no state, clock, I/O or logging. Equal arguments give equal bytes.
 - All-or-nothing: every call returns its full result or raises.
 - The deserializer is strict on identity (record body, version index, type code, batch shape)
@@ -26,6 +27,8 @@ Import from `fdb_kafka_bridge.serialization`; everything in its `__all__` is con
 in `_`-modules. Runtime dependency: `protobuf>=7.34,<8` (the committed gencode is 6.30.2,
 which protobuf 8 will not load); generated code is imported as
 `from fdbkafka.cdc.v1 import mutations_pb2` (installed with the wheel; from a checkout, `protobuf/gen` on the path).
+The `buf.gen.yaml` plugins (`v30.2`) produce that gencode, and the `requirements-dev.txt`
+protobuf pin must sit in the runtime range.
 
 ### 2.1 Input
 
@@ -34,7 +37,9 @@ Upstream `CdcMutation` conforms. Attributes are read by name, once each; the obj
 indexed or unpacked, so a bare tuple is rejected.
 
 `MutationType` is an `IntEnum` of the 16 declared type codes (mirrors upstream
-`CdcMutationType`). It is a convenience for callers; neither path looks a type code up in it.
+`CdcMutationType`; names, minus `MUTATION_TYPE_`, and values match the proto
+`FDBSingleKeyMutation.MutationType`). It is a convenience for callers; neither path looks a
+type code up in it.
 
 Ranges (inclusive; the limits are not exported):
 
@@ -71,16 +76,17 @@ serialize_version_group(mutations, *, fdb_version, max_record_bytes, stream_name
   (fdb_version, n-1)` in order, then exactly one version end with `total_mutations == n`. An
   empty group returns only the version end. *Caller precondition:* `mutations` is the whole
   group.
-  - `max_record_bytes` bounds `len()` of each returned value only; Kafka key, headers and
-    framing are the caller's to subtract.
+  - `max_record_bytes` bounds `len()` of each returned value only, inclusively; Kafka key,
+    headers and framing are the caller's to subtract.
   - Slicing is greedy in native order; each batch record is byte-identical to
     `serialize_batch` of its slice.
   - A mutation is never split. If one mutation's one-element batch record, or the version-end
-    record, exceeds the budget → `RecordTooLargeError`.
+    record, exceeds the budget → `RecordTooLargeError`. If both do, the mutation's error
+    (`index = i`) is raised.
   - Returns a list, so an invalid mutation anywhere raises before any record is produced.
 
 The primitives have no size cap. Sizing: FDB caps keys at 10,000 B and values at 100,000 B, so
-a budget of 128 KiB plus the stream name's length never raises on real CDC data.
+a budget of 128 KiB plus the stream name's UTF-8 byte length never raises on real CDC data.
 
 ### 2.3 Deserialize
 
@@ -141,8 +147,9 @@ surfaces as `VersionEnd.bridge_timestamp_ns`. Unknown fields are ignored. An abs
 - The type code alone accepts `IntEnum` (upstream `CdcMutationType`), normalized to plain `int`.
 - Not checked: FDB key/value size limits, system keys, empty keys/values, clear-range order,
   operand widths, legacy/undeclared type codes. All are forwarded as-is.
-- Keyword checks run before `mutations` is iterated, so a bad keyword leaves a generator
-  unconsumed.
+- Keyword checks run in signature order before `mutations` is iterated, so a bad keyword
+  leaves a generator unconsumed. The position assigned to batch element `i` is checked after
+  element `i` is pulled from the iterator but before any of its attributes are read.
 
 ## 5. Errors
 
@@ -177,6 +184,10 @@ SerializationError(Exception)
 | `TYPE_CODE_OUT_OF_RANGE` | `mutation_type` outside 0..255 |
 | `EMPTY_BATCH` | `batch` arm with no mutations |
 | `INCONSISTENT_BATCH` | mixed `fdb_version`, or `sequence_no[i] != sequence_no[0] + i`; `index` = first offender |
+
+Checks run in a fixed order: per mutation, `version_index` presence → version range →
+mutation arm → type range. In a batch, any element's own fault outranks `INCONSISTENT_BATCH`,
+even when it sits after the first inconsistent position.
 
 Arms that are present but all-default (e.g. empty `version_end` → `VersionEnd(0, 0, None)`) are
 accepted: presence is checked, not content.

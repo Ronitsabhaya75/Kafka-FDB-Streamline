@@ -21,7 +21,7 @@ Also follow personal skill `managing-trello` for MCP mechanics.
 
 At session start for board work: `set_active_board` with that ID (or confirm with `get_active_board_info`).
 
-MCP namespace in this workspace: `project-0-GUI_Kafka-trello`.
+MCP server name: `trello` (see `.mcp.json.example` / `.cursor/mcp.json.example`); clients may prefix tool names with a workspace namespace.
 
 ## Lists (column flow)
 
@@ -70,8 +70,8 @@ Default new work → **Backlog**. Ready for this week → **To-DO**. Starting im
 ### Research / infra cards
 
 - CDC / docs research → label `research`
-- Docker, GHCR, Actions → label `Infra`
-- Keep card descriptions short; link to repo paths (`FDB-CDC-Deep-Dive.md`, Actions URL) instead of pasting secrets.
+- Docker, GitHub Actions → label `Infra`
+- Keep card descriptions short; link to repo paths (`docs/CDC-DEEP-DIVE.md`, Actions URL) instead of pasting secrets.
 
 ## Members (assign by ID)
 
@@ -89,5 +89,5 @@ Default new work → **Backlog**. Ready for this week → **To-DO**. Starting im
 
 - Create a second capstone board
 - Archive Sprints / pipeline lists
-- Put Trello API keys, GHCR tokens, or cluster secrets on cards
+- Put Trello API keys, GitHub tokens, or cluster secrets on cards
 - Mass-move or mass-archive without an explicit ask

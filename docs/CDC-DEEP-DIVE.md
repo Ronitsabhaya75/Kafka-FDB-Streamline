@@ -1,5 +1,9 @@
 # FoundationDB native CDC, deep dive
 
+> **Status: Research.** Describes upstream FoundationDB CDC and the design options it leaves open.
+> [`CDC-CONSUMER-SPEC.md`](CDC-CONSUMER-SPEC.md) is normative for this repo's behaviour, including
+> error classification. *As built* notes below mark where the bridge chose differently.
+
 Trello: [Research FoundationDB CDC Architecture & API](https://trello.com/c/DLfs4a8S)
 (`DLfs4a8S`).
 
@@ -13,10 +17,10 @@ retention monitoring (§3, *Retention*), Kafka key and partitioning (§5.1).
 |---|---|---|---|
 | 1 | Stream lifecycle | `register_cdc_stream` → `create_cdc_consumer` (or `resume_cdc_consumer` from a persisted cursor) → `consume` → durably apply **and checkpoint** → `acknowledge` → `close`. `close()` neither acks nor removes. Removal is terminal. Re-registering the name mints a new `stream_id`, killing every persisted cursor that names the old one. | [§1](#1-cdc-stream-lifecycle-deliverable-1) |
 | 2 | Python API | Five future-returning `Database` methods (`register_cdc_stream`, `remove_cdc_stream`, `list_cdc_streams`, `create_cdc_consumer`, `resume_cdc_consumer`), plus a `CdcConsumer` handle with `consume` / `acknowledge` (futures) and `get_position` / `close` (synchronous). Five value types, one non-exhaustive enum. `consume()` and `acknowledge()` take no arguments. No `asyncio`; `wait()` parks only its caller (§2.7). All of it prospective on unmerged PR #13925. | [§2](#2-python-api-deliverable-2) |
-| 3 | Limitations | At-least-once only. One oversized commit version stalls a stream permanently (`server_overloaded`, and no way to skip the version). No error mapping shipped, and the standard retry predicate is wrong about two of the three CDC error codes. Unacked streams retain TLog history with no age bound, and a TLog disk at 5 % free stops commits cluster-wide. **P1: #13925 and #13971 redefine the same symbols at the same API version, undetectable at load.** | [§3](#3-known-limitations-and-gaps-deliverable-3) |
+| 3 | Limitations | At-least-once only. One oversized commit version stalls a stream permanently (`server_overloaded`, and no way to skip the version). No error mapping shipped in the binding (ours is in `cdc/client.py`), and the standard retry predicate is wrong about two of the three CDC error codes. Unacked streams retain TLog history with no age bound, and a TLog disk at 5 % free stops commits cluster-wide. **P1: #13925 and #13971 redefine the same symbols at the same API version, undetectable at load.** | [§3](#3-known-limitations-and-gaps-deliverable-3) |
 | 4 | API version | API 800, hard-gated, raising synchronously below it. Selecting 800 also removes tenants and metaclusters, blob granules, ChangeFeed, storage cache servers, the configuration database and dynamic knobs, and encryption at rest. No released FDB has CDC. 7.4.7 has zero CDC symbols, and 8.0.0 is unreleased with no date. | [§4](#4-api-version-requirements-deliverable-4) |
 | 5 | Directory Layer | CDC registers **byte ranges**, not paths. Child **directories** get independent prefixes and will not appear on a parent stream. Nested **subspaces** share the prefix and will. Register `[rawPrefix, strinc(rawPrefix))`, never `dir.range()`. | [§2.5](#25-registering-a-directorys-range-) |
-| 6 | Kafka proposal mapping | CDC identity is `(version, array index)`. `sequence_no` and `VersionEnd` are bridge inventions. Empty `consume()` that still advances the cursor is the native idle watermark. The Kafka key picks a partition, not the partition count, and no key gives atomicity. Default: one partition per stream, FDB key as record key, `VersionEnd` per group; Kafka transactions next. | [§5](#5-mapping-onto-the-kafka-proposal), [§5.1](#51-kafka-record-key-partitioning-and-atomicity-) |
+| 6 | Kafka proposal mapping | CDC identity is `(version, array index)`. `sequence_no` and `VersionEnd` are bridge inventions. Empty `consume()` that still advances the cursor is the native idle watermark. The Kafka key picks a partition, not the partition count, and no key gives atomicity. Default: one partition per stream, FDB key as record key, `VersionEnd` per group; Kafka transactions next. *As built:* every record is keyed by stream name, not FDB key, so compaction is destructive ([§5.1](#51-kafka-record-key-partitioning-and-atomicity-)); a Kafka transactional mode already exists ([`KAFKA-PRODUCER-SPEC.md`](KAFKA-PRODUCER-SPEC.md#transactional-mode)). | [§5](#5-mapping-onto-the-kafka-proposal), [§5.1](#51-kafka-record-key-partitioning-and-atomicity-) |
 | 7 | Baseline snapshot | CDC starts at the registration commit version and never returns state. Register **first**, then range-read the directory in chunks, one transaction and one read version `R_i` each (5 s MVCC limit), then replay CDC dropping every mutation piece at `v ≤ R_i` in its chunk. Exact for every mutation type. Snapshot-then-register silently loses `(R, C)`. | [§1.6](#16-baseline-snapshot-and-handoff-) |
 
 ## How to read this
@@ -517,8 +521,8 @@ loop thread. Never decode on the network thread.
 ---
 ## 3. Known limitations and gaps (deliverable 3)
 
-> In one line: one range, one consumer, at-least-once, no error mapping, unbounded retention, plus
-> one poison pill and one P1.
+> In one line: one range, one consumer, at-least-once, no error mapping in the binding (ours is in
+> `cdc/client.py`), unbounded retention, plus one poison pill and one P1.
 
 Three of these can stop the project: L1, L2, L3. L5 and below are constraints to design around, not
 risks to plan against. Rows marked prospective depend on a named open PR and describe no shipped
@@ -530,9 +534,9 @@ artifact.
 | **L2** | #13925 and #13971 redefine the same exported symbols at the same API version, with no `_v2` and no version guard. `fdb_database_register_cdc_stream` goes 7 args to 5. `FDBCdcStreamInfo` goes 52 bytes to 40, so `CdcStreamInfo.begin_key`/`.end_key` (§2.2) cease to exist as fields. The value-type break is as bad as the signature break. | Silent memory corruption, both directions. `dlsym` resolves by name and succeeds, so nothing fails at load. See *ABI risk* below. | **Prospective**, both PRs open | #13971; `impl.py:1424-1440` @ `ee1fa01e6`; [mengxu-oai review](https://github.com/apple/foundationdb/pull/13971#pullrequestreview-5074513231) |
 | **L3** | Retention is released only by ack or removal, with no age bound. Upstream deliberately rejected automatic expiry: "automatic expiration is still the wrong default because it silently violates the retention contract." | **A cluster-wide write outage, not a consumer-local problem.** CDC tags spill by reference, so one stalled stream pins its TLogs' whole disk queue from its oldest unacked version, including every tag's bytes, not just its own. At 5 % TLog free space Ratekeeper stops every client's commits. It also holds recovery at `ALL_LOGS_RECRUITED`. The way out is always explicit: repair and ack forward, or remove and rebuild downstream ([§1.6](#16-baseline-snapshot-and-handoff-)). Signals in [*Retention*](#retention-what-to-watch-l3-) below. | Pin | `design/cdc.md:252-269`, `:682-690`, `:893-899`; safe-pop rule `:587-594`; `TLogServer.cpp:809-821, 1030-1072`; `Ratekeeper.cpp:936-1066` |
 | **L4** | Two processes cannot share a stream, since the server rejects concurrent consumes. Sequential interleaving is *not* rejected, and both share one durable ack frontier. | Bridge instances need external fencing (a single-writer lease). Without it, a restarted instance racing its predecessor advances the shared watermark and each sees the other's versions as already released. No fan-out, no consumer group, no partitioning. | Pin | `CDCProxy.cpp:1511-1516` (`activeConsumes > 0` → `client_invalid_operation`, comment: "A stream has one durable acknowledgement frontier, so concurrent logical consumers cannot be isolated"); cursor-trust check `:1527-1535`; `design/cdc.md:571` |
-| **L5** | At-least-once only. The ack cannot be bundled into a transaction with the sink's state, and `acknowledge()` takes no version argument, so granularity is the delivered batch. | Sink writes must be idempotent under whole-batch replay, and replay is expected after commit-proxy replacement rather than exceptional. Identify records by `(stream_id, version, index)` and upsert. That is a dedup identity, not the Kafka record key (§5.1). | Pin | `design/cdc.md:78-83` (exactly-once and transactional ack both listed non-goals) |
+| **L5** | At-least-once only. The ack cannot be bundled into a transaction with the sink's state, and `acknowledge()` takes no version argument, so granularity is the delivered batch. | Sink writes must be idempotent under whole-batch replay, and replay is expected after commit-proxy replacement rather than exceptional. Identify records by `(stream_id, version, index)` and upsert. That is a dedup identity, not the Kafka record key (§5.1). *As built:* Kafka-side transactional mode exists ([`KAFKA-PRODUCER-SPEC.md`](KAFKA-PRODUCER-SPEC.md#transactional-mode)); it does not change this row, since the CDC ack still cannot join the transaction. | Pin | `design/cdc.md:78-83` (exactly-once and transactional ack both listed non-goals) |
 | **L6** | CDC delivers committed effects, not application calls. See *Mutation fidelity* below. | No transaction id, timestamp, or application operation name. Nothing in the wire format supplies them. | Pin | `fdb_c.h:213-232` |
-| **L7** | No error mapping in the binding. Every native failure arrives as a raw `fdb.FDBError`. See *Errors we have to map* below. | We write the mapping. Three codes matter, and the standard retry predicate is wrong about two. | **Prospective**, #13925 | `NativeCdc.cpp:242-244`; `fdb_c.cpp:167-184` |
+| **L7** | No error mapping in the binding. Every native failure arrives as a raw `fdb.FDBError`. See *Errors we have to map* below. | We write the mapping (*as built:* `cdc/client.py`, classes in [`CDC-CONSUMER-SPEC.md` §2.4](CDC-CONSUMER-SPEC.md#24-errors-srcfdb_kafka_bridgecdcerrorspy)). Three codes matter, and the standard retry predicate is wrong about two. | **Prospective**, #13925 | `NativeCdc.cpp:242-244`; `fdb_c.cpp:167-184` |
 | **L8** | A stream's key range is fixed at registration. Changing it means remove plus re-register, terminal for existing cursors. | A downstream rebuild, not a reconfiguration. #13971 would allow a union of up to 1,024 ranges, still with one cursor and one watermark for all of them. | Pin; union **prospective** (#13971) | `design/cdc.md:84-85`; [mengxu-oai review](https://github.com/apple/foundationdb/pull/13971#pullrequestreview-5074513231) ("does not add independent progress or retention for each range") |
 
 ### Mutation fidelity ▽
@@ -588,7 +592,7 @@ Python raw as `fdb.FDBError`. The binding adds only `RuntimeError` (API < 800, m
 
 | Code | Meaning on CDC | `is_retryable` | Correct action |
 |---|---|---|---|
-| `transaction_too_old` (1007) | Requested data already popped, a retention-invariant violation, terminal | **`True`** (`fdb_c.cpp:176`) | Stop. A conventional retry loop spins forever on unrecoverable data loss. Alert, then rebuild. |
+| `transaction_too_old` (1007) | Cursor behind the already-acked watermark (a consumer bug), or required data already popped (a retention-invariant violation); terminal either way (§1.4) | **`True`** (`fdb_c.cpp:176`) | Stop. A conventional retry loop spins forever. Alert, then rebuild. |
 | `server_overloaded` (1211) | Reply-budget or buffer-limit trip, including the L1 poison pill | **`False`**, absent from every predicate list (`fdb_c.cpp:167-184`) | Back off and retry with a bound. If it repeats at one version, it is L1: escalate, do not spin. |
 | `client_invalid_operation` (2000) | Concurrent consumer, unproven cursor, or a resume that skipped reconcile, or a predecessor's cancelled or abandoned poll still holding the proxy lease (≤ 5 s) | `False` | Terminal for the request. Distinguish fencing loss from cursor-proof failure before retrying. Within 5 s of a cancel or crash, back off past the lease and retry once. |
 
@@ -795,6 +799,16 @@ not atomic with Kafka. Expect rewind after CDC proxy replacement.
 > atomicity. Default: one partition per stream, FDB key as record key, `VersionEnd` per group.
 > Upgrade: Kafka transactions, then key-hash partitions if a reader needs them.
 
+> **As built.** The bridge keys every record by stream name (`raw_stream_name` unless
+> `partition_key` overrides it; [`BRIDGE-PIPELINE-SPEC.md`](BRIDGE-PIPELINE-SPEC.md#partition-key)),
+> not by FDB key: option (c)'s key with (a)'s single partition per stream. Total order per stream
+> holds as analysed below. **Do not enable compaction on these topics.** With one key per stream,
+> compaction keeps only the last record of the whole stream and silently discards every earlier
+> mutation. The *Compaction* paragraph below assumes FDB-key keys and does not apply as built.
+> Kafka transactions (option (d)) are implemented as a producer mode
+> ([`KAFKA-PRODUCER-SPEC.md`](KAFKA-PRODUCER-SPEC.md#transactional-mode)); CDC itself stays
+> at-least-once (L5).
+
 **Key is not partition.** Unless the producer names a partition, it is `hash(key) mod N`.
 confluent-kafka inherits librdkafka's `partitioner=consistent_random` (CRC32 of the key, null keys
 random) ([librdkafka CONFIGURATION.md][rdk-conf]). The Java client uses `murmur2(key) mod N`
@@ -824,7 +838,7 @@ add streams (directories, or key-range shards of one directory), each with its o
 | (d) Kafka transactions over (a), (b) or (c) | Unchanged | **Atomic across partitions** for `read_committed` readers ([KIP-98][kip98]) | Unchanged | An open transaction stalls `read_committed` readers at the last stable offset. Commit latency per transaction. Commit markers occupy offsets |
 | Key = commit version | Within a group only | None across partitions | N | *V+1* can be read before *V*; per-key last-writer-wins breaks |
 
-**Compaction.** Sound only for directories that emit `SET_VALUE` and single-key clears. A single-key
+**Compaction** (assumes key = FDB key; see *As built* above). Sound only for directories that emit `SET_VALUE` and single-key clears. A single-key
 clear arrives as `CLEAR_RANGE(k, k‖\x00)` (§3, *Mutation fidelity*) and becomes a tombstone on `k`.
 Wider clears cannot be compacted safely. Compaction keeps each cleared key's last value, so a replay
 from offset 0 brings the key back, and a reader lagging more than `delete.retention.ms` can miss

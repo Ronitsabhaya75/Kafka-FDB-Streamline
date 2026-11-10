@@ -7,6 +7,7 @@ Guidance for coding agents in this repo. Layout, branching, code style and PR ru
 - Run `pre-commit run --all-files` (ruff + black). Fix lint rather than adding `# noqa`; if a suppression is truly needed, scope it to one rule on one line and say why.
 - Every function signature carries type hints; every public module, class and function carries a Google-style docstring. Ruff enforces both.
 - Adding or substantially changing a doc means updating its row in `docs/INDEX.md`.
+- A behaviour change updates the owning spec in the same PR. See [Specs](docs/conventions.md#specs).
 - Do not commit `.env`, `.mcp.json`, `.cursor/mcp.json`, or anything holding tokens.
 
 ## Code Comments

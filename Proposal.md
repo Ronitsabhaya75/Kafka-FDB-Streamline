@@ -1,5 +1,12 @@
 # FoundationDB-Kafka Connector (Kafka-FDB-Streamline)
 
+> [!NOTE]
+> **Status: Historical (sponsor proposal).** Scope and motivation still hold; the schema and API sketches below are superseded by the as-built design:
+>
+> - **Schema (§3):** package is `fdbkafka.cdc.v1`, not `fdb.kafka.cdc`. `MutationType` mirrors FDB's numbering (`MUTATION_TYPE_SET_VALUE = 0`, `MUTATION_TYPE_ADD = 2`, …), not `ADD = 1`. `FDBMutationRecord` gains `bridge_timestamp` (field 2) and a `batch` arm, so its arms are 3/4/5, not 2/3; `VersionEnd` gains `total_mutations` and `bridge_timestamp`. Source of truth: [`mutations.proto`](protobuf/proto/fdbkafka/cdc/v1/mutations.proto) and [`SERIALIZATION-SPEC.md`](docs/SERIALIZATION-SPEC.md).
+> - **API (§1, §4):** FDB API version 800 (`fdb_kafka_bridge.cdc.DEFAULT_CDC_API_VERSION`), not 730. There is no async `open_cdc_stream` / `open_directory_cdc`; the synchronous `FDBClient` and CDC listener are in [`CDC-CONSUMER-SPEC.md`](docs/CDC-CONSUMER-SPEC.md).
+> - **Directory → topic (§1, §2, §4):** the bridge streams a raw hex `begin_key`/`end_key` range (e.g. a directory's prefix range) to one topic per bridge; it does not open directories. See [`BRIDGE-PIPELINE-SPEC.md`](docs/BRIDGE-PIPELINE-SPEC.md).
+
 A robust change data capture (CDC) bridge connecting **FoundationDB** with **Apache Kafka**, enabling real-time stream consumption of FDB mutations with strong consistency guarantees.
 
 ---

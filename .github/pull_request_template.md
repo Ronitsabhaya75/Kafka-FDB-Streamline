@@ -26,4 +26,5 @@
 - [ ] Branch follows `<type>/<name>` ([conventions](../docs/conventions.md#branching))
 - [ ] `pre-commit run --all-files` passes (ruff + black)
 - [ ] New functions have type hints and Google-style docstrings
+- [ ] Behaviour change? Owning spec updated, INDEX row updated ([specs](../docs/conventions.md#specs))
 - [ ] Commits are signed

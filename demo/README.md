@@ -14,8 +14,9 @@ use a browser or a simulator. The script walks through seven visible stages:
 
 ## Prerequisites
 
-Running the demonstration requires live FoundationDB 8.0 (with CDC enabled)
-and Kafka broker services, normally supplied by the project's Docker Compose stack.
+Running the demonstration requires live FoundationDB (the `FDB_VERSION` pinned
+in the [`Dockerfile`](../Dockerfile), with native CDC enabled) and Kafka broker
+services, normally supplied by the project's Docker Compose stack.
 
 Run the demo from inside the application container so `kafka:19092` and the FDB
 cluster file are available:
@@ -28,5 +29,10 @@ docker compose -f .devcontainer/docker-compose.yml exec app \
   env PYTHONPATH=.:src:protobuf/gen python3 demo/run_demo.py --count 10000
 ```
 
-Use `--kafka-bootstrap-servers` and `--timeout` to override the broker address
-or the default one-hour deadline.
+The broker address defaults to `$KAFKA_BOOTSTRAP_SERVERS`, else `kafka:19092`
+(the compose file sets the variable in the `app` container). Use
+`--kafka-bootstrap-servers` and `--timeout` to override the broker address or the
+default one-hour deadline, and `--count` to change the number of mutations.
+
+The FDB image is `linux/amd64` only (FDB publishes x86_64 binaries), so on ARM
+Macs the `app` container runs under emulation: expect a slower build and demo.
