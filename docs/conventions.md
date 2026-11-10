@@ -8,8 +8,9 @@ How the team lays out the repo, branches, writes Python, and merges. Tooling enf
 |------|---------|
 | `src/fdb_kafka_bridge/` | Import package (distribution `fdb-kafka-bridge`): `bridge/`, `cdc/`, `kafka/`, `serialization/` |
 | `protobuf/` | `proto/` schema, `gen/` committed `buf generate` output, `tests/` schema and pipeline-simulation tests |
-| `tests/` | Unit and integration tests; subdirectories mirror the `src` packages, plus `demo/` |
+| `tests/` | Unit and integration tests; subdirectories mirror the `src` packages, plus `demo/` and `benchmarks/` |
 | `demo/` | Live FDB → Kafka demo ([`demo/README.md`](../demo/README.md)) |
+| `benchmarks/` | Per-release end-to-end benchmark harness and results ([`benchmarks/README.md`](../benchmarks/README.md)) |
 | `docs/` | Specs, conventions and research; map in [`INDEX.md`](INDEX.md) |
 | `scripts/` | CI and dev helper scripts |
 | `config/` | Placeholder (`.gitkeep`); nothing reads it yet |
@@ -160,7 +161,7 @@ Then add the same public key on GitHub under Settings → SSH and GPG keys → N
 | `packaging / packaging` | [`packaging.yml`](../.github/workflows/packaging.yml) | `tests/test_packaging.py` with `PACKAGING_INTEGRATION=1`: builds the wheel and installs it into a fresh venv (no `libfdb_c`); fails if any test skips or none run |
 | `buf / buf` | [`buf-ci.yaml`](../.github/workflows/buf-ci.yaml) | `buf lint`, `buf breaking` against the PR base, `buf build`, and a `buf generate` drift check on `protobuf/gen` |
 | `container-setup / build-and-verify` | [`Container-setup.yml`](../.github/workflows/Container-setup.yml) | Builds the `Dockerfile` image, checks FDB binaries and bindings, waits for the cluster, runs a read/write check |
-| `container-setup / test-protobuf`, `test-serialization`, `test-cdc-mutations`, `test-kafka`, `test-bridge` | `Container-setup.yml` | `pytest` per directory inside that image: `protobuf/tests`, `tests/serialization`, `tests/cdc` (live FDB), `tests/kafka` and `tests/bridge` + `tests/demo` (unit, then live Kafka integration), plus the Kafka smoke script |
+| `container-setup / test-protobuf`, `test-serialization`, `test-cdc-mutations`, `test-kafka`, `test-bridge` | `Container-setup.yml` | `pytest` per directory inside that image: `protobuf/tests`, `tests/serialization`, `tests/cdc` (live FDB), `tests/kafka` and `tests/bridge` + `tests/demo` + `tests/benchmarks` (unit, then live Kafka integration), plus the Kafka smoke script |
 
 There is no single `pytest` job: a new test directory needs its own CI job or it never runs in CI. `tests/test_cdc_e2e.py` is currently run by no job.
 

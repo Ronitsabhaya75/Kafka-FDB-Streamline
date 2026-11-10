@@ -302,6 +302,7 @@ jobs:
               python3 -m pytest \
                 tests/bridge/ \
                 tests/demo/ \
+                tests/benchmarks/ \
                 -v -m "not integration"
             '
 

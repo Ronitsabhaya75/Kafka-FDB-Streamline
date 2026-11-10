@@ -32,3 +32,4 @@ Map of the project's docs. Check here before reading docs wholesale, then open o
 | [`kafka-delivery-guarantees.md`](kafka-delivery-guarantees.md) | Research | Kafka delivery semantics, exactly-once strategies, error handling, Python client comparison. |
 | [`protobuf_schema_validation.md`](protobuf_schema_validation.md) | Historical | Pre-implementation protobuf schema review and evolution rules; superseded by `mutations.proto` and the serialization spec. |
 | [`FDB-DIRECTORY-LAYER-KEY-RANGE-MAPPING.md`](FDB-DIRECTORY-LAYER-KEY-RANGE-MAPPING.md) | Research | FDB directory layer, subspaces and key ranges, and how they map onto bridge key ranges and topics. |
+| [`../benchmarks/0.1.0v/README.md`](../benchmarks/0.1.0v/README.md) | Research | v0.1.0 end-to-end benchmarks: 10-min sustained run, unthrottled throughput, checkpoint durability, CDC ordering checks. |
