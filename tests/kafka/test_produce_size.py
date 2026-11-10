@@ -32,6 +32,8 @@ def producer() -> Iterator[MutationProducer]:
 def _record_of_size(size: int) -> mutations_pb2.FDBMutationRecord:
     """Pad a SET record's value until the serialized record is exactly size."""
     rec = build_set_mutation_record("orders", 1, 0, b"k", b"")
+    # Wall-clock nanos vary the varint width, moving the gaps between runs.
+    rec.bridge_timestamp.FromSeconds(1_700_000_000)
     n = size - rec.ByteSize()
     # Varint length prefixes grow with the value, so converge iteratively. A size
     # inside a prefix-length gap is unreachable and would oscillate forever.
@@ -64,6 +66,6 @@ def test_one_byte_over_derived_budget_is_rejected(
 
 
 def test_record_of_size_rejects_unreachable_size() -> None:
-    # 152 falls in a varint-length gap: no value length serializes to it.
-    with pytest.raises(ValueError, match="152"):
-        _record_of_size(152)
+    # 153 falls in a varint-length gap: no value length serializes to it.
+    with pytest.raises(ValueError, match="153"):
+        _record_of_size(153)
