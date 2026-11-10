@@ -4,7 +4,11 @@ from collections.abc import Callable
 
 import pytest
 
-from demo.workload import expected_mutation, verify_workload
+from demo.workload import (
+    expected_mutation,
+    verify_workload,
+    verify_workload_at_least_once,
+)
 from fdbkafka.cdc.v1 import mutations_pb2
 
 PREFIX = b"demo/abc/"
@@ -209,3 +213,50 @@ class TestVerifyWorkload:
         skm.value = skm.value + b"\x00"
         with pytest.raises(AssertionError, match="index 10"):
             verify_workload(records, PREFIX, 20)
+
+
+class TestVerifyWorkloadAtLeastOnce:
+    def test_well_formed_stream_passes(self) -> None:
+        result = verify_workload_at_least_once(_stream(42), PREFIX, 42)
+        assert sum(result.type_counts.values()) == 42
+        assert result.duplicates == 0
+        assert result.missing == ()
+
+    def test_duplicate_index_is_counted_not_failed(self) -> None:
+        records = _stream(20)
+        dup = mutations_pb2.FDBMutation()
+        dup.CopyFrom(records[0].batch.mutations[0])
+        dup.version_index.sequence_no = 5
+        records[0].batch.mutations.append(dup)
+        records[1].version_end.total_mutations = 6
+        result = verify_workload_at_least_once(records, PREFIX, 20)
+        assert result.duplicates == 1
+        assert result.missing == ()
+
+    def test_duplicate_version_end_same_total_ok(self) -> None:
+        records = _stream(20)
+        records.append(records[1])
+        result = verify_workload_at_least_once(records, PREFIX, 20)
+        assert result.duplicates == 0
+
+    def test_conflicting_version_end_totals_fail(self) -> None:
+        records = _stream(20)
+        conflict = mutations_pb2.FDBMutationRecord()
+        conflict.CopyFrom(records[1])
+        conflict.version_end.total_mutations = 99
+        records.append(conflict)
+        with pytest.raises(AssertionError, match="conflicting VersionEnd"):
+            verify_workload_at_least_once(records, PREFIX, 20)
+
+    def test_missing_index_fails(self) -> None:
+        records = _stream(20)
+        del records[0].batch.mutations[4]
+        records[1].version_end.total_mutations = 4
+        with pytest.raises(AssertionError, match="missing"):
+            verify_workload_at_least_once(records, PREFIX, 20)
+
+    def test_sequence_gap_fails(self) -> None:
+        records = _stream(20)
+        records[0].batch.mutations[2].version_index.sequence_no = 7
+        with pytest.raises(AssertionError, match="sequence"):
+            verify_workload_at_least_once(records, PREFIX, 20)

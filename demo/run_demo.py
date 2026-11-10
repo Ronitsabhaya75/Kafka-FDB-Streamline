@@ -8,12 +8,18 @@ Demonstrates the Kafka Bridge running as an autonomous streaming daemon:
    delivers them to Kafka (acks=all), and advances the FDB retention watermark.
 5. Downstream consumer verifies every record against the committed workload.
 6. Gracefully terminates the Bridge daemon with queue drainage.
+
+Modes:
+  * ``batch`` (default): write a fixed mutation count, then wait for the bridge.
+  * ``sustained``: write concurrently with the bridge for a duration at a target
+    rate, measure backlog / catch-up, and verify at-least-once delivery.
 """
 
 from __future__ import annotations
 
 import argparse
 import os
+import random
 import struct
 import sys
 import threading
@@ -25,7 +31,8 @@ from typing import Any
 import fdb
 from confluent_kafka import Consumer, KafkaException
 
-from demo.workload import verify_workload
+from demo.sustained import SustainedStats, caught_up, default_max_backlog
+from demo.workload import verify_workload, verify_workload_at_least_once
 from fdb_kafka_bridge.bridge.config import from_dict
 from fdb_kafka_bridge.bridge.pipeline import Bridge
 from fdb_kafka_bridge.cdc.client import FDBClient
@@ -34,6 +41,10 @@ from fdbkafka.cdc.v1 import mutations_pb2
 
 DEFAULT_KAFKA_BOOTSTRAP_SERVERS = "kafka:19092"
 DEFAULT_SAMPLE_COUNT = 10000
+DEFAULT_SUSTAINED_DURATION_SECONDS = 30.0
+DEFAULT_SUSTAINED_TARGET_RATE = 500.0
+DEFAULT_CATCHUP_TIMEOUT_SECONDS = 60.0
+DEFAULT_SEED = 1
 
 # Names for every mutation type that the native CDC API may emit.
 MUTATION_TYPE_NAMES: dict[int, str] = {
@@ -67,6 +78,12 @@ def _arguments(argv: Sequence[str] | None) -> argparse.Namespace:
     """
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
+        "--mode",
+        choices=("batch", "sustained"),
+        default="batch",
+        help="batch: fixed write-then-drain demo; sustained: concurrent workload.",
+    )
+    parser.add_argument(
         "--kafka-bootstrap-servers",
         default=os.environ.get(
             "KAFKA_BOOTSTRAP_SERVERS", DEFAULT_KAFKA_BOOTSTRAP_SERVERS
@@ -76,16 +93,102 @@ def _arguments(argv: Sequence[str] | None) -> argparse.Namespace:
     parser.add_argument(
         "--count",
         type=int,
-        default=DEFAULT_SAMPLE_COUNT,
-        help="Number of mutations to write (e.g. 100, 1000, 10000).",
+        default=None,
+        help=(
+            "Batch mode: mutations to write (default 10000). "
+            "Sustained mode: optional hard cap (default unlimited for duration)."
+        ),
     )
     parser.add_argument(
         "--timeout",
         type=float,
         default=3600.0,
-        help="Maximum timeout in seconds for streaming and consumption.",
+        help="Maximum timeout in seconds for batch streaming and consumption.",
+    )
+    parser.add_argument(
+        "--duration",
+        type=float,
+        default=DEFAULT_SUSTAINED_DURATION_SECONDS,
+        help="Sustained mode: seconds to keep writing concurrently.",
+    )
+    parser.add_argument(
+        "--target-rate",
+        type=float,
+        default=DEFAULT_SUSTAINED_TARGET_RATE,
+        help="Sustained mode: target mutations/sec (0 = unthrottled).",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=DEFAULT_SEED,
+        help="Sustained mode: RNG seed for pacing jitter.",
+    )
+    parser.add_argument(
+        "--catchup-timeout",
+        type=float,
+        default=DEFAULT_CATCHUP_TIMEOUT_SECONDS,
+        help="Sustained mode: seconds allowed for the bridge to drain after writes.",
+    )
+    parser.add_argument(
+        "--max-backlog",
+        type=int,
+        default=None,
+        help=(
+            "Sustained mode: soft max for written-published during the write "
+            "window (default max(target_rate*5, 1000))."
+        ),
     )
     return parser.parse_args(argv)
+
+
+def _apply_one_mutation(tr: Any, prefix: bytes, index: int) -> None:
+    """Apply one representative mutation for ``index`` inside an open transaction.
+
+    Args:
+        tr: FoundationDB transaction.
+        prefix: Target key prefix.
+        index: Workload operation index.
+    """
+    mod = index % 14
+    idx_bytes = f"{index:08d}".encode()
+    if mod == 0:
+        tr[prefix + b"set_" + idx_bytes] = f"val-{index}".encode()
+    elif mod == 1:
+        tr.clear_range(
+            prefix + b"clr_" + idx_bytes + b"/a",
+            prefix + b"clr_" + idx_bytes + b"/z",
+        )
+    elif mod == 2:
+        delta = (index & 0xFFFFFFFF).to_bytes(8, "little")
+        tr.add(prefix + b"add_" + idx_bytes, delta)
+    elif mod == 3:
+        tr.bit_and(prefix + b"and_" + idx_bytes, b"\x0f")
+    elif mod == 4:
+        tr.bit_or(prefix + b"or_" + idx_bytes, b"\xf0")
+    elif mod == 5:
+        tr.bit_xor(prefix + b"xor_" + idx_bytes, b"\xaa")
+    elif mod == 6:
+        tr.append_if_fits(prefix + b"app_" + idx_bytes, b"chunk")
+    elif mod == 7:
+        val = (index & 0xFFFFFFFF).to_bytes(8, "little")
+        tr.max(prefix + b"max_" + idx_bytes, val)
+    elif mod == 8:
+        val = (index & 0xFFFFFFFF).to_bytes(8, "little")
+        tr.min(prefix + b"min_" + idx_bytes, val)
+    elif mod == 9:
+        k_pref = prefix + b"vsk_" + idx_bytes
+        vsk_key = k_pref + b"\x00" * 10 + struct.pack("<I", len(k_pref))
+        tr.set_versionstamped_key(vsk_key, b"vsk_payload")
+    elif mod == 10:
+        v_pref = b"vsv_" + idx_bytes
+        vsv_val = v_pref + b"\x00" * 10 + struct.pack("<I", len(v_pref))
+        tr.set_versionstamped_value(prefix + b"vsv_" + idx_bytes, vsv_val)
+    elif mod == 11:
+        tr.byte_min(prefix + b"bmin_" + idx_bytes, b"\x10")
+    elif mod == 12:
+        tr.byte_max(prefix + b"bmax_" + idx_bytes, b"\xfe")
+    elif mod == 13:
+        tr[prefix + b"set_b_" + idx_bytes] = f"val-b-{index}".encode()
 
 
 def _write_samples(database: Any, prefix: bytes, count: int) -> float:
@@ -93,19 +196,6 @@ def _write_samples(database: Any, prefix: bytes, count: int) -> float:
 
     Generates a round-robin mix of FoundationDB mutation operations. Some legacy
     and versionstamped operations are normalized before native CDC emits them.
-    - SET_VALUE (0)
-    - CLEAR_RANGE (1)
-    - ADD (2)
-    - BIT_AND / AND_V2 (6 / 19)
-    - BIT_OR (7)
-    - BIT_XOR (8)
-    - APPEND_IF_FITS (9)
-    - MAX (12)
-    - MIN / MIN_V2 (13 / 18)
-    - SET_VERSIONSTAMPED_KEY (14)
-    - SET_VERSIONSTAMPED_VALUE (15)
-    - BYTE_MIN (16)
-    - BYTE_MAX (17)
 
     Args:
         database: FoundationDB database connection.
@@ -123,46 +213,7 @@ def _write_samples(database: Any, prefix: bytes, count: int) -> float:
     @fdb.transactional
     def _commit_chunk(tr: Any, s_idx: int, c_size: int) -> None:
         for index in range(s_idx, s_idx + c_size):
-            mod = index % 14
-            idx_bytes = f"{index:08d}".encode()
-            if mod == 0:
-                tr[prefix + b"set_" + idx_bytes] = f"val-{index}".encode()
-            elif mod == 1:
-                tr.clear_range(
-                    prefix + b"clr_" + idx_bytes + b"/a",
-                    prefix + b"clr_" + idx_bytes + b"/z",
-                )
-            elif mod == 2:
-                delta = (index & 0xFFFFFFFF).to_bytes(8, "little")
-                tr.add(prefix + b"add_" + idx_bytes, delta)
-            elif mod == 3:
-                tr.bit_and(prefix + b"and_" + idx_bytes, b"\x0f")
-            elif mod == 4:
-                tr.bit_or(prefix + b"or_" + idx_bytes, b"\xf0")
-            elif mod == 5:
-                tr.bit_xor(prefix + b"xor_" + idx_bytes, b"\xaa")
-            elif mod == 6:
-                tr.append_if_fits(prefix + b"app_" + idx_bytes, b"chunk")
-            elif mod == 7:
-                val = (index & 0xFFFFFFFF).to_bytes(8, "little")
-                tr.max(prefix + b"max_" + idx_bytes, val)
-            elif mod == 8:
-                val = (index & 0xFFFFFFFF).to_bytes(8, "little")
-                tr.min(prefix + b"min_" + idx_bytes, val)
-            elif mod == 9:
-                k_pref = prefix + b"vsk_" + idx_bytes
-                vsk_key = k_pref + b"\x00" * 10 + struct.pack("<I", len(k_pref))
-                tr.set_versionstamped_key(vsk_key, b"vsk_payload")
-            elif mod == 10:
-                v_pref = b"vsv_" + idx_bytes
-                vsv_val = v_pref + b"\x00" * 10 + struct.pack("<I", len(v_pref))
-                tr.set_versionstamped_value(prefix + b"vsv_" + idx_bytes, vsv_val)
-            elif mod == 11:
-                tr.byte_min(prefix + b"bmin_" + idx_bytes, b"\x10")
-            elif mod == 12:
-                tr.byte_max(prefix + b"bmax_" + idx_bytes, b"\xfe")
-            elif mod == 13:
-                tr[prefix + b"set_b_" + idx_bytes] = f"val-b-{index}".encode()
+            _apply_one_mutation(tr, prefix, index)
 
     for start_idx in range(0, count, batch_size):
         chunk_size = min(batch_size, count - start_idx)
@@ -181,24 +232,46 @@ def _write_samples(database: Any, prefix: bytes, count: int) -> float:
     return time.monotonic() - start_time
 
 
-def _seed_clear_targets(database: Any, prefix: bytes, count: int) -> None:
-    """Create keys that the demo's disjoint clear ranges will remove.
+def _seed_clear_targets(database: Any, prefix: bytes, indexes: Sequence[int]) -> None:
+    """Create keys that disjoint clear ranges will remove.
 
     Args:
         database: FoundationDB database connection.
         prefix: Target key prefix for the workload.
-        count: Total number of operations in the upcoming workload.
+        indexes: Workload indexes that may include clear-range ops.
     """
 
     @fdb.transactional
-    def _seed_chunk(tr: Any, indexes: list[int]) -> None:
-        for index in indexes:
+    def _seed_chunk(tr: Any, chunk: list[int]) -> None:
+        for index in chunk:
             idx_bytes = f"{index:08d}".encode()
             tr[prefix + b"clr_" + idx_bytes + b"/m"] = b"seed"
 
-    clear_indexes = [index for index in range(count) if index % 14 == 1]
+    clear_indexes = [index for index in indexes if index % 14 == 1]
     for offset in range(0, len(clear_indexes), 500):
         _seed_chunk(database, clear_indexes[offset : offset + 500])
+
+
+def _commit_chunk_with_seed(
+    database: Any, prefix: bytes, start_idx: int, chunk_size: int
+) -> None:
+    """Seed clear targets then commit ``chunk_size`` mutations from ``start_idx``.
+
+    Args:
+        database: FoundationDB database connection.
+        prefix: Workload key prefix.
+        start_idx: First workload index.
+        chunk_size: Number of mutations to commit.
+    """
+    indexes = list(range(start_idx, start_idx + chunk_size))
+    _seed_clear_targets(database, prefix, indexes)
+
+    @fdb.transactional
+    def _commit(tr: Any) -> None:
+        for index in indexes:
+            _apply_one_mutation(tr, prefix, index)
+
+    _commit(database)
 
 
 def _consume_records(
@@ -272,6 +345,83 @@ def _consume_records(
     return records
 
 
+class _ConcurrentKafkaCollector:
+    """Background Kafka consumer that accumulates records until stopped."""
+
+    def __init__(self, bootstrap_servers: str, topic: str) -> None:
+        """Create a collector for ``topic``.
+
+        Args:
+            bootstrap_servers: Kafka broker addresses.
+            topic: Topic to subscribe to.
+        """
+        self._bootstrap_servers = bootstrap_servers
+        self._topic = topic
+        self._stop = threading.Event()
+        self._errors: list[BaseException] = []
+        self._lock = threading.Lock()
+        self._records: list[mutations_pb2.FDBMutationRecord] = []
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        """Start the background poll loop."""
+        self._thread = threading.Thread(
+            target=self._run, daemon=True, name="DemoKafkaCollector"
+        )
+        self._thread.start()
+
+    def request_stop(self) -> None:
+        """Signal the poll loop to exit without joining."""
+        self._stop.set()
+
+    def stop(self, timeout: float = 10.0) -> list[mutations_pb2.FDBMutationRecord]:
+        """Stop the collector and return accumulated records.
+
+        Args:
+            timeout: Join timeout in seconds.
+
+        Returns:
+            Records collected so far.
+
+        Raises:
+            RuntimeError: If the collector thread raised.
+        """
+        self.request_stop()
+        if self._thread is not None:
+            self._thread.join(timeout=timeout)
+        if self._errors:
+            raise RuntimeError("Kafka collector failed") from self._errors[0]
+        with self._lock:
+            return list(self._records)
+
+    def _run(self) -> None:
+        consumer = Consumer(
+            {
+                "bootstrap.servers": self._bootstrap_servers,
+                "group.id": f"demo-sustained-{uuid.uuid4().hex}",
+                "auto.offset.reset": "earliest",
+            }
+        )
+        consumer.subscribe([self._topic])
+        try:
+            while not self._stop.is_set():
+                message = consumer.poll(timeout=0.5)
+                if message is None:
+                    continue
+                if message.error() is not None:
+                    raise KafkaException(message.error())
+                value = message.value()
+                if value is None:
+                    continue
+                record = mutations_pb2.FDBMutationRecord.FromString(value)
+                with self._lock:
+                    self._records.append(record)
+        except BaseException as exc:
+            self._errors.append(exc)
+        finally:
+            consumer.close()
+
+
 def _stop_bridge(bridge: Bridge | None, thread: threading.Thread | None) -> None:
     """Best-effort bridge teardown that never raises or blocks on a stuck step.
 
@@ -295,6 +445,98 @@ def _stop_bridge(bridge: Bridge | None, thread: threading.Thread | None) -> None
         print(f"      WARNING: bridge.stop() failed: {exc!r}", file=sys.stderr)
 
 
+def _start_bridge(
+    *,
+    stream_name: str,
+    prefix: bytes,
+    topic: str,
+    bootstrap_servers: str,
+    cursor_file: str,
+) -> tuple[Bridge, threading.Thread, list[BaseException]]:
+    """Configure, start, and launch the bridge daemon thread.
+
+    Args:
+        stream_name: CDC stream name.
+        prefix: Key-range prefix.
+        topic: Kafka topic.
+        bootstrap_servers: Kafka brokers.
+        cursor_file: Durable cursor path.
+
+    Returns:
+        Bridge instance, daemon thread, and shared error list.
+    """
+    bridge_cfg = from_dict(
+        {
+            "fdb": {"api_version": 800},
+            "cdc": {
+                "stream_name": stream_name,
+                "begin_key": prefix.hex(),
+                "end_key": strinc(prefix).hex(),
+                "max_record_bytes": 1_000_000,
+                "cursor_file": cursor_file,
+            },
+            "kafka": {
+                "bootstrap_servers": bootstrap_servers,
+                "topic": topic,
+            },
+            "pipeline": {
+                "flush_timeout_seconds": 10.0,
+                "backoff_base_seconds": 0.1,
+                "backoff_max_seconds": 2.0,
+                "shutdown_timeout_seconds": 15.0,
+            },
+        }
+    )
+    bridge = Bridge(bridge_cfg)
+    bridge.start()
+    bridge_errors: list[BaseException] = []
+
+    def _run_bridge() -> None:
+        try:
+            bridge.run()
+        except BaseException as exc:
+            bridge_errors.append(exc)
+
+    bridge_thread = threading.Thread(
+        target=_run_bridge, daemon=True, name="BridgeDaemon"
+    )
+    bridge_thread.start()
+    return bridge, bridge_thread, bridge_errors
+
+
+def _cleanup_demo(
+    *,
+    bridge: Bridge | None,
+    bridge_thread: threading.Thread | None,
+    database: Any,
+    fdb_client: FDBClient | None,
+    prefix: bytes,
+    stream_name: str,
+    cursor_file: str,
+) -> None:
+    """Best-effort teardown shared by batch and sustained modes."""
+    if bridge is not None:
+        bridge.request_shutdown()
+    if bridge_thread is not None and bridge_thread.is_alive():
+        bridge_thread.join(timeout=10.0)
+    _stop_bridge(bridge, bridge_thread)
+    if database is not None:
+        try:
+            del database[prefix : strinc(prefix)]
+        except Exception:
+            pass
+    if fdb_client is not None:
+        try:
+            fdb_client.remove_cdc_stream(stream_name)
+        except Exception:
+            pass
+        fdb_client.close()
+    try:
+        os.unlink(cursor_file)
+    except (FileNotFoundError, OSError):
+        pass
+
+
 def run_demo(bootstrap_servers: str, timeout: float, count: int) -> None:
     """Run step-by-step FoundationDB CDC to Kafka Bridge demonstration.
 
@@ -313,7 +555,6 @@ def run_demo(bootstrap_servers: str, timeout: float, count: int) -> None:
     print("  FoundationDB Native CDC -> Apache Kafka Bridge Demonstration")
     print("=" * 76)
 
-    # 1. FoundationDB Database Initialization
     print("\n[1/7] FoundationDB Database: Initializing Connection (API 800)")
     fdb_client = FDBClient(api_version=800)
     database = fdb_client.open()
@@ -324,10 +565,9 @@ def run_demo(bootstrap_servers: str, timeout: float, count: int) -> None:
     bridge_thread: threading.Thread | None = None
 
     try:
-        _seed_clear_targets(database, prefix, count)
+        _seed_clear_targets(database, prefix, range(count))
         print("      Prepared disjoint clear-range targets before CDC registration.")
 
-        # 2. Bridge Service Configuration & Daemon Launch
         print(
             "\n[2/7] Kafka Bridge Service: Declarative Configuration & Daemon Startup"
         )
@@ -337,53 +577,17 @@ def run_demo(bootstrap_servers: str, timeout: float, count: int) -> None:
         print("      Delivery Policy   : acks=all, enable.idempotence=True")
         print("      Retention Policy  : Advance minVersion only after Kafka ack")
 
-        bridge_cfg = from_dict(
-            {
-                "fdb": {"api_version": 800},
-                "cdc": {
-                    "stream_name": stream_name,
-                    "begin_key": prefix.hex(),
-                    "end_key": strinc(prefix).hex(),
-                    "max_record_bytes": 1_000_000,
-                    "cursor_file": cursor_file,
-                },
-                "kafka": {
-                    "bootstrap_servers": bootstrap_servers,
-                    "topic": topic,
-                },
-                "pipeline": {
-                    "flush_timeout_seconds": 10.0,
-                    "backoff_base_seconds": 0.1,
-                    "backoff_max_seconds": 2.0,
-                    "shutdown_timeout_seconds": 15.0,
-                },
-            }
+        bridge, bridge_thread, bridge_errors = _start_bridge(
+            stream_name=stream_name,
+            prefix=prefix,
+            topic=topic,
+            bootstrap_servers=bootstrap_servers,
+            cursor_file=cursor_file,
         )
-
-        bridge = Bridge(bridge_cfg)
-        bridge.start()
         print("      Registered CDC stream in FDB transaction subsystem.")
-
-        # Run the Bridge daemon loop in a background thread
-        bridge_errors: list[BaseException] = []
-
-        def _run_bridge() -> None:
-            try:
-                assert bridge is not None
-                bridge.run()
-            except BaseException as exc:
-                bridge_errors.append(exc)
-
-        bridge_thread = threading.Thread(
-            target=_run_bridge, daemon=True, name="BridgeDaemon"
-        )
-        bridge_thread.start()
         print("      Started autonomous Kafka Bridge daemon thread.")
-
-        # Brief warm-up to ensure CDC consumer handle is armed
         time.sleep(1.0)
 
-        # 3. Transactional Writes to FoundationDB
         print(f"\n[3/7] Upstream Application: Committing {count:,} mutations to FDB")
         print("      Exercising representative writes and atomic operations...")
         stream_start = time.monotonic()
@@ -394,7 +598,6 @@ def run_demo(bootstrap_servers: str, timeout: float, count: int) -> None:
             f"({write_rate:,.0f} writes/sec)"
         )
 
-        # 4. Bridge Streaming & Telemetry
         print("\n[4/7] Autonomous Bridge Pipeline: CDC Ingest -> Protobuf -> Kafka")
         print("      Bridge is streaming, serializing, publishing, and acking...")
         deadline = stream_start + timeout
@@ -437,7 +640,6 @@ def run_demo(bootstrap_servers: str, timeout: float, count: int) -> None:
         if bridge_errors:
             raise RuntimeError("Bridge daemon failed") from bridge_errors[0]
 
-        # 5. Downstream Kafka Consumer Ingestion
         print("\n[5/7] Downstream Kafka Consumers: Ingestion from Topic")
         consume_start = time.monotonic()
         consumed = _consume_records(
@@ -449,7 +651,6 @@ def run_demo(bootstrap_servers: str, timeout: float, count: int) -> None:
             f"{consume_duration:.3f}s"
         )
 
-        # 6. Workload Verification
         print("\n[6/7] Workload Verification: Kafka Records vs. Committed Writes")
         if bridge.mutations_published != count:
             raise AssertionError(
@@ -475,7 +676,6 @@ def run_demo(bootstrap_servers: str, timeout: float, count: int) -> None:
             f"across {len(consumed):,} Kafka messages"
         )
 
-        # 7. Graceful Bridge Shutdown
         print("\n[7/7] Bridge Service: Graceful Shutdown & Drain")
         metrics = bridge.metrics
         bridge.stop()
@@ -495,26 +695,270 @@ def run_demo(bootstrap_servers: str, timeout: float, count: int) -> None:
         print("=" * 76 + "\n")
 
     finally:
-        if bridge is not None:
-            bridge.request_shutdown()
-        if bridge_thread is not None and bridge_thread.is_alive():
-            bridge_thread.join(timeout=10.0)
-        _stop_bridge(bridge, bridge_thread)
-        if database is not None:
+        _cleanup_demo(
+            bridge=bridge,
+            bridge_thread=bridge_thread,
+            database=database,
+            fdb_client=fdb_client,
+            prefix=prefix,
+            stream_name=stream_name,
+            cursor_file=cursor_file,
+        )
+
+
+def run_sustained_demo(
+    *,
+    bootstrap_servers: str,
+    duration: float,
+    target_rate: float,
+    seed: int,
+    catchup_timeout: float,
+    max_backlog: int | None,
+    count_cap: int | None,
+) -> SustainedStats:
+    """Run a sustained concurrent write + bridge + Kafka consumer workload.
+
+    Args:
+        bootstrap_servers: Kafka broker addresses.
+        duration: Seconds to keep the writer running.
+        target_rate: Target mutations per second (0 = unthrottled).
+        seed: RNG seed for pacing jitter.
+        catchup_timeout: Seconds allowed for drain after writers stop.
+        max_backlog: Soft backlog threshold (default from target_rate).
+        count_cap: Optional hard cap on mutations written.
+
+    Returns:
+        Accumulated sustained-run statistics.
+
+    Raises:
+        TimeoutError: If the bridge does not catch up in time.
+        AssertionError: If at-least-once verification fails.
+        RuntimeError: If the bridge or Kafka collector fails.
+    """
+    if duration <= 0:
+        raise ValueError("duration must be positive")
+    if catchup_timeout <= 0:
+        raise ValueError("catchup_timeout must be positive")
+    if target_rate < 0:
+        raise ValueError("target_rate must be non-negative")
+    if count_cap is not None and count_cap <= 0:
+        raise ValueError("count must be positive when set in sustained mode")
+
+    threshold = (
+        max_backlog if max_backlog is not None else default_max_backlog(target_rate)
+    )
+    rng = random.Random(seed)
+    stats = SustainedStats()
+
+    run_id = uuid.uuid4().hex[:10]
+    stream_name = f"demo-sustained-{run_id}"
+    topic = f"fdb-cdc-sustained-{run_id}"
+    prefix = f"demo/sustained/{run_id}/".encode()
+    cursor_file = f"/tmp/fdb-kafka-sustained-{run_id}.cursor.json"
+
+    print("=" * 76)
+    print("  Sustained Concurrent CDC Ingestion Demonstration")
+    print("=" * 76)
+    print(f"      duration={duration}s target_rate={target_rate}/s seed={seed}")
+    print(f"      catchup_timeout={catchup_timeout}s max_backlog={threshold:,}")
+    if count_cap is not None:
+        print(f"      count_cap={count_cap:,}")
+
+    print("\n[1/6] FoundationDB Database: Initializing Connection (API 800)")
+    fdb_client = FDBClient(api_version=800)
+    database = fdb_client.open()
+    print(f"      Connected. read_version={fdb_client.get_read_version()}")
+
+    bridge: Bridge | None = None
+    bridge_thread: threading.Thread | None = None
+    collector: _ConcurrentKafkaCollector | None = None
+    writer_errors: list[BaseException] = []
+    written = 0
+    written_lock = threading.Lock()
+
+    try:
+        print("\n[2/6] Kafka Bridge + Concurrent Consumer: Startup")
+        bridge, bridge_thread, bridge_errors = _start_bridge(
+            stream_name=stream_name,
+            prefix=prefix,
+            topic=topic,
+            bootstrap_servers=bootstrap_servers,
+            cursor_file=cursor_file,
+        )
+        collector = _ConcurrentKafkaCollector(bootstrap_servers, topic)
+        collector.start()
+        time.sleep(1.0)
+        print(f"      stream='{stream_name}' topic='{topic}'")
+
+        print("\n[3/6] Concurrent Writer: Sustained Mixed Mutations")
+        e2e_start = time.monotonic()
+        write_deadline = e2e_start + duration
+        chunk_size = 50 if target_rate > 0 else 500
+        next_index = 0
+        last_published_for_latency = 0
+        last_written_for_latency = 0
+        latency_mark = e2e_start
+
+        def _writer() -> None:
+            nonlocal next_index, written
             try:
-                del database[prefix : strinc(prefix)]
-            except Exception:
-                pass
-        if fdb_client is not None:
-            try:
-                fdb_client.remove_cdc_stream(stream_name)
-            except Exception:
-                pass
-            fdb_client.close()
-        try:
-            os.unlink(cursor_file)
-        except (FileNotFoundError, OSError):
-            pass
+                while time.monotonic() < write_deadline:
+                    if count_cap is not None and next_index >= count_cap:
+                        break
+                    size = chunk_size
+                    if count_cap is not None:
+                        size = min(size, count_cap - next_index)
+                    if size <= 0:
+                        break
+                    _commit_chunk_with_seed(database, prefix, next_index, size)
+                    next_index += size
+                    with written_lock:
+                        written = next_index
+                    if target_rate > 0:
+                        expected = next_index / target_rate
+                        elapsed = time.monotonic() - e2e_start
+                        sleep_for = expected - elapsed
+                        if sleep_for > 0:
+                            jitter = rng.uniform(0.0, min(0.01, sleep_for))
+                            time.sleep(sleep_for + jitter)
+            except BaseException as exc:
+                writer_errors.append(exc)
+
+        writer_thread = threading.Thread(
+            target=_writer, daemon=True, name="SustainedWriter"
+        )
+        writer_thread.start()
+
+        while writer_thread.is_alive():
+            if bridge_errors:
+                raise RuntimeError("Bridge daemon failed") from bridge_errors[0]
+            if writer_errors:
+                raise RuntimeError("Writer failed") from writer_errors[0]
+            with written_lock:
+                w = written
+            pub = bridge.mutations_published
+            backlog = stats.sample_backlog(written=w, published=pub)
+            stats.batches_acked = bridge.batches_acked
+            if pub > last_published_for_latency and w > last_written_for_latency:
+                # Approximate publish lag from progress marks.
+                stats.publish_latency_samples.append(time.monotonic() - latency_mark)
+                last_published_for_latency = pub
+                last_written_for_latency = w
+                latency_mark = time.monotonic()
+            if backlog > threshold:
+                print(
+                    f"      WARNING: backlog {backlog:,} exceeds soft threshold "
+                    f"{threshold:,} (continuing; catch-up is the hard gate)",
+                    file=sys.stderr,
+                )
+            time.sleep(0.2)
+
+        writer_thread.join(timeout=30.0)
+        if writer_errors:
+            raise RuntimeError("Writer failed") from writer_errors[0]
+        stats.write_duration_seconds = time.monotonic() - e2e_start
+        with written_lock:
+            stats.written = written
+        print(
+            f"      Writer stopped: written={stats.written:,} in "
+            f"{stats.write_duration_seconds:.3f}s "
+            f"(max_backlog={stats.max_backlog:,})"
+        )
+
+        print("\n[4/6] Catch-up: Waiting for Bridge to Drain")
+        catchup_start = time.monotonic()
+        catchup_deadline = catchup_start + catchup_timeout
+        while not caught_up(
+            written=stats.written, published=bridge.mutations_published
+        ):
+            if bridge_errors:
+                raise RuntimeError("Bridge daemon failed") from bridge_errors[0]
+            if time.monotonic() >= catchup_deadline:
+                raise TimeoutError(
+                    f"Bridge published {bridge.mutations_published} of "
+                    f"{stats.written} mutations within {catchup_timeout}s catch-up"
+                )
+            stats.sample_backlog(
+                written=stats.written, published=bridge.mutations_published
+            )
+            stats.batches_acked = bridge.batches_acked
+            time.sleep(0.2)
+        stats.catchup_seconds = time.monotonic() - catchup_start
+        stats.published = bridge.mutations_published
+        stats.batches_acked = bridge.batches_acked
+        print(
+            f"      Caught up in {stats.catchup_seconds:.3f}s: "
+            f"published={stats.published:,} acks={stats.batches_acked:,}"
+        )
+
+        bridge.request_shutdown()
+        bridge_thread.join(timeout=10.0)
+        if bridge_thread.is_alive():
+            raise TimeoutError("Bridge daemon did not stop within 10 seconds")
+        if bridge_errors:
+            raise RuntimeError("Bridge daemon failed") from bridge_errors[0]
+
+        print("\n[5/6] Verification: At-Least-Once + VersionEnd Integrity")
+        assert collector is not None
+        # Give the collector a moment to observe final produce.
+        time.sleep(1.0)
+        consumed = collector.stop(timeout=15.0)
+        result = verify_workload_at_least_once(consumed, prefix, stats.written)
+        versions = sum(1 for rec in consumed if rec.HasField("version_end"))
+        print(
+            f"      Verified {stats.written:,} unique mutations "
+            f"(duplicates={result.duplicates:,}, version_ends={versions:,})"
+        )
+        for code, n in sorted(result.type_counts.items()):
+            label = f"{MUTATION_TYPE_NAMES.get(code, f'TYPE_{code}')} (code {code})"
+            print(f"      [✓] {label:<36} : count = {n:,}")
+
+        print("\n[6/6] Bridge Shutdown & Summary")
+        metrics = bridge.metrics
+        bridge.stop()
+        stats.e2e_seconds = time.monotonic() - e2e_start
+        avg_pub_latency = (
+            sum(stats.publish_latency_samples) / len(stats.publish_latency_samples)
+            if stats.publish_latency_samples
+            else float("nan")
+        )
+        print(
+            f"      published={metrics.mutations_published:,} "
+            f"records={metrics.records_published:,} "
+            f"acks={metrics.batches_acked:,} retries={metrics.errors_retried:,}"
+        )
+        print(
+            f"      max_backlog={stats.max_backlog:,} "
+            f"catchup={stats.catchup_seconds:.3f}s "
+            f"e2e={stats.e2e_seconds:.3f}s "
+            f"approx_publish_sample_interval={avg_pub_latency:.3f}s"
+        )
+        print(
+            f"      backlog_threshold={threshold:,} "
+            f"(soft warn only; hard gate is catch-up)"
+        )
+
+        print("\n" + "=" * 76)
+        print(
+            f"  SUCCESS: sustained run wrote {stats.written:,} mutations; "
+            f"bridge caught up; Kafka verified at-least-once "
+            f"(duplicates={result.duplicates})."
+        )
+        print("=" * 76 + "\n")
+        return stats
+
+    finally:
+        if collector is not None:
+            collector.request_stop()
+        _cleanup_demo(
+            bridge=bridge,
+            bridge_thread=bridge_thread,
+            database=database,
+            fdb_client=fdb_client,
+            prefix=prefix,
+            stream_name=stream_name,
+            cursor_file=cursor_file,
+        )
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -527,7 +971,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         Process exit code.
     """
     args = _arguments(argv)
-    run_demo(args.kafka_bootstrap_servers, args.timeout, args.count)
+    if args.mode == "sustained":
+        run_sustained_demo(
+            bootstrap_servers=args.kafka_bootstrap_servers,
+            duration=args.duration,
+            target_rate=args.target_rate,
+            seed=args.seed,
+            catchup_timeout=args.catchup_timeout,
+            max_backlog=args.max_backlog,
+            count_cap=args.count,
+        )
+        return 0
+
+    count = DEFAULT_SAMPLE_COUNT if args.count is None else args.count
+    if count <= 0:
+        raise SystemExit("--count must be positive in batch mode")
+    run_demo(args.kafka_bootstrap_servers, args.timeout, count)
     return 0
 
 

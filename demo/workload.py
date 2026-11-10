@@ -14,6 +14,22 @@ from dataclasses import dataclass
 
 from fdbkafka.cdc.v1 import mutations_pb2
 
+
+@dataclass(frozen=True)
+class AtLeastOnceResult:
+    """Outcome of an at-least-once workload verification.
+
+    Attributes:
+        type_counts: Verified mutation count per wire type (unique indices).
+        duplicates: Extra deliveries beyond the first for any workload index.
+        missing: Workload indices that never appeared (empty on success).
+    """
+
+    type_counts: dict[int, int]
+    duplicates: int
+    missing: tuple[int, ...]
+
+
 VERSIONSTAMP_LEN = 10
 
 _SET_VALUE = 0
@@ -200,3 +216,92 @@ def verify_workload(
     if sum(totals.values()) != count:
         raise AssertionError(f"VersionEnd totals sum to {sum(totals.values())}")
     return dict(type_counts)
+
+
+def verify_workload_at_least_once(
+    records: Iterable[mutations_pb2.FDBMutationRecord], prefix: bytes, count: int
+) -> AtLeastOnceResult:
+    """Assert consumed records cover the workload at least once.
+
+    Same shape checks as :func:`verify_workload` (VersionEnd presence, gap-free
+    sequence numbers per version, byte-for-byte mutation content), but repeated
+    deliveries of the same workload index are counted as duplicates instead of
+    failing. Duplicate ``(fdb_version, sequence_no)`` coordinates and repeated
+    VersionEnds with the same ``total_mutations`` are tolerated for replay.
+
+    Args:
+        records: Decoded Kafka records, in any order.
+        prefix: Workload key prefix.
+        count: Number of workload operations written.
+
+    Returns:
+        Type counts for unique indices, duplicate delivery count, and missing
+        indices (empty on success).
+
+    Raises:
+        AssertionError: On missing indices, content mismatches, VersionEnd gaps,
+            or conflicting VersionEnd totals for the same version.
+    """
+    seqs_by_version: dict[int, set[int]] = defaultdict(set)
+    totals: dict[int, int] = {}
+    seen_counts: dict[int, int] = defaultdict(int)
+    type_counts: dict[int, int] = defaultdict(int)
+    duplicates = 0
+
+    def check(m: mutations_pb2.FDBMutation) -> None:
+        nonlocal duplicates
+        vi = m.version_index
+        seqs_by_version[vi.fdb_version].add(vi.sequence_no)
+
+        type_code, p1, p2 = _native(m)
+        match = _INDEX_IN_KEY.match(p1, len(prefix)) if p1.startswith(prefix) else None
+        if match is None:
+            raise AssertionError(f"key {p1!r} is not a workload key under prefix")
+        index = int(match.group(1))
+        if index >= count:
+            raise AssertionError(f"unexpected mutation for index {index}")
+        exp = expected_mutation(prefix, index)
+        if not exp.matches(type_code, p1, p2):
+            raise AssertionError(
+                f"mutation for index {index} is {(type_code, p1, p2)!r}, "
+                f"expected {(exp.type_code, exp.param1, exp.param2)!r}"
+            )
+        if seen_counts[index] == 0:
+            type_counts[type_code] += 1
+        else:
+            duplicates += 1
+        seen_counts[index] += 1
+
+    for rec in records:
+        if rec.HasField("batch"):
+            for m in rec.batch.mutations:
+                check(m)
+        elif rec.HasField("mutation"):
+            check(rec.mutation)
+        elif rec.HasField("version_end"):
+            ve = rec.version_end
+            prior = totals.get(ve.fdb_version)
+            if prior is not None and prior != ve.total_mutations:
+                raise AssertionError(
+                    f"conflicting VersionEnd totals for {ve.fdb_version}: "
+                    f"{prior} vs {ve.total_mutations}"
+                )
+            totals[ve.fdb_version] = ve.total_mutations
+
+    missing = tuple(sorted(i for i in range(count) if seen_counts[i] == 0))
+    if missing:
+        raise AssertionError(f"{len(missing)} indices missing, e.g. {missing[:5]}")
+    for version in seqs_by_version:
+        if version not in totals:
+            raise AssertionError(f"version {version} has no VersionEnd")
+    for version, total in totals.items():
+        if seqs_by_version.get(version, set()) != set(range(total)):
+            raise AssertionError(
+                f"version {version}: sequence numbers do not reconcile with "
+                f"declared total {total}"
+            )
+    return AtLeastOnceResult(
+        type_counts=dict(type_counts),
+        duplicates=duplicates,
+        missing=(),
+    )
