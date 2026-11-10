@@ -62,8 +62,8 @@ class SustainedStats:
         write_duration_seconds: Wall time of the writer loop.
         catchup_seconds: Wall time from writer stop until backlog cleared.
         e2e_seconds: Wall time from writer start through verification.
-        publish_latency_samples: Approximate seconds between write progress and
-            matching publish progress samples.
+        monitor_sample_intervals: Seconds between monitor samples where both
+            written and published advanced (not Kafka produce RTT).
     """
 
     written: int = 0
@@ -73,7 +73,7 @@ class SustainedStats:
     write_duration_seconds: float = 0.0
     catchup_seconds: float = 0.0
     e2e_seconds: float = 0.0
-    publish_latency_samples: list[float] = field(default_factory=list)
+    monitor_sample_intervals: list[float] = field(default_factory=list)
 
     def sample_backlog(self, *, written: int, published: int) -> int:
         """Record a backlog sample and update the peak.

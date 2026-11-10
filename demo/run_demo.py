@@ -374,6 +374,17 @@ class _ConcurrentKafkaCollector:
         """Signal the poll loop to exit without joining."""
         self._stop.set()
 
+    def snapshot(self) -> list[mutations_pb2.FDBMutationRecord]:
+        """Return a copy of records collected so far."""
+        if self._errors:
+            raise RuntimeError("Kafka collector failed") from self._errors[0]
+        with self._lock:
+            return list(self._records)
+
+    def mutation_count(self) -> int:
+        """Return decoded mutation count across collected records."""
+        return _record_mutation_count(self.snapshot())
+
     def stop(self, timeout: float = 10.0) -> list[mutations_pb2.FDBMutationRecord]:
         """Stop the collector and return accumulated records.
 
@@ -420,6 +431,57 @@ class _ConcurrentKafkaCollector:
             self._errors.append(exc)
         finally:
             consumer.close()
+
+
+def _record_mutation_count(records: Sequence[mutations_pb2.FDBMutationRecord]) -> int:
+    """Count individual mutations across Protobuf envelopes.
+
+    Args:
+        records: Decoded Kafka records.
+
+    Returns:
+        Total mutation count (batches + singles); VersionEnds contribute zero.
+    """
+    total = 0
+    for record in records:
+        if record.HasField("batch"):
+            total += len(record.batch.mutations)
+        elif record.HasField("mutation"):
+            total += 1
+    return total
+
+
+def _drain_collector(
+    collector: _ConcurrentKafkaCollector,
+    *,
+    min_mutations: int,
+    timeout: float,
+) -> list[mutations_pb2.FDBMutationRecord]:
+    """Wait until the collector has at least ``min_mutations``, then stop it.
+
+    Args:
+        collector: Running concurrent Kafka collector.
+        min_mutations: Minimum decoded mutations required before stop.
+        timeout: Maximum seconds to wait for the collector to catch up.
+
+    Returns:
+        All records accumulated by the collector.
+
+    Raises:
+        TimeoutError: If the collector does not reach ``min_mutations`` in time.
+        RuntimeError: If the collector thread failed.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if collector.mutation_count() >= min_mutations:
+            return collector.stop(timeout=15.0)
+        time.sleep(0.2)
+    got = collector.mutation_count()
+    collector.request_stop()
+    raise TimeoutError(
+        f"Kafka collector decoded {got} of {min_mutations} mutations "
+        f"within {timeout}s drain window"
+    )
 
 
 def _stop_bridge(bridge: Bridge | None, thread: threading.Thread | None) -> None:
@@ -795,9 +857,10 @@ def run_sustained_demo(
         write_deadline = e2e_start + duration
         chunk_size = 50 if target_rate > 0 else 500
         next_index = 0
-        last_published_for_latency = 0
-        last_written_for_latency = 0
-        latency_mark = e2e_start
+        last_published_for_sample = 0
+        last_written_for_sample = 0
+        sample_mark = e2e_start
+        backlog_warned = False
 
         def _writer() -> None:
             nonlocal next_index, written
@@ -839,13 +902,13 @@ def run_sustained_demo(
             pub = bridge.mutations_published
             backlog = stats.sample_backlog(written=w, published=pub)
             stats.batches_acked = bridge.batches_acked
-            if pub > last_published_for_latency and w > last_written_for_latency:
-                # Approximate publish lag from progress marks.
-                stats.publish_latency_samples.append(time.monotonic() - latency_mark)
-                last_published_for_latency = pub
-                last_written_for_latency = w
-                latency_mark = time.monotonic()
-            if backlog > threshold:
+            if pub > last_published_for_sample and w > last_written_for_sample:
+                stats.monitor_sample_intervals.append(time.monotonic() - sample_mark)
+                last_published_for_sample = pub
+                last_written_for_sample = w
+                sample_mark = time.monotonic()
+            if backlog > threshold and not backlog_warned:
+                backlog_warned = True
                 print(
                     f"      WARNING: backlog {backlog:,} exceeds soft threshold "
                     f"{threshold:,} (continuing; catch-up is the hard gate)",
@@ -900,9 +963,9 @@ def run_sustained_demo(
 
         print("\n[5/6] Verification: At-Least-Once + VersionEnd Integrity")
         assert collector is not None
-        # Give the collector a moment to observe final produce.
-        time.sleep(1.0)
-        consumed = collector.stop(timeout=15.0)
+        consumed = _drain_collector(
+            collector, min_mutations=stats.written, timeout=max(catchup_timeout, 15.0)
+        )
         result = verify_workload_at_least_once(consumed, prefix, stats.written)
         versions = sum(1 for rec in consumed if rec.HasField("version_end"))
         print(
@@ -917,9 +980,9 @@ def run_sustained_demo(
         metrics = bridge.metrics
         bridge.stop()
         stats.e2e_seconds = time.monotonic() - e2e_start
-        avg_pub_latency = (
-            sum(stats.publish_latency_samples) / len(stats.publish_latency_samples)
-            if stats.publish_latency_samples
+        avg_sample_interval = (
+            sum(stats.monitor_sample_intervals) / len(stats.monitor_sample_intervals)
+            if stats.monitor_sample_intervals
             else float("nan")
         )
         print(
@@ -931,7 +994,7 @@ def run_sustained_demo(
             f"      max_backlog={stats.max_backlog:,} "
             f"catchup={stats.catchup_seconds:.3f}s "
             f"e2e={stats.e2e_seconds:.3f}s "
-            f"approx_publish_sample_interval={avg_pub_latency:.3f}s"
+            f"monitor_sample_interval={avg_sample_interval:.3f}s"
         )
         print(
             f"      backlog_threshold={threshold:,} "

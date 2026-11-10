@@ -25,15 +25,20 @@ Keep writing while the bridge and a Kafka consumer run concurrently, then assert
 catch-up and at-least-once delivery (duplicates reported, not treated as loss):
 
 1. Start the bridge daemon and a background Kafka collector.
-2. Write mixed mutations for `--duration` at `--target-rate` (optional `--count` cap).
-3. Sample mutation backlog (`written - published`); soft-warn above `--max-backlog`.
+2. Run a background writer thread for `--duration` at `--target-rate`
+   (optional `--count` cap). The main thread monitors backlog and catch-up.
+3. Sample **mutation backlog** (`written - published`). This demo’s lag metric is
+   that backlog (not FDB version-cursor distance). Soft-warn once above
+   `--max-backlog`.
 4. After writers stop, wait until backlog is zero within `--catchup-timeout`.
-5. Verify every written index appears ≥1 time; count duplicates; check VersionEnds.
+5. Drain the Kafka collector until decoded mutations cover the write set, then
+   verify every written index appears ≥1 time; count duplicates; check VersionEnds.
 6. Print written / published / acks / max backlog / catch-up / e2e timings.
 
 **Lag threshold:** default `--max-backlog` is `max(target_rate * 5, 1000)` mutations
-(about five seconds of target throughput). Exceeding it only prints a warning;
-the hard gate is catch-up after writers stop.
+(about five seconds of target throughput). Exceeding it prints a one-time warning;
+the hard gate is catch-up after writers stop. Monitor sample intervals in the
+summary are progress-tick gaps, not Kafka produce RTT.
 
 ## Prerequisites
 

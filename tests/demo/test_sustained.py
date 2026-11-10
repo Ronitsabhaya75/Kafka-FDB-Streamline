@@ -65,3 +65,26 @@ def test_arguments_batch_count_default_none(run_demo: ModuleType) -> None:
     args = run_demo._arguments([])
     assert args.mode == "batch"
     assert args.count is None
+
+
+def test_record_mutation_count_ignores_version_ends(run_demo: ModuleType) -> None:
+    from fdbkafka.cdc.v1 import mutations_pb2
+
+    batch = mutations_pb2.FDBMutationRecord(
+        batch=mutations_pb2.FDBMutationBatch(
+            mutations=[
+                mutations_pb2.FDBMutation(
+                    version_index=mutations_pb2.FDBVersionIndex(
+                        fdb_version=1, sequence_no=0
+                    ),
+                    single_key_mutation=mutations_pb2.FDBSingleKeyMutation(
+                        key=b"k", value=b"v", mutation_type=0
+                    ),
+                )
+            ]
+        )
+    )
+    end = mutations_pb2.FDBMutationRecord(
+        version_end=mutations_pb2.VersionEnd(fdb_version=1, total_mutations=1)
+    )
+    assert run_demo._record_mutation_count([batch, end]) == 1
