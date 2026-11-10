@@ -19,7 +19,7 @@ Schema: [`mutations.proto`](../protobuf/proto/fdbkafka/cdc/v1/mutations.proto).
   `consume()` → durably process/checkpoint → `acknowledge()`.
   Acknowledgement is cumulative, takes no arguments, and advances the cluster retention
   watermark to `last_consumed_version + 1`. A listener rejects another consume until a
-  non-empty delivered reply is acknowledged. There is no automatic acknowledgement:
+  non-empty `poll_records()` result is acknowledged. There is no automatic acknowledgement:
   the listener cannot know whether Kafka publication and checkpoint persistence have
   completed. A serialization failure permanently blocks both acknowledgement and every
   later `poll_records()` on that listener; close it and resume a new listener from the last
@@ -29,18 +29,31 @@ Schema: [`mutations.proto`](../protobuf/proto/fdbkafka/cdc/v1/mutations.proto).
   `poll_records()` uses `fdb_kafka_bridge.serialization.serialize_version_group()` to split each
   version group into records no larger than `max_record_bytes`, then emits its
   `VersionEnd`. A reply watermark beyond the final version group is represented by an
-  additional zero-mutation `VersionEnd`, which is held to the same `max_record_bytes` limit
-  (`RecordTooLargeError` otherwise). Every returned record, including an idle
-  watermark record, belongs to the native reply and must be durably processed before ack.
-- **Idle acknowledgement cadence:** ack-per-reply is deliberate. Any non-empty reply,
-  including one that carries only an idle watermark `VersionEnd`, requires an ack before
-  the next poll, so an idle stream costs one ack per watermark-advancing reply. How often an
-  idle stream yields such replies is UNVERIFIED: the 5 s figure is the server-side lease
-  (`CDC_PROXY_CONSUME_POLL_TIMEOUT`), which the client renews rather than returning
-  ([CDC deep dive §2.7](CDC-DEEP-DIVE.md#27-threads-blocking-and-the-network-thread-)). The
-  cumulative-ack coalescing option in that section — only replies carrying **no mutations** may
-  be coalesced: consume again without acking, then checkpoint and ack at most every few seconds
-  or when a reply carries data — is tracked as a follow-up, not implemented here.
+  additional zero-mutation `VersionEnd`, unless idle coalescing withholds it (below); it is
+  held to the same `max_record_bytes` limit (`RecordTooLargeError` otherwise). Every
+  returned record must be durably processed before ack.
+- **Idle acknowledgement cadence:** an idle reply carries no version groups, only an
+  advanced watermark. By default each one returns a single zero-mutation `VersionEnd` that
+  must be acked before the next poll, so an idle stream costs one ack per
+  watermark-advancing reply. How often an idle stream yields such replies is UNVERIFIED:
+  the 5 s figure is the server-side lease (`CDC_PROXY_CONSUME_POLL_TIMEOUT`), which the
+  client renews rather than returning
+  ([CDC deep dive §2.7](CDC-DEEP-DIVE.md#27-threads-blocking-and-the-network-thread-)).
+  Setting `idle_ack_max_replies` (N) and/or `idle_ack_max_seconds` (T) enables
+  cumulative-ack coalescing
+  ([CDC deep dive §1.3](CDC-DEEP-DIVE.md#13-acknowledgement-semantics-),
+  [§2.7](CDC-DEEP-DIVE.md#27-threads-blocking-and-the-network-thread-)): an idle reply
+  below threshold returns `[]` and needs no ack. Once N idle replies (this one included)
+  accumulate since the last ack, or T seconds pass since the last ack (or start/resume),
+  the reply flushes as one `VersionEnd` at the latest watermark, acked as usual; with both
+  set, whichever is reached first flushes. T is soft: it is checked only when a reply
+  arrives, since `consume()` long-polls, so a T at or below the native idle reply cadence
+  flushes every idle reply; set it well above. Data replies are unchanged and their ack
+  subsumes skipped idle progress; ack and start/resume reset both bounds. Skipped progress
+  un-acked at close is re-consumed as an idle reply after resume. Downstream sees
+  `VersionEnd` heartbeats less often. After a `[]`, `get_position()` is past the last ack:
+  checkpoint a position only for a reply you then acknowledge, never after a `[]`.
+  Coalescing is a listener option only; the Bridge daemon does not expose it.
 - **Resume Safety:** Resume waits until a fresh database read version reaches the cursor's
   `last_consumed_version`, then re-acknowledges the resumed cursor before polling. This
   restores the native consumer's retention watermark after process restart. If either step
@@ -106,6 +119,8 @@ class FDBMutationListener:
         max_record_bytes: int = DEFAULT_MAX_RECORD_BYTES,  # 1_000_000
         resume_timeout_seconds: float = 10.0,
         resume_poll_interval_seconds: float = 0.05,
+        idle_ack_max_replies: int | None = None,
+        idle_ack_max_seconds: float | None = None,
     ) -> None: ...
 
     def start(self) -> None: ...
@@ -127,6 +142,9 @@ class FDBMutationListener:
 
 Supply exactly one of `key_range` or `subspace` to register a stream when the listener
 starts. Omit both to consume a stream registered elsewhere. Supplying both is invalid.
+Leave both `idle_ack_*` bounds `None` for per-reply idle acks; set either to coalesce
+idle replies (§1). N must be an `int` >= 1 and T a finite `int` or `float` > 0 (`bool`
+rejected); wrong types raise `TypeError`, bad values `ValueError`.
 
 `get_position()` returns the native cursor for the last **consumed** reply, which may be ahead
 of the last acknowledged one. That includes a reply that failed to serialize and was never

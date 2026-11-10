@@ -8,7 +8,7 @@ Map of the project's docs. Check here before reading docs wholesale, then open o
 
 | Doc | Status | Read it for |
 |-----|--------|-------------|
-| [`CDC-CONSUMER-SPEC.md`](CDC-CONSUMER-SPEC.md) | Normative | `fdb_kafka_bridge.cdc`: FDB client, CDC stream lifecycle, polling, resume and acknowledgement. |
+| [`CDC-CONSUMER-SPEC.md`](CDC-CONSUMER-SPEC.md) | Normative | `fdb_kafka_bridge.cdc`: FDB client, CDC stream lifecycle, polling, resume and acknowledgement, opt-in idle-reply ack coalescing. |
 | [`SERIALIZATION-SPEC.md`](SERIALIZATION-SPEC.md) | Normative | `fdb_kafka_bridge.serialization`: public API, wire mapping, errors, version-group reader contract. |
 | [`KAFKA-PRODUCER-SPEC.md`](KAFKA-PRODUCER-SPEC.md) | Normative | `fdb_kafka_bridge.kafka.MutationProducer`: producer contract and local Kafka verification. |
 | [`BRIDGE-PIPELINE-SPEC.md`](BRIDGE-PIPELINE-SPEC.md) | Normative | `fdb_kafka_bridge.bridge`: `BridgePipeline`, `Bridge` daemon, config, cursor, recovery and shutdown. |
