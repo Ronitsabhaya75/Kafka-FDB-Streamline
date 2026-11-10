@@ -72,7 +72,7 @@ serialize_version_group(mutations, *, fdb_version, max_record_bytes, stream_name
   empty group returns only the version end. *Caller precondition:* `mutations` is the whole
   group.
   - `max_record_bytes` bounds `len()` of each returned value only; Kafka key, headers and
-    framing are the caller's to subtract.
+    framing are the caller's to subtract ([Record size](KAFKA-PRODUCER-SPEC.md#record-size)).
   - Slicing is greedy in native order; each batch record is byte-identical to
     `serialize_batch` of its slice.
   - A mutation is never split. If one mutation's one-element batch record, or the version-end

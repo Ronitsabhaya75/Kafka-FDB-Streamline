@@ -87,7 +87,7 @@ class FDBMutationListener:
         key_range: tuple[bytes, bytes] | None = None,
         subspace: Any | None = None,
         cursor: Any | None = None,
-        max_record_bytes: int = 1_000_000,
+        max_record_bytes: int | None = None,
         resume_timeout_seconds: float = 10.0,
         resume_poll_interval_seconds: float = 0.05,
         idle_ack_max_replies: int | None = None,
@@ -106,6 +106,23 @@ starts. Omit both to consume a stream registered elsewhere. Supplying both is in
 Leave both `idle_ack_*` bounds `None` for per-reply idle acks; set either to coalesce
 idle replies (§1). N must be an `int` >= 1 and T a finite `int` or `float` > 0 (`bool`
 rejected); wrong types raise `TypeError`, bad values `ValueError`.
+
+`max_record_bytes` bounds each record **value** only. `None` (the default) derives it from
+the stream name's UTF-8 bytes, which the bridge uses as the Kafka key:
+`max_record_bytes_for_key(key)` = librdkafka's default `message.max.bytes` (1,000,000)
+minus the key minus the 36-byte per-message overhead, so a full-size record fits the
+producer's limit. The helper lives in `fdb_kafka_bridge.record_size` (re-exported by
+`fdb_kafka_bridge.kafka`), so the CDC layer never imports the Kafka client. A caller that
+produces under a different key (e.g. `BridgePipeline(partition_key=...)`) must pass
+`max_record_bytes=max_record_bytes_for_key(key)` itself.
+
+The stream name also sits in every record's envelope, so it counts twice. Whether derived
+or explicit, the budget must hold the stream's largest possible `VersionEnd`
+(`min_record_cap(stream_name)`: the name plus about 50 bytes); otherwise every watermark
+would fail identically on each replay, so the constructor raises `ValueError`. With the
+derived default this caps the stream name at roughly 500 KB. An explicit value is
+otherwise used as given; the caller owns the full budget, see
+[Record size](KAFKA-PRODUCER-SPEC.md#record-size).
 
 ### 2.3 Prefix Utilities (`src/fdb_kafka_bridge/cdc/listener.py`)
 
