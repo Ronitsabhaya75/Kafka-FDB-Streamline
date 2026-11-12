@@ -1,0 +1,9 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Community Discussions & Questions
+    url: https://github.com/Ronitsabhaya75/Kafka-FDB-Streamline/discussions
+    about: Ask usage questions, discuss architecture, or share ideas before opening an issue.
+  - name: Architecture & Specification Docs
+    url: https://github.com/Ronitsabhaya75/Kafka-FDB-Streamline/blob/main/docs/INDEX.md
+    about: Review our technical specifications for FDB CDC, Kafka producer delivery, and bridge guarantees.
+

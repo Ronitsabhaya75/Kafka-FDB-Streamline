@@ -1,0 +1,40 @@
+{
+  "mode": "autonomous_bridge",
+  "config": {
+    "duration_s": 60.0,
+    "warmup_s": 10.0,
+    "batch_size": 500,
+    "value_size": 100,
+    "target_rate": 15000.0,
+    "key_pool": 500000,
+    "cursor_file": "/tmp/bench_cursor_36220ebd81.json"
+  },
+  "environment": {
+    "platform": "Linux-7.0.14-linuxkit-x86_64-with-glibc2.39",
+    "cpu_count": 8,
+    "python": "3.12.3",
+    "git_sha": "d790aa2-dirty"
+  },
+  "write_rate_per_s": 15000.0,
+  "bridge_rate_per_s": 14983.333333333334,
+  "backlog_slope_per_s": 3.639335509940514,
+  "backlog_growing": false,
+  "drained": true,
+  "drain_s": 0.14973599000006743,
+  "total_written": 1051000,
+  "total_acked": 1051000,
+  "batches_fsynced_to_disk": 6537,
+  "errors_retried": 0,
+  "lag_versions": {
+    "mean": 26286.94849785408,
+    "max": 444764,
+    "approx_max_seconds": 0.444764
+  },
+  "cursor_checkpoint": {
+    "stream_id": 17,
+    "last_consumed_version": 16706238451,
+    "stream_name": "bench-36220ebd81"
+  },
+  "cursor_matches_listener": true,
+  "cursor_covers_writer": true
+}

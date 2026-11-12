@@ -80,11 +80,13 @@ If the checkpoint or the acknowledgement budget fails after delivery, the next `
 
 Parsed via `from_dict(data)`:
 - `fdb`: `api_version` (default 800), `cluster_file` (optional path).
-- `cdc`: `stream_name` (required; empty or whitespace-only is rejected), `begin_key` / `end_key` (paired hex strings or bytes, `begin_key < end_key`), `max_record_bytes`, `cursor_file` (optional path), `ack_timeout_seconds` (default 5), `proxy_consume_poll_timeout_seconds` (default 5; match the server knob).
+- `cdc`: `stream_name` (required; empty or whitespace-only is rejected), `begin_key` / `end_key` (paired hex strings or bytes, `begin_key < end_key`), `max_record_bytes` (optional; `None` derives it from the stream name, see [CDC spec](CDC-CONSUMER-SPEC.md)), `cursor_file` (optional path), `ack_timeout_seconds` (default 5), `proxy_consume_poll_timeout_seconds` (default 5; match the server knob).
 - `kafka`: `bootstrap_servers`, `topic`, `transactional_id` (optional non-empty string; setting it enables transactional mode).
 - `pipeline`: `flush_timeout_seconds`, `backoff_base_seconds`, `backoff_max_seconds`, `shutdown_timeout_seconds`.
 
 Unknown keys at any level raise `ValueError`, so a typo fails instead of silently falling back to a default.
+
+Every record is keyed by the stream name, so the record budget depends on its length. With `max_record_bytes` unset, the listener derives the largest budget that fits (`max_record_bytes_for_key`), and `from_dict` rejects the configuration if the derived or explicit budget cannot hold the stream's largest `VersionEnd` (`min_record_cap(stream_name)`: the name plus about 50 bytes, since the name is also in every record's envelope). An explicit `max_record_bytes` is rejected with `ValueError` when `max_record_bytes + len(stream_name.encode("utf-8")) + 36 > 1,000,000` (librdkafka's default `message.max.bytes`; the bridge passes no `extra_config`), since librdkafka would reject a max-size record at `produce()` ([Record size](KAFKA-PRODUCER-SPEC.md#record-size)).
 
 ### Producer wiring
 
@@ -109,6 +111,10 @@ On start and on every rebuild, if `cursor_file` exists it is parsed strictly. In
 In `Bridge.run()`:
 - **Terminal errors** (`CDCTerminalError`, fatal Kafka errors via `is_fatal_kafka_error`): sets shutdown, logs with `exc_info=True`, and re-raises.
 - **Permanent errors** (a `ValueError` that is not a `SerializationError`, `CDCInvalidCursorError`, or a `CheckpointError` other than `CheckpointWriteError`, including failures during rebuild): sets shutdown and re-raises rather than retrying forever.
+- **Oversized record** (`KafkaException` with `MSG_SIZE_TOO_LARGE`): permanent, since a restart replays the same version and the same records. Logs, sets shutdown and re-raises; the version is not acknowledged. The remedy depends on where it was raised:
+  - From `produce()`: librdkafka rejected one record client-side (`len(value) + len(key) + 36 > message.max.bytes`). The derived default and the config check prevent this for listener-sized records. Lower `cdc.max_record_bytes`.
+  - From a delivery report (re-raised by `flush()` in idempotent mode) or from `commit_transaction()` (transactional mode: the rejection makes the transaction abortable and the commit raises the same code): the broker rejected a record batch larger than the topic `max.message.bytes`. With producer defaults librdkafka batches a reply's records up to about 1,000,000 bytes, so lowering `cdc.max_record_bytes` does not help; raise the topic `max.message.bytes` to at least 1,000,061 ([Record size](KAFKA-PRODUCER-SPEC.md#record-size)).
+  - Not covered: in transactional mode, a broker rejection that arrives while the step is still producing makes the next `produce()` fail with `_STATE`, and the abort clears the stored size error. The bridge treats `_STATE` as recoverable and rebuilds and replays indefinitely ([#45](https://github.com/Ronitsabhaya75/Kafka-FDB-Streamline/issues/45)).
 - **Retry in place** (e.g. `CDCRetryableError` from poll, checkpoint or ack failure, retriable-commit exhaustion): backs off and calls `step()` again on the same pipeline.
 - **Rebuild** when the failure left state only a resume from checkpoint clears: producer `closed` or `fatal`, listener `delivery_failed` (`SerializationError`/`RecordTooLargeError`), or listener `awaiting_ack` after a non-fatal transactional abort (no `commit_outstanding`). `_rebuild_pipeline()`:
   1. Does nothing while `commit_outstanding` is set (rule 7); the next `step()` retries the commit.

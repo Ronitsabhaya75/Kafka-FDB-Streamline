@@ -18,7 +18,7 @@ Schema: [`mutations.proto`](../protobuf/proto/fdbkafka/cdc/v1/mutations.proto).
   `consume()` → durably process/checkpoint → `acknowledge()`.
   Acknowledgement is cumulative, takes no arguments, and advances the cluster retention
   watermark to `last_consumed_version + 1`. A listener rejects another consume until a
-  non-empty delivered reply is acknowledged. There is no automatic acknowledgement:
+  non-empty `poll_records()` result is acknowledged. There is no automatic acknowledgement:
   the listener cannot know whether Kafka publication and checkpoint persistence have
   completed. A serialization failure permanently blocks acknowledgement on that listener;
   close it and resume from the last durable cursor.
@@ -27,15 +27,25 @@ Schema: [`mutations.proto`](../protobuf/proto/fdbkafka/cdc/v1/mutations.proto).
   `poll_records()` uses `fdb_kafka_bridge.serialization.serialize_version_group()` to split each
   version group into records no larger than `max_record_bytes`, then emits its
   `VersionEnd`. A reply watermark beyond the final version group is represented by an
-  additional zero-mutation `VersionEnd`. Every returned record, including an idle
-  watermark record, belongs to the native reply and must be durably processed before ack.
-- **Idle acknowledgement cadence:** ack-per-reply is deliberate. Any non-empty reply,
-  including one that carries only an idle watermark `VersionEnd`, requires an ack before
-  the next poll. At the ~5 s idle cadence this is one ack per idle reply, which keeps the
-  ordering rule uniform.   The cumulative-ack coalescing option in
-  [CDC deep dive §2.7](CDC-DEEP-DIVE.md#27-threads-blocking-and-the-network-thread-)
-  (consume again without acking, then checkpoint and ack once every N replies or T
-  seconds) is tracked as a follow-up, not implemented here.
+  additional zero-mutation `VersionEnd`, unless idle coalescing withholds it (below).
+  Every returned record must be durably processed before ack.
+- **Idle acknowledgement cadence:** an idle reply carries no version groups, only an
+  advanced watermark. By default each one returns a single zero-mutation `VersionEnd` that
+  must be acked before the next poll (one ack per ~5 s idle reply). Setting
+  `idle_ack_max_replies` (N) and/or `idle_ack_max_seconds` (T) enables cumulative-ack
+  coalescing ([CDC deep dive §1.3](CDC-DEEP-DIVE.md#13-acknowledgement-semantics-),
+  [§2.7](CDC-DEEP-DIVE.md#27-threads-blocking-and-the-network-thread-)): an idle reply
+  below threshold returns `[]` and needs no ack. Once N idle replies (this one included)
+  accumulate since the last ack, or T seconds pass since the last ack (or start/resume),
+  the reply flushes as one `VersionEnd` at the latest watermark, acked as usual; with both
+  set, whichever is reached first flushes. T is soft: it is checked only when a reply
+  arrives, since `consume()` long-polls, so a T at or below the native idle reply cadence
+  flushes every idle reply; set it well above. Data replies are unchanged and their ack
+  subsumes skipped idle progress; ack and start/resume reset both bounds. Skipped progress
+  un-acked at close is re-consumed as an idle reply after resume. Downstream sees
+  `VersionEnd` heartbeats less often. After a `[]`, `get_position()` is past the last ack:
+  checkpoint a position only for a reply you then acknowledge, never after a `[]`.
+  Coalescing is a listener option only; the Bridge daemon does not expose it.
 - **Resume Safety:** Resume waits until a fresh database read version reaches the cursor's
   `last_consumed_version`, then re-acknowledges the resumed cursor before polling. This
   restores the native consumer's retention watermark after process restart.
@@ -78,12 +88,14 @@ class FDBMutationListener:
         key_range: tuple[bytes, bytes] | None = None,
         subspace: Any | None = None,
         cursor: Any | None = None,
-        max_record_bytes: int = 1_000_000,
+        max_record_bytes: int | None = None,
         resume_timeout_seconds: float = 10.0,
         resume_poll_interval_seconds: float = 0.05,
         ack_timeout_seconds: float = 5.0,
         proxy_consume_poll_timeout_seconds: float = 5.0,
         before_ack: Callable[[], None] | None = None,
+        idle_ack_max_replies: int | None = None,
+        idle_ack_max_seconds: float | None = None,
     ) -> None: ...
 
     def start(self) -> None: ...
@@ -96,6 +108,26 @@ class FDBMutationListener:
 
 Supply exactly one of `key_range` or `subspace` to register a stream when the listener
 starts. Omit both to consume a stream registered elsewhere. Supplying both is invalid.
+Leave both `idle_ack_*` bounds `None` for per-reply idle acks; set either to coalesce
+idle replies (§1). N must be an `int` >= 1 and T a finite `int` or `float` > 0 (`bool`
+rejected); wrong types raise `TypeError`, bad values `ValueError`.
+
+`max_record_bytes` bounds each record **value** only. `None` (the default) derives it from
+the stream name's UTF-8 bytes, which the bridge uses as the Kafka key:
+`max_record_bytes_for_key(key)` = librdkafka's default `message.max.bytes` (1,000,000)
+minus the key minus the 36-byte per-message overhead, so a full-size record fits the
+producer's limit. The helper lives in `fdb_kafka_bridge.record_size` (re-exported by
+`fdb_kafka_bridge.kafka`), so the CDC layer never imports the Kafka client. A caller that
+produces under a different key (e.g. `BridgePipeline(partition_key=...)`) must pass
+`max_record_bytes=max_record_bytes_for_key(key)` itself.
+
+The stream name also sits in every record's envelope, so it counts twice. Whether derived
+or explicit, the budget must hold the stream's largest possible `VersionEnd`
+(`min_record_cap(stream_name)`: the name plus about 50 bytes); otherwise every watermark
+would fail identically on each replay, so the constructor raises `ValueError`. With the
+derived default this caps the stream name at roughly 500 KB. An explicit value is
+otherwise used as given; the caller owns the full budget, see
+[Record size](KAFKA-PRODUCER-SPEC.md#record-size).
 
 ### 2.3 Prefix Utilities (`src/fdb_kafka_bridge/cdc/listener.py`)
 

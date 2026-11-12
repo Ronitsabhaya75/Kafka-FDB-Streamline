@@ -161,11 +161,12 @@ Flags override environment variables:
 | `--shutdown-timeout-s` | `STREAMLINE_SHUTDOWN_TIMEOUT_S` | 20 |
 | `--ack-timeout-s` | `STREAMLINE_ACK_TIMEOUT_S` | 5 |
 | `--proxy-consume-poll-timeout-s` | `CDC_PROXY_CONSUME_POLL_TIMEOUT` | 5 |
-| `--max-record-bytes` | `STREAMLINE_MAX_RECORD_BYTES` | 900000 |
+| `--max-record-bytes` | `STREAMLINE_MAX_RECORD_BYTES` | Derived from stream-name key |
 
 Prefixes are UTF-8 text or `0x`-prefixed hexadecimal bytes. A path is slash-separated
-non-empty tuple-prefix components. The envelope default leaves room below Kafka's message
-limit for framing and the key; broker limits must still accommodate the configured size.
+non-empty tuple-prefix components. The default record cap accounts for the stream-name
+key and Kafka framing. Explicit caps are validated against that budget; broker/topic
+batch limits must still accommodate the producer's configured message size.
 
 The CLI runs startup and `Bridge.run()` in a worker thread. SIGINT/SIGTERM request
 shutdown; the main thread calls `Bridge.stop(deadline=...)` and restores previous

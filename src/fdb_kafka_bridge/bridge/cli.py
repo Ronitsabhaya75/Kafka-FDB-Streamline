@@ -54,7 +54,7 @@ def load_config(argv: list[str] | None = None) -> BridgeConfig:
         "shutdown-timeout-s": ("STREAMLINE_SHUTDOWN_TIMEOUT_S", "20", float),
         "ack-timeout-s": ("STREAMLINE_ACK_TIMEOUT_S", "5", float),
         "proxy-consume-poll-timeout-s": ("CDC_PROXY_CONSUME_POLL_TIMEOUT", "5", float),
-        "max-record-bytes": ("STREAMLINE_MAX_RECORD_BYTES", "900000", int),
+        "max-record-bytes": ("STREAMLINE_MAX_RECORD_BYTES", None, int),
     }
     for flag, (env, default, converter) in options.items():
         parser.add_argument(

@@ -26,6 +26,7 @@ def test_config_defaults_and_overrides(monkeypatch: pytest.MonkeyPatch) -> None:
     cfg = load_config(
         ["--kafka-bootstrap-servers", "flag:9092", "--subspace-prefix", "0x00ff"]
     )
+    assert cfg.cdc.max_record_bytes is None
     assert cfg.kafka.topic == "fdb.cdc.orders"
     assert cfg.kafka.bootstrap_servers == "flag:9092"
     assert cfg.cdc.begin_key == b"\x00\xff"
