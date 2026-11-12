@@ -6,7 +6,7 @@ import inspect
 import os
 from collections.abc import Callable
 from pathlib import Path
-from unittest.mock import MagicMock, create_autospec, patch
+from unittest.mock import MagicMock, PropertyMock, create_autospec, patch
 
 import pytest
 from confluent_kafka import KafkaError, KafkaException
@@ -616,3 +616,180 @@ def test_run_propagates_permanent_checkpoint_error(tmp_path: Path) -> None:
     rebuild.assert_not_called()
     listener.acknowledge.assert_not_called()
     assert bridge._shutdown_requested.is_set()
+
+
+def test_bridge_builds_listener_with_idle_coalescing_config() -> None:
+    """Verify Bridge._build_pipeline passes idle coalescing bounds to the listener."""
+    cfg = from_dict(
+        {
+            "cdc": {
+                "stream_name": "s",
+                "idle_ack_max_replies": 4,
+                "idle_ack_max_seconds": 8.0,
+            }
+        }
+    )
+    with (
+        patch("fdb_kafka_bridge.bridge.pipeline.FDBClient") as mock_client_cls,
+        patch(
+            "fdb_kafka_bridge.bridge.pipeline.FDBMutationListener"
+        ) as mock_listener_cls,
+        patch("fdb_kafka_bridge.bridge.pipeline.MutationProducer"),
+    ):
+        mock_client = MagicMock()
+        mock_client_cls.return_value = mock_client
+        mock_listener = MagicMock()
+        mock_listener.raw_stream_name = b"s"
+        mock_listener.stream_name = "s"
+        mock_listener_cls.return_value = mock_listener
+
+        bridge = Bridge(cfg)
+        bridge.start()
+
+        mock_listener_cls.assert_called_once()
+        _, kwargs = mock_listener_cls.call_args
+        assert kwargs["idle_ack_max_replies"] == 4
+        assert kwargs["idle_ack_max_seconds"] == 8.0
+
+
+def test_bridge_checkpoint_failure_never_acknowledges(tmp_path: Path) -> None:
+    """Verify Bridge never acknowledges FDB if the checkpoint write fails."""
+    cursor_file = str(tmp_path / "cursor.json")
+    bridge, listener, _ = _recovery_bridge(cursor_file=cursor_file)
+    listener.poll_records.return_value = [_make_batch_record(1)]
+
+    with patch(
+        "fdb_kafka_bridge.bridge.pipeline._save_cursor_to_file",
+        side_effect=OSError("Disk write error"),
+    ):
+        with pytest.raises(OSError, match="Disk write error"):
+            bridge._pipeline.step()  # type: ignore[union-attr]
+
+    listener.acknowledge.assert_not_called()
+
+
+def test_bridge_acknowledgement_failure_retries_and_raises(tmp_path: Path) -> None:
+    """Verify an acknowledgement failure after checkpoint retries and raises."""
+    cursor_file = str(tmp_path / "cursor.json")
+    bridge, listener, _ = _recovery_bridge(cursor_file=cursor_file)
+    listener.poll_records.return_value = [_make_batch_record(1)]
+    listener.acknowledge.side_effect = CDCRetryableError("FDB overloaded", code=1037)
+
+    with pytest.raises(CDCRetryableError, match="FDB overloaded"):
+        bridge._pipeline.step()  # type: ignore[union-attr]
+
+    assert listener.acknowledge.call_count == 3
+    # Checkpoint was written to disk
+    assert os.path.exists(cursor_file)
+
+
+def test_bridge_graceful_shutdown_flushes_pending_idle_window(tmp_path: Path) -> None:
+    """Verify stop() flushes pending idle progress and acks before close."""
+    cursor_file = str(tmp_path / "cursor.json")
+    cfg = from_dict(
+        {
+            "cdc": {
+                "stream_name": "test_stream",
+                "cursor_file": cursor_file,
+                "idle_ack_max_replies": 5,
+            }
+        }
+    )
+    mock_client = create_autospec(FDBClient, instance=True)
+    mock_listener = create_autospec(FDBMutationListener, instance=True)
+    mock_listener.raw_stream_name = b"test_stream"
+    mock_listener.stream_name = "test_stream"
+    mock_pos = MagicMock(stream_id=1, last_consumed_version=888)
+    mock_listener.get_position.return_value = mock_pos
+    record = mutations_pb2.FDBMutationRecord()
+    record.version_end.fdb_version = 888
+    mock_listener.flush_idle_progress.return_value = [record]
+
+    mock_producer = create_autospec(MutationProducer, instance=True)
+    type(mock_producer).transactional = PropertyMock(return_value=False)
+
+    bridge = Bridge(
+        cfg, client=mock_client, listener=mock_listener, producer=mock_producer
+    )
+    bridge.start()
+
+    # Call stop() directly
+    bridge.stop()
+
+    mock_listener.flush_idle_progress.assert_called_once()
+    mock_producer.produce.assert_called_once()
+    mock_producer.flush_or_raise.assert_called_once()
+    mock_listener.acknowledge.assert_called_once()
+    assert os.path.exists(cursor_file)
+    mock_producer.close.assert_called_once()
+    mock_listener.close.assert_called_once()
+
+
+def test_bridge_shutdown_flush_failure_leaves_unacknowledged(tmp_path: Path) -> None:
+    """Verify flush failure during shutdown is caught and left unacknowledged."""
+    cursor_file = str(tmp_path / "cursor.json")
+    cfg = from_dict({"cdc": {"stream_name": "test_stream", "cursor_file": cursor_file}})
+    mock_client = create_autospec(FDBClient, instance=True)
+    mock_listener = create_autospec(FDBMutationListener, instance=True)
+    mock_listener.raw_stream_name = b"test_stream"
+    mock_listener.stream_name = "test_stream"
+    mock_listener.flush_idle_progress.return_value = [_make_batch_record(1)]
+
+    mock_producer = create_autospec(MutationProducer, instance=True)
+    type(mock_producer).transactional = PropertyMock(return_value=False)
+    mock_producer.flush_or_raise.side_effect = TimeoutError("Kafka flush timeout")
+
+    bridge = Bridge(
+        cfg, client=mock_client, listener=mock_listener, producer=mock_producer
+    )
+    bridge.start()
+
+    # stop() should catch the flush error and proceed to close handles
+    bridge.stop()
+
+    mock_listener.acknowledge.assert_not_called()
+    assert not os.path.exists(cursor_file)
+    assert mock_producer.close.call_count >= 1
+    mock_listener.close.assert_called_once()
+
+
+def test_bridge_restart_recovery_from_unacknowledged_idle_window(
+    tmp_path: Path,
+) -> None:
+    """Verify Bridge restarts from checkpoint when previous window was unacked."""
+    cursor_file = str(tmp_path / "cursor.json")
+    pos_1 = MagicMock(stream_id=1, last_consumed_version=100)
+    _save_cursor_to_file(cursor_file, pos_1, stream_name="test_stream")
+
+    cfg = from_dict(
+        {
+            "cdc": {
+                "stream_name": "test_stream",
+                "cursor_file": cursor_file,
+                "idle_ack_max_replies": 5,
+            }
+        }
+    )
+
+    with (
+        patch("fdb_kafka_bridge.bridge.pipeline.FDBClient") as mock_client_cls,
+        patch(
+            "fdb_kafka_bridge.bridge.pipeline.FDBMutationListener"
+        ) as mock_listener_cls,
+        patch("fdb_kafka_bridge.bridge.pipeline.MutationProducer"),
+    ):
+        mock_client = MagicMock()
+        mock_client_cls.return_value = mock_client
+        mock_listener = MagicMock()
+        mock_listener.raw_stream_name = b"test_stream"
+        mock_listener.stream_name = "test_stream"
+        mock_listener_cls.return_value = mock_listener
+
+        bridge = Bridge(cfg)
+        bridge.start()
+
+        # The listener should have been resumed with the cursor from disk (version 100)
+        _, kwargs = mock_listener_cls.call_args
+        resumed_cursor = kwargs["cursor"]
+        assert resumed_cursor.last_consumed_version == 100
+        assert resumed_cursor.stream_id == 1

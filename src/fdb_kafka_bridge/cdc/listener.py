@@ -174,6 +174,7 @@ class FDBMutationListener:
         self.idle_ack_max_replies = idle_ack_max_replies
         self.idle_ack_max_seconds = idle_ack_max_seconds
         self._skipped_idle_replies = 0
+        self._last_withheld_watermark = -1
         self._idle_window_start = 0.0
 
     def start(self) -> None:
@@ -309,6 +310,7 @@ class FDBMutationListener:
         if not serialized and watermark >= 0 and self._withhold_idle_watermark():
             # Safe only because native ack is cumulative and this reply carries
             # nothing but watermark progress; a later ack subsumes it.
+            self._last_withheld_watermark = watermark
             self._delivery_failed = False
             return []
         if watermark >= 0 and watermark > last_group_version:
@@ -338,9 +340,69 @@ class FDBMutationListener:
         return records
 
     def _reset_idle_window(self) -> None:
-        """Clear the skipped-idle count and restart the idle timer."""
+        """Clear skipped-idle count and watermark, and restart the idle timer."""
         self._skipped_idle_replies = 0
+        self._last_withheld_watermark = -1
         self._idle_window_start = time.monotonic()
+
+    @property
+    def has_pending_idle_progress(self) -> bool:
+        """Whether the listener has skipped idle replies awaiting flush."""
+        return self._skipped_idle_replies > 0 and not self._awaiting_ack
+
+    def flush_idle_progress(
+        self, bridge_timestamp_ns: int | None = None
+    ) -> list[mutations_pb2.FDBMutationRecord]:
+        """Flush any pending coalesced idle progress into a VersionEnd record.
+
+        Returns:
+            A single VersionEnd record for the latest watermark if idle replies
+            were skipped, or [] if no idle progress is pending.
+
+        Raises:
+            CDCConsumerClosedError: If the listener is closed.
+            CDCError: If a prior reply is already awaiting acknowledgement.
+            RecordTooLargeError: If the watermark record exceeds max_record_bytes.
+        """
+        if self._is_closed:
+            raise CDCConsumerClosedError("CDC consumer is closed.")
+        if self._awaiting_ack:
+            raise CDCError("Previous CDC reply has not been acknowledged.")
+        if self._skipped_idle_replies == 0:
+            return []
+
+        watermark = self._last_withheld_watermark
+        if watermark < 0 and self._consumer is not None:
+            pos = self.get_position()
+            watermark = getattr(pos, "last_consumed_version", -1)
+        if watermark < 0:
+            return []
+
+        timestamp_ns = (
+            bridge_timestamp_ns if bridge_timestamp_ns is not None else time.time_ns()
+        )
+        watermark_record = serialize_version_end(
+            fdb_version=watermark,
+            total_mutations=0,
+            stream_name=self.stream_name,
+            bridge_timestamp_ns=timestamp_ns,
+        )
+        if len(watermark_record) > self.max_record_bytes:
+            record_bytes = len(watermark_record)
+            raise RecordTooLargeError(
+                f"watermark version end of version {watermark} needs a "
+                f"{record_bytes}-byte record; max_record_bytes is "
+                f"{self.max_record_bytes}",
+                index=None,
+                record_bytes=record_bytes,
+                max_record_bytes=self.max_record_bytes,
+            )
+
+        self._reset_idle_window()
+        records = [mutations_pb2.FDBMutationRecord.FromString(watermark_record)]
+        self._delivery_failed = False
+        self._awaiting_ack = True
+        return records
 
     def _withhold_idle_watermark(self) -> bool:
         """Count one idle reply and report whether its watermark may go unacked."""

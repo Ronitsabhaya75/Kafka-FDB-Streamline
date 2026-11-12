@@ -224,3 +224,104 @@ def test_from_dict_rejects_non_string_transactional_id() -> None:
     """Verify a non-string transactional_id is a type error."""
     with pytest.raises(TypeError, match="kafka.transactional_id must be"):
         from_dict({"cdc": {"stream_name": "s"}, "kafka": {"transactional_id": 7}})
+
+
+def test_cdc_config_idle_coalescing_defaults() -> None:
+    """Verify idle ack coalescing is disabled by default."""
+    cfg = CDCConfig()
+    assert cfg.idle_ack_max_replies is None
+    assert cfg.idle_ack_max_seconds is None
+
+
+def test_from_dict_parses_idle_coalescing() -> None:
+    """Verify cdc.idle_ack_max_replies and cdc.idle_ack_max_seconds are parsed."""
+    cfg = from_dict(
+        {
+            "cdc": {
+                "stream_name": "s",
+                "idle_ack_max_replies": 5,
+                "idle_ack_max_seconds": 12.5,
+            }
+        }
+    )
+    assert cfg.cdc.idle_ack_max_replies == 5
+    assert cfg.cdc.idle_ack_max_seconds == 12.5
+
+
+@pytest.mark.parametrize(
+    ("val", "err", "match"),
+    [
+        (True, TypeError, "cdc.idle_ack_max_replies must be an integer"),
+        ("5", TypeError, "cdc.idle_ack_max_replies must be an integer"),
+        (2.5, TypeError, "cdc.idle_ack_max_replies must be an integer"),
+        (0, ValueError, "cdc.idle_ack_max_replies must be positive"),
+        (-1, ValueError, "cdc.idle_ack_max_replies must be positive"),
+    ],
+)
+def test_from_dict_validates_idle_ack_max_replies(
+    val: object, err: type[Exception], match: str
+) -> None:
+    """Verify idle_ack_max_replies rejects non-integers and non-positive values."""
+    with pytest.raises(err, match=match):
+        from_dict({"cdc": {"stream_name": "s", "idle_ack_max_replies": val}})
+
+
+@pytest.mark.parametrize(
+    ("val", "err", "match"),
+    [
+        (True, TypeError, "cdc.idle_ack_max_seconds must be numeric"),
+        ("10.0", TypeError, "cdc.idle_ack_max_seconds must be numeric"),
+        (0, ValueError, "cdc.idle_ack_max_seconds must be positive"),
+        (-0.1, ValueError, "cdc.idle_ack_max_seconds must be positive"),
+        (float("nan"), ValueError, "cdc.idle_ack_max_seconds must be finite"),
+        (float("inf"), ValueError, "cdc.idle_ack_max_seconds must be finite"),
+        (10**400, ValueError, "cdc.idle_ack_max_seconds must be finite"),
+    ],
+)
+def test_from_dict_validates_idle_ack_max_seconds(
+    val: object, err: type[Exception], match: str
+) -> None:
+    """Verify idle_ack_max_seconds rejects invalid or non-positive values."""
+    with pytest.raises(err, match=match):
+        from_dict({"cdc": {"stream_name": "s", "idle_ack_max_seconds": val}})
+
+
+def test_from_env_parses_environment_variables() -> None:
+    """Verify from_env correctly maps environment variables into BridgeConfig."""
+    from fdb_kafka_bridge.bridge.config import from_env
+
+    env = {
+        "FDB_API_VERSION": "800",
+        "FDB_CLUSTER_FILE": "/tmp/test.cluster",
+        "FDB_CDC_STREAM_NAME": "env_stream",
+        "FDB_CDC_BEGIN_KEY": "61",
+        "FDB_CDC_END_KEY": "62",
+        "FDB_CDC_MAX_RECORD_BYTES": "500000",
+        "FDB_CDC_CURSOR_FILE": "/tmp/cursor.json",
+        "FDB_CDC_IDLE_ACK_MAX_REPLIES": "10",
+        "FDB_CDC_IDLE_ACK_MAX_SECONDS": "15.5",
+        "KAFKA_BOOTSTRAP_SERVERS": "kafka:9092",
+        "KAFKA_TOPIC": "env-topic",
+        "KAFKA_TRANSACTIONAL_ID": "env-txn",
+        "PIPELINE_FLUSH_TIMEOUT_SECONDS": "8.0",
+        "PIPELINE_BACKOFF_BASE_SECONDS": "0.2",
+        "PIPELINE_BACKOFF_MAX_SECONDS": "3.0",
+        "PIPELINE_SHUTDOWN_TIMEOUT_SECONDS": "12.0",
+    }
+    cfg = from_env(env)
+    assert cfg.fdb.api_version == 800
+    assert cfg.fdb.cluster_file == "/tmp/test.cluster"
+    assert cfg.cdc.stream_name == "env_stream"
+    assert cfg.cdc.begin_key == b"a"
+    assert cfg.cdc.end_key == b"b"
+    assert cfg.cdc.max_record_bytes == 500_000
+    assert cfg.cdc.cursor_file == "/tmp/cursor.json"
+    assert cfg.cdc.idle_ack_max_replies == 10
+    assert cfg.cdc.idle_ack_max_seconds == 15.5
+    assert cfg.kafka.bootstrap_servers == "kafka:9092"
+    assert cfg.kafka.topic == "env-topic"
+    assert cfg.kafka.transactional_id == "env-txn"
+    assert cfg.pipeline.flush_timeout_seconds == 8.0
+    assert cfg.pipeline.backoff_base_seconds == 0.2
+    assert cfg.pipeline.backoff_max_seconds == 3.0
+    assert cfg.pipeline.shutdown_timeout_seconds == 12.0

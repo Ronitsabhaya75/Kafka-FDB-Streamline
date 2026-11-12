@@ -45,7 +45,8 @@ Schema: [`mutations.proto`](../protobuf/proto/fdbkafka/cdc/v1/mutations.proto).
   un-acked at close is re-consumed as an idle reply after resume. Downstream sees
   `VersionEnd` heartbeats less often. After a `[]`, `get_position()` is past the last ack:
   checkpoint a position only for a reply you then acknowledge, never after a `[]`.
-  Coalescing is a listener option only; the Bridge daemon does not expose it.
+  Idle coalescing is configured via `idle_ack_max_replies` and `idle_ack_max_seconds`
+  on `FDBMutationListener`, and exposed daemon-wide via `BridgeConfig.cdc` and the bridge CLI.
 - **Resume Safety:** Resume waits until a fresh database read version reaches the cursor's
   `last_consumed_version`, then re-acknowledges the resumed cursor before polling. This
   restores the native consumer's retention watermark after process restart.
