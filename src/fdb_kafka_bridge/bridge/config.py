@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field, fields
 from typing import Any
 
@@ -35,6 +36,11 @@ class CDCConfig:
     end_key: bytes = b""
     max_record_bytes: int | None = None
     cursor_file: str | None = None
+    checkpoint_path: tuple[str, ...] | None = None
+    checkpoint_timeout_seconds: float = 5.0
+    checkpoint_retry_limit: int = 10
+    ack_timeout_seconds: float = 5.0
+    proxy_consume_poll_timeout_seconds: float = 5.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -224,6 +230,41 @@ def from_dict(data: dict[str, Any]) -> BridgeConfig:
     if cursor_file is not None and not isinstance(cursor_file, str):
         raise TypeError("cdc.cursor_file must be a string or None")
 
+    checkpoint_path = cdc_dict.get("checkpoint_path")
+    if checkpoint_path is not None:
+        if (
+            not isinstance(checkpoint_path, (list, tuple))
+            or not checkpoint_path
+            or any(not isinstance(p, str) or not p for p in checkpoint_path)
+        ):
+            raise ValueError("cdc.checkpoint_path must be non-empty path components")
+        checkpoint_path = tuple(checkpoint_path)
+        if cursor_file is not None:
+            raise ValueError("Choose cursor_file or checkpoint_path, not both")
+    checkpoint_timeout = cdc_dict.get("checkpoint_timeout_seconds", 5.0)
+    if (
+        isinstance(checkpoint_timeout, bool)
+        or not isinstance(checkpoint_timeout, (int, float))
+        or not math.isfinite(checkpoint_timeout)
+        or checkpoint_timeout <= 0
+    ):
+        raise ValueError("cdc.checkpoint_timeout_seconds must be finite and positive")
+    checkpoint_retries = cdc_dict.get("checkpoint_retry_limit", 10)
+    if type(checkpoint_retries) is not int or checkpoint_retries < 0:
+        raise ValueError("cdc.checkpoint_retry_limit must be a nonnegative integer")
+
+    cdc_timeouts = {}
+    for name in ("ack_timeout_seconds", "proxy_consume_poll_timeout_seconds"):
+        value = cdc_dict.get(name, 5.0)
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or value <= 0
+        ):
+            raise ValueError(f"cdc.{name} must be finite and positive")
+        cdc_timeouts[name] = float(value)
+
     # Kafka validation
     bootstrap_servers = kafka_dict.get("bootstrap_servers", "localhost:9092")
     if not isinstance(bootstrap_servers, str) or not bootstrap_servers.strip():
@@ -245,6 +286,7 @@ def from_dict(data: dict[str, Any]) -> BridgeConfig:
     if (
         not isinstance(flush_timeout, (int, float))
         or isinstance(flush_timeout, bool)
+        or not math.isfinite(flush_timeout)
         or flush_timeout <= 0
     ):
         raise ValueError("pipeline.flush_timeout_seconds must be a positive number")
@@ -253,6 +295,7 @@ def from_dict(data: dict[str, Any]) -> BridgeConfig:
     if (
         not isinstance(backoff_base, (int, float))
         or isinstance(backoff_base, bool)
+        or not math.isfinite(backoff_base)
         or backoff_base <= 0
     ):
         raise ValueError("pipeline.backoff_base_seconds must be a positive number")
@@ -261,6 +304,7 @@ def from_dict(data: dict[str, Any]) -> BridgeConfig:
     if (
         not isinstance(backoff_max, (int, float))
         or isinstance(backoff_max, bool)
+        or not math.isfinite(backoff_max)
         or backoff_max <= 0
     ):
         raise ValueError("pipeline.backoff_max_seconds must be a positive number")
@@ -269,6 +313,7 @@ def from_dict(data: dict[str, Any]) -> BridgeConfig:
     if (
         not isinstance(shutdown_timeout, (int, float))
         or isinstance(shutdown_timeout, bool)
+        or not math.isfinite(shutdown_timeout)
         or shutdown_timeout <= 0
     ):
         raise ValueError("pipeline.shutdown_timeout_seconds must be a positive number")
@@ -284,6 +329,10 @@ def from_dict(data: dict[str, Any]) -> BridgeConfig:
             end_key=end_key,
             max_record_bytes=max_record_bytes,
             cursor_file=cursor_file,
+            checkpoint_path=checkpoint_path,
+            checkpoint_timeout_seconds=float(checkpoint_timeout),
+            checkpoint_retry_limit=checkpoint_retries,
+            **cdc_timeouts,
         ),
         kafka=KafkaConfig(
             bootstrap_servers=bootstrap_servers,

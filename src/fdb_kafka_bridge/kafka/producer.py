@@ -16,6 +16,7 @@ is outside the Kafka transaction boundary.
 from __future__ import annotations
 
 import logging
+import math
 from collections.abc import Callable
 from typing import Any
 
@@ -407,6 +408,36 @@ class MutationProducer:
 
         self._producer.produce(topic, **kwargs)
         self._producer.poll(0)
+
+    def cluster_id(self, timeout: float = 10.0) -> str:
+        """Read Kafka's cluster identity without creating a topic.
+
+        Args:
+            timeout: Finite positive metadata request timeout in seconds.
+
+        Returns:
+            Broker-reported cluster ID.
+
+        Raises:
+            ValueError: If timeout is invalid or metadata has no cluster ID.
+            RuntimeError: If the producer is closed or fatal.
+            KafkaException: If metadata retrieval fails.
+        """
+        if self._closed:
+            raise RuntimeError("Producer is closed")
+        if self._fatal:
+            raise RuntimeError("Producer is in a fatal error state")
+        if (
+            isinstance(timeout, bool)
+            or not isinstance(timeout, (int, float))
+            or not math.isfinite(timeout)
+            or timeout <= 0
+        ):
+            raise ValueError("Metadata timeout must be finite and positive")
+        cluster_id = self._producer.list_topics(timeout=timeout).cluster_id
+        if not isinstance(cluster_id, str) or not cluster_id.strip():
+            raise ValueError("Kafka metadata did not report a cluster ID")
+        return cluster_id
 
     def flush(self, timeout: float = 10.0) -> int:
         """Block until all queued messages are broker-acknowledged.

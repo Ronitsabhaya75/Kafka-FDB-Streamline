@@ -7,8 +7,8 @@ from typing import Any
 
 import pytest
 
-from fdb_kafka_bridge.cdc.client import FDB_TRANSACTION_TOO_OLD, FDBClient
-from fdb_kafka_bridge.cdc.errors import CDCTerminalError
+from fdb_kafka_bridge.cdc.client import FDBClient
+from fdb_kafka_bridge.cdc.errors import CDCInvalidCursorError
 from fdb_kafka_bridge.cdc.listener import FDBMutationListener, strinc
 from fdbkafka.cdc.v1 import mutations_pb2
 
@@ -190,14 +190,13 @@ def test_live_idle_coalescing_flush_ack_covers_skipped_replies() -> None:
             listener.acknowledge()
 
         # Only the flush was acked, yet the skipped cursor is now behind the
-        # retained history: the ack covered it. The native layer may reject the
-        # stale cursor at resume or at first consume.
-        with pytest.raises(CDCTerminalError) as exc_info:
+        # retained history: the ack covered it. Resume must reject this before
+        # issuing a native acknowledgement or consume.
+        with pytest.raises(CDCInvalidCursorError, match="retained history"):
             with FDBMutationListener(
                 client=client, stream_name=stream_name, cursor=skipped
             ) as stale:
                 stale.poll_records()
-        assert exc_info.value.code == FDB_TRANSACTION_TOO_OLD
 
         key = prefix + b"after_flush"
         committed = _commit(db, key, b"v")

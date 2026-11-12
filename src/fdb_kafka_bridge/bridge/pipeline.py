@@ -36,8 +36,20 @@ except ImportError:
 from confluent_kafka import KafkaException
 
 from fdb_kafka_bridge.bridge.config import BridgeConfig
+from fdb_kafka_bridge.bridge.startup import resolve_startup
+from fdb_kafka_bridge.cdc.checkpoint import (
+    CheckpointError,
+    CheckpointSinkMismatchError,
+    CheckpointStore,
+    CheckpointWriteError,
+    SinkIdentity,
+)
 from fdb_kafka_bridge.cdc.client import FDBClient
-from fdb_kafka_bridge.cdc.errors import CDCRetryableError, CDCTerminalError
+from fdb_kafka_bridge.cdc.errors import (
+    CDCInvalidCursorError,
+    CDCRetryableError,
+    CDCTerminalError,
+)
 from fdb_kafka_bridge.cdc.listener import FDBMutationListener
 from fdb_kafka_bridge.kafka import (
     MutationProducer,
@@ -119,6 +131,7 @@ class BridgePipeline:
         commit_retries: int = DEFAULT_COMMIT_RETRIES,
         commit_retry_delay_seconds: float = DEFAULT_COMMIT_RETRY_DELAY_SECONDS,
         flush_timeout_seconds: float = DEFAULT_FLUSH_TIMEOUT_SECONDS,
+        before_ack: Callable[[], None] | None = None,
     ) -> None:
         """Bind a listener and producer to one topic.
 
@@ -138,6 +151,7 @@ class BridgePipeline:
             commit_retries: Attempts for a retriable transactional commit.
             commit_retry_delay_seconds: Pause between commit attempts.
             flush_timeout_seconds: Maximum wait for message delivery during flush.
+            before_ack: Optional ownership check before every ack attempt.
 
         Raises:
             ValueError: If the partition key is empty, or a retry count is
@@ -157,6 +171,7 @@ class BridgePipeline:
         self._producer = producer
         self._topic = topic
         self._checkpoint = checkpoint
+        self._before_ack = before_ack
         self._partition_key = _resolve_partition_key(listener, partition_key)
         self._ack_retries = ack_retries
         self._ack_retry_delay_seconds = float(ack_retry_delay_seconds)
@@ -332,6 +347,8 @@ class BridgePipeline:
         last_err: CDCRetryableError | None = None
         for attempt in range(1, self._ack_retries + 1):
             try:
+                if self._before_ack is not None:
+                    self._before_ack()
                 self._listener.acknowledge()
                 return
             except CDCRetryableError as exc:
@@ -589,6 +606,7 @@ class Bridge:
     Args:
         config: Declarative configuration for FDB, CDC stream, Kafka, and pipeline.
         client: Optional pre-configured :class:`FDBClient` (useful for testing).
+        checkpoint_store: Optional FDB cursor backend, shared with this client's stream.
         listener: Optional pre-configured :class:`FDBMutationListener`.
         producer: Optional pre-configured :class:`MutationProducer`.
         producer_factory: Optional builder for replacement producers.
@@ -602,6 +620,7 @@ class Bridge:
         listener: FDBMutationListener | None = None,
         producer: MutationProducer | None = None,
         producer_factory: Callable[[], MutationProducer] | None = None,
+        checkpoint_store: CheckpointStore | None = None,
     ) -> None:
         """Initialize the Bridge with declarative configuration.
 
@@ -616,6 +635,8 @@ class Bridge:
             producer: Optional injected MutationProducer. A transactional one
                 must not have had ``init_transactions()`` called; ``start``
                 calls it.
+            checkpoint_store: Optional FDB store bound to the same client. Cannot
+                be combined with an injected listener or a cursor file.
             producer_factory: Builds each replacement producer after a
                 rebuild. Defaults to ``MutationProducer`` from
                 ``config.kafka``, transactional when ``transactional_id`` is
@@ -624,7 +645,9 @@ class Bridge:
         Raises:
             ValueError: If ``producer`` is transactional but neither
                 ``producer_factory`` nor ``config.kafka.transactional_id`` is
-                given, so a rebuild would downgrade it to idempotent.
+                given, so a rebuild would downgrade it to idempotent; or the
+                FDB checkpoint backend conflicts with an injected listener,
+                cursor file or FDB client.
         """
         if (
             producer is not None
@@ -636,6 +659,23 @@ class Bridge:
                 "An injected transactional producer needs producer_factory or "
                 "kafka.transactional_id so rebuilds stay transactional"
             )
+        uses_fdb_checkpoint = (
+            checkpoint_store is not None or config.cdc.checkpoint_path is not None
+        )
+        if uses_fdb_checkpoint and (
+            listener is not None or config.cdc.cursor_file is not None
+        ):
+            raise ValueError(
+                "FDB checkpoints require a managed listener and no cursor_file"
+            )
+        if checkpoint_store is not None:
+            if client is not None and checkpoint_store.client is not client:
+                raise ValueError(
+                    "Checkpoint store and bridge must share the FDB client"
+                )
+            client = checkpoint_store.client
+        self._uses_fdb_checkpoint = uses_fdb_checkpoint
+        self._checkpoint_store = checkpoint_store
         self.config = config
         self._shutdown_requested = threading.Event()
         self._step_lock = threading.Lock()
@@ -672,7 +712,9 @@ class Bridge:
         if not self.config.cdc.stream_name:
             raise ValueError("Bridge requires a non-empty cdc.stream_name")
 
-        self._build_pipeline()
+        with self._step_lock:
+            if not self._shutdown_requested.is_set():
+                self._build_pipeline()
 
     def _producer_from_config(self) -> MutationProducer:
         """Build a producer from ``config.kafka``."""
@@ -706,16 +748,26 @@ class Bridge:
                     if self.config.cdc.begin_key or self.config.cdc.end_key
                     else None
                 )
-                cursor = _load_cursor_from_file(
-                    self.config.cdc.cursor_file,
-                    stream_name=self.config.cdc.stream_name,
-                )
+                if self._uses_fdb_checkpoint:
+                    cursor, register = self._resolve_fdb_startup(key_range)
+                    if not register:
+                        key_range = None
+                else:
+                    cursor = _load_cursor_from_file(
+                        self.config.cdc.cursor_file,
+                        stream_name=self.config.cdc.stream_name,
+                    )
                 self._listener = FDBMutationListener(
                     self._client,
                     stream_name=self.config.cdc.stream_name,
                     key_range=key_range,
                     cursor=cursor,
                     max_record_bytes=self.config.cdc.max_record_bytes,
+                    ack_timeout_seconds=self.config.cdc.ack_timeout_seconds,
+                    proxy_consume_poll_timeout_seconds=(
+                        self.config.cdc.proxy_consume_poll_timeout_seconds
+                    ),
+                    before_ack=self._verify_checkpoint_owner,
                 )
                 self._listener.start()
 
@@ -737,11 +789,14 @@ class Bridge:
         partition_key = stream_bytes if stream_bytes else None
 
         def _checkpoint_callback(position: Any) -> None:
-            _save_cursor_to_file(
-                self.config.cdc.cursor_file,
-                position,
-                stream_name=self.config.cdc.stream_name,
-            )
+            if self._checkpoint_store is not None:
+                self._checkpoint_store.save(stream_bytes, position)
+            else:
+                _save_cursor_to_file(
+                    self.config.cdc.cursor_file,
+                    position,
+                    stream_name=self.config.cdc.stream_name,
+                )
 
         self._pipeline = BridgePipeline(
             self._counting_listener,  # type: ignore[arg-type]
@@ -750,6 +805,42 @@ class Bridge:
             checkpoint=_checkpoint_callback,
             partition_key=partition_key,
             flush_timeout_seconds=self.config.pipeline.flush_timeout_seconds,
+            before_ack=self._verify_checkpoint_owner,
+        )
+
+    def _verify_checkpoint_owner(self) -> None:
+        if self._checkpoint_store is not None:
+            self._checkpoint_store.verify_owner(
+                self.config.cdc.stream_name.encode("utf-8")
+            )
+
+    def _resolve_fdb_startup(
+        self, key_range: tuple[bytes, bytes] | None
+    ) -> tuple[Any | None, bool]:
+        """Validate destination and native stream before allocating or registering."""
+        if self._producer is None:
+            self._producer = self._producer_factory()
+        sink = SinkIdentity(
+            self._producer.cluster_id(self.config.pipeline.flush_timeout_seconds),
+            self.config.kafka.topic,
+        )
+        if self._checkpoint_store is None:
+            self._checkpoint_store = CheckpointStore(
+                self._client,
+                sink=sink,
+                path=self.config.cdc.checkpoint_path,
+                timeout_s=self.config.cdc.checkpoint_timeout_seconds,
+                retry_limit=self.config.cdc.checkpoint_retry_limit,
+            )
+        if self._checkpoint_store.sink != sink:
+            raise CheckpointSinkMismatchError(
+                "Kafka destination changed during rebuild"
+            )
+        return resolve_startup(
+            self._client,
+            self._checkpoint_store,
+            self.config.cdc.stream_name.encode("utf-8"),
+            key_range,
         )
 
     def _discard_listener_and_producer(self) -> None:
@@ -877,8 +968,12 @@ class Bridge:
                     raise
                 # Checkpoint coordinates and cursor files fail the same way on
                 # every retry. SerializationError is per-reply and resumable.
-                if isinstance(exc, ValueError) and not isinstance(
-                    exc, SerializationError
+                if (
+                    isinstance(exc, (ValueError, CDCInvalidCursorError))
+                    and not isinstance(exc, SerializationError)
+                ) or (
+                    isinstance(exc, CheckpointError)
+                    and not isinstance(exc, CheckpointWriteError)
                 ):
                     logger.error(
                         "Permanent error in bridge run loop: %s", exc, exc_info=True
@@ -919,36 +1014,49 @@ class Bridge:
         """Signal the daemon run loop to stop cleanly."""
         self._shutdown_requested.set()
 
-    def stop(self) -> None:
+    def stop(self, *, deadline: float | None = None) -> None:
         """Request shutdown, finish any outstanding commit, and close all handles.
 
-        Waits up to ``shutdown_timeout_seconds`` for an in-flight step. If it
-        is still running (typically parked in ``consume()`` on an idle
-        stream), the listener is closed to unblock it and the wait repeats
-        once; after that, handles are closed regardless. Every close is
-        attempted.
+        A parked consume is cancelled immediately. All teardown work shares one
+        deadline. Cleanup runs on a daemon thread so an unresponsive dependency
+        cannot extend the supervisor's shutdown budget. Handles are never closed
+        concurrently with an executing pipeline step.
+
+        Args:
+            deadline: Absolute monotonic deadline shared with the daemon join.
+                Defaults to now plus ``shutdown_timeout_seconds``.
 
         Raises:
-            Exception: The first error raised by a close, after all closes
-                were attempted.
+            TimeoutError: If teardown does not complete within the total budget.
+            Exception: The first cleanup failure after attempting all closes.
         """
         self.request_shutdown()
-        timeout = self.config.pipeline.shutdown_timeout_seconds
-        locked = self._step_lock.acquire(timeout=timeout)
+        if deadline is None:
+            deadline = time.monotonic() + self.config.pipeline.shutdown_timeout_seconds
+        failures: list[BaseException] = []
+
+        def cleanup() -> None:
+            try:
+                self._stop_before(deadline)
+            except BaseException as exc:
+                failures.append(exc)
+
+        closer = threading.Thread(target=cleanup, name="bridge-cleanup", daemon=True)
+        closer.start()
+        closer.join(max(0, deadline - time.monotonic()))
+        if closer.is_alive():
+            raise TimeoutError("Bridge teardown exceeded the total shutdown budget")
+        if failures:
+            raise failures[0]
+
+    def _stop_before(self, deadline: float) -> None:
+        if self._listener is not None:
+            self._listener.cancel_pending()
+        locked = self._step_lock.acquire(timeout=max(0, deadline - time.monotonic()))
         if not locked:
-            # A blocked consume().wait() raises once its consumer is closed.
-            if self._listener is not None:
-                try:
-                    self._listener.close()
-                except Exception:
-                    logger.exception("Error closing listener to unblock step")
-            locked = self._step_lock.acquire(timeout=timeout)
-            if not locked:
-                logger.warning("Bridge step still running; closing handles anyway")
+            raise TimeoutError("Bridge step exceeded the total shutdown budget")
         try:
-            # Without the lock the run thread may still be inside step().
-            if locked:
-                self._finish_outstanding_commit(timeout)
+            self._finish_outstanding_commit(max(0, deadline - time.monotonic()))
             producer, listener, client = self._producer, self._listener, self._client
             self._producer = self._listener = self._client = None
             self._pipeline = None
@@ -956,7 +1064,9 @@ class Bridge:
 
             closes: list[Callable[[], None]] = []
             if producer is not None:
-                closes.append(lambda: producer.close(timeout=timeout))
+                closes.append(
+                    lambda: producer.close(timeout=max(0, deadline - time.monotonic()))
+                )
             if listener is not None:
                 closes.append(listener.close)
             if client is not None:

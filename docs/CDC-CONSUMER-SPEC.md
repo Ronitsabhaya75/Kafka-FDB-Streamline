@@ -67,6 +67,7 @@ class FDBClient:
     def __init__(self, cluster_file: str | None = None, api_version: int = 800) -> None: ...
     def open(self) -> Any: ...
     def close(self) -> None: ...
+    def cancel_pending(self) -> None: ...
     def register_cdc_stream(self, name: bytes | str, begin_key: bytes, end_key: bytes) -> int: ...
     def create_cdc_consumer(self, name: bytes | str) -> Any: ...
     def resume_cdc_consumer(self, cursor: Any) -> Any: ...
@@ -90,12 +91,16 @@ class FDBMutationListener:
         max_record_bytes: int | None = None,
         resume_timeout_seconds: float = 10.0,
         resume_poll_interval_seconds: float = 0.05,
+        ack_timeout_seconds: float = 5.0,
+        proxy_consume_poll_timeout_seconds: float = 5.0,
+        before_ack: Callable[[], None] | None = None,
         idle_ack_max_replies: int | None = None,
         idle_ack_max_seconds: float | None = None,
     ) -> None: ...
 
     def start(self) -> None: ...
     def close(self) -> None: ...
+    def cancel_pending(self) -> None: ...
     def poll_records(self, bridge_timestamp_ns: int | None = None) -> list[mutations_pb2.FDBMutationRecord]: ...
     def acknowledge(self) -> None: ...
     def get_position(self) -> Any: ...
@@ -139,12 +144,13 @@ otherwise used as given; the caller owns the full budget, see
 - `CDCInvalidRangeError`: Invalid key range supplied.
 - `CDCConsumeError`: Base for a failed native `consume`/`acknowledge`. Carries the
   native FoundationDB `code` on the surface, not behind `__cause__`.
-  - `CDCRetryableError`: `server_overloaded` (1211). Retry with bounded backoff;
+  - `CDCRetryableError`: `server_overloaded` (1211) or an acknowledgement timeout. Retry with bounded backoff;
     if it repeats at one commit version it is the L1 poison pill — escalate, do
     not spin.
   - `CDCTerminalError`: `transaction_too_old` (1007) or `client_invalid_operation`
-    (2000). Do not retry; 1007 means rebuild, and the narrow ≤5 s retry-once case
-    for 2000 is the caller's to implement from `code`.
+    (2000). 1007 requires operator recovery. The listener retries 2000 only on the
+    first consume after resume, within `proxy_consume_poll_timeout_seconds`, then
+    raises it as terminal. Match that setting to the server's consume poll timeout.
 
 Only these three CDC error codes are classified ([CDC deep dive §3](CDC-DEEP-DIVE.md#errors-we-have-to-map-),
 whose standard `is_retryable` predicate is wrong about two of them). Any other native
@@ -156,3 +162,18 @@ non-native consume/ack failure is wrapped as `CDCError` with the original as its
 Unit tests run without FoundationDB. The live-cluster integration test is skipped unless
 `FDB_CDC_INTEGRATION=1` is set in an environment containing the API-800 Python bindings,
 CDC-enabled client library, and a reachable CDC-enabled cluster.
+
+## Durable FDB checkpoints
+
+`fdb_kafka_bridge.cdc` exports `CheckpointStore`, `CheckpointCursor`, `SinkIdentity`
+and the checkpoint error classes. The store validates Kafka destination identity
+and cursor monotonicity before advancing. See [FDB checkpoints](FDB-CHECKPOINT-SPEC.md)
+for the storage layout, overlap guards and bridge integration.
+
+
+Resume checks the current stream registration and requires `cursor + 1 >= min_version`
+before restoring an ack. A stale cursor raises `CDCInvalidCursorError`. Both restored
+and normal ack futures use `ack_timeout_seconds`; expiry explicitly cancels the future
+and leaves the delivered reply pending for retry. `cancel_pending()` prevents new
+operations and cancels a parked consume. `close()` cancels any pending future before
+releasing the handle; closing the native handle alone does not cancel a consume.

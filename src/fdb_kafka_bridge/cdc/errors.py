@@ -53,8 +53,7 @@ class CDCTerminalError(CDCConsumeError):
     """A consume/ack failure that will not succeed on a plain retry.
 
     Raised for ``transaction_too_old`` (1007) and ``client_invalid_operation``
-    (2000). 1007 is unrecoverable data loss and must trigger a rebuild, not a
-    retry. 2000 is terminal for the request apart from the narrow ≤5 s
-    retry-once-past-the-lease case in CDC-DEEP-DIVE §3, which callers implement
-    from ``code``.
+    (2000). 1007 means required history is unavailable and needs operator
+    recovery. The listener retries 2000 only on the first consume after resume,
+    within the configured proxy poll timeout; later occurrences are terminal.
     """

@@ -682,3 +682,27 @@ def test_close_logs_warning_when_flush_raises(
 
     assert "3 message(s) could not be delivered during close" in caplog.text
     assert producer._closed is True
+
+
+def test_cluster_identity_metadata(producer_class: MagicMock) -> None:
+    producer_class.return_value.list_topics.return_value.cluster_id = "cluster"
+    producer = MutationProducer("broker:9092")
+    assert producer.cluster_id(2.0) == "cluster"
+    producer_class.return_value.list_topics.assert_called_once_with(timeout=2.0)
+    producer_class.return_value.flush.return_value = 0
+    producer.close()
+    with pytest.raises(RuntimeError, match="closed"):
+        producer.cluster_id()
+
+
+@pytest.mark.parametrize("cluster", [None, "", " ", 10])
+def test_missing_cluster_identity(producer_class: MagicMock, cluster: object) -> None:
+    producer_class.return_value.list_topics.return_value.cluster_id = cluster
+    with pytest.raises(ValueError, match="cluster ID"):
+        MutationProducer("broker:9092").cluster_id()
+
+
+@pytest.mark.parametrize("timeout", [0, -1, True, float("nan"), float("inf"), "bad"])
+def test_invalid_metadata_timeout(producer_class: MagicMock, timeout: object) -> None:
+    with pytest.raises(ValueError, match="timeout"):
+        MutationProducer("broker:9092").cluster_id(timeout)
