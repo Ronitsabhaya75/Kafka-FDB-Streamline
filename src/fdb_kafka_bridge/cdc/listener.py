@@ -10,6 +10,7 @@ from fdb_kafka_bridge.cdc.errors import (
     CDCError,
     CDCInvalidCursorError,
 )
+from fdb_kafka_bridge.record_size import max_record_bytes_for_key, min_record_cap
 from fdb_kafka_bridge.serialization import (
     serialize_version_end,
     serialize_version_group,
@@ -17,7 +18,6 @@ from fdb_kafka_bridge.serialization import (
 from fdb_kafka_bridge.serialization.errors import RecordTooLargeError
 from fdbkafka.cdc.v1 import mutations_pb2
 
-DEFAULT_MAX_RECORD_BYTES: Final[int] = 1_000_000
 DEFAULT_RESUME_TIMEOUT_SECONDS: Final[float] = 10.0
 DEFAULT_RESUME_POLL_INTERVAL_SECONDS: Final[float] = 0.05
 
@@ -87,7 +87,7 @@ class FDBMutationListener:
         key_range: tuple[bytes, bytes] | None = None,
         subspace: Any | None = None,
         cursor: Any | None = None,
-        max_record_bytes: int = DEFAULT_MAX_RECORD_BYTES,
+        max_record_bytes: int | None = None,
         resume_timeout_seconds: float = DEFAULT_RESUME_TIMEOUT_SECONDS,
         resume_poll_interval_seconds: float = DEFAULT_RESUME_POLL_INTERVAL_SECONDS,
         idle_ack_max_replies: int | None = None,
@@ -105,6 +105,10 @@ class FDBMutationListener:
             subspace: Optional FDB subspace or bytes prefix to register.
             cursor: Optional persisted cursor from which to resume.
             max_record_bytes: Maximum serialized size of every returned record.
+                ``None`` derives the largest value Kafka's default
+                ``message.max.bytes`` accepts with the stream name's bytes as
+                the message key; pass an explicit cap when producing with a
+                different key.
             resume_timeout_seconds: Maximum wait for the cluster read version to
                 reach a resumed cursor.
             resume_poll_interval_seconds: Delay between resume read-version checks.
@@ -118,14 +122,30 @@ class FDBMutationListener:
         Raises:
             TypeError: If a numeric configuration value has an invalid type.
             ValueError: If both range forms are supplied, a value is not positive,
-                or ``idle_ack_max_seconds`` is not finite.
+                ``idle_ack_max_seconds`` is not finite, the stream name is
+                empty, or the effective ``max_record_bytes`` cannot hold the
+                stream's largest ``VersionEnd``.
         """
         if key_range is not None and subspace is not None:
             raise ValueError("Specify either key_range or subspace, not both")
-        if type(max_record_bytes) is not int:
+        raw_stream_name = _to_bytes(stream_name)
+        decoded_stream_name = raw_stream_name.decode("utf-8", errors="replace")
+        derived = max_record_bytes is None
+        if max_record_bytes is None:
+            max_record_bytes = max_record_bytes_for_key(raw_stream_name)
+        elif type(max_record_bytes) is not int:
             raise TypeError("max_record_bytes must be an integer")
-        if max_record_bytes < 1:
+        elif max_record_bytes < 1:
             raise ValueError("max_record_bytes must be positive")
+        floor = min_record_cap(decoded_stream_name)
+        if max_record_bytes < floor:
+            # Every watermark would fail the same way on each replay.
+            source = "derived from Kafka message.max.bytes " if derived else ""
+            raise ValueError(
+                f"max_record_bytes ({max_record_bytes}) {source}for the "
+                f"{len(raw_stream_name)}-byte stream_name is smaller than the "
+                f"{floor}-byte largest VersionEnd it must hold"
+            )
         if not isinstance(resume_timeout_seconds, (int, float)) or isinstance(
             resume_timeout_seconds, bool
         ):
@@ -158,8 +178,8 @@ class FDBMutationListener:
                 raise ValueError("idle_ack_max_seconds must be positive")
 
         self.client = client
-        self.raw_stream_name = _to_bytes(stream_name)
-        self.stream_name = self.raw_stream_name.decode("utf-8", errors="replace")
+        self.raw_stream_name = raw_stream_name
+        self.stream_name = decoded_stream_name
         self.key_range = (
             subspace_to_key_range(subspace) if subspace is not None else key_range
         )

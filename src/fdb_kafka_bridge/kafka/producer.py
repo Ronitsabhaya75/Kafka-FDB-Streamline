@@ -67,6 +67,32 @@ def is_fatal_kafka_error(exc: Exception) -> bool:
 _is_fatal_kafka_error = is_fatal_kafka_error
 
 
+def is_message_too_large_error(exc: BaseException) -> bool:
+    """Return True if exc, or an exception it was raised from, is MSG_SIZE_TOO_LARGE.
+
+    The same record serializes to the same bytes on every replay, so a
+    rebuild-and-retry cannot succeed; callers should treat this as permanent.
+    Follows ``__cause__`` because a failed transaction abort is raised from the
+    produce error that triggered it.
+
+    Args:
+        exc: Exception to test.
+
+    Returns:
+        True if exc or any exception in its ``__cause__`` chain is a
+        KafkaException carrying ``KafkaError.MSG_SIZE_TOO_LARGE``.
+    """
+    current: BaseException | None = exc
+    while current is not None:
+        if isinstance(current, KafkaException) and current.args:
+            err = current.args[0]
+            code = getattr(err, "code", None)
+            if callable(code) and code() == KafkaError.MSG_SIZE_TOO_LARGE:
+                return True
+        current = current.__cause__
+    return False
+
+
 def _default_error_cb(err: KafkaError) -> None:
     """Log asynchronous client and broker errors.
 

@@ -344,7 +344,6 @@ def run_demo(bootstrap_servers: str, timeout: float, count: int) -> None:
                     "stream_name": stream_name,
                     "begin_key": prefix.hex(),
                     "end_key": strinc(prefix).hex(),
-                    "max_record_bytes": 1_000_000,
                     "cursor_file": cursor_file,
                 },
                 "kafka": {

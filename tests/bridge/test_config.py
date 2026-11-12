@@ -12,6 +12,10 @@ from fdb_kafka_bridge.bridge.config import (
     PipelineConfig,
     from_dict,
 )
+from fdb_kafka_bridge.kafka import (
+    DEFAULT_MESSAGE_MAX_BYTES,
+    KAFKA_MESSAGE_OVERHEAD_BYTES,
+)
 
 _CDC = {"stream_name": "s"}
 
@@ -24,7 +28,7 @@ def test_default_config() -> None:
     assert cfg.cdc.stream_name == ""
     assert cfg.cdc.begin_key == b""
     assert cfg.cdc.end_key == b""
-    assert cfg.cdc.max_record_bytes == 1_000_000
+    assert cfg.cdc.max_record_bytes is None
     assert cfg.cdc.cursor_file is None
     assert cfg.kafka.bootstrap_servers == "localhost:9092"
     assert cfg.kafka.topic == "fdb-cdc"
@@ -224,3 +228,64 @@ def test_from_dict_rejects_non_string_transactional_id() -> None:
     """Verify a non-string transactional_id is a type error."""
     with pytest.raises(TypeError, match="kafka.transactional_id must be"):
         from_dict({"cdc": {"stream_name": "s"}, "kafka": {"transactional_id": 7}})
+
+
+def test_from_dict_default_max_record_bytes() -> None:
+    """Verify an omitted cap stays None so the listener derives it."""
+    cfg = from_dict({"cdc": _CDC})
+    assert cfg.cdc.max_record_bytes is None
+
+
+def test_long_stream_name_with_default_cap_accepted() -> None:
+    """Verify a long stream name does not fail config load under the default."""
+    cfg = from_dict({"cdc": {"stream_name": "s" * 10_000}})
+    assert cfg.cdc.max_record_bytes is None
+
+
+def test_max_record_bytes_at_message_limit_accepted() -> None:
+    """Verify a cap that exactly fills message.max.bytes is accepted, +1 is not."""
+    stream = "stream"
+    cap = DEFAULT_MESSAGE_MAX_BYTES - len(stream) - KAFKA_MESSAGE_OVERHEAD_BYTES
+    cfg = from_dict({"cdc": {"stream_name": stream, "max_record_bytes": cap}})
+    assert cfg.cdc.max_record_bytes == cap
+    with pytest.raises(ValueError, match=r"cdc.max_record_bytes \(\d+\) exceeds"):
+        from_dict({"cdc": {"stream_name": stream, "max_record_bytes": cap + 1}})
+
+
+def test_explicit_cap_counts_stream_name_in_utf8_bytes() -> None:
+    """Verify the key is sized in UTF-8 bytes, not characters."""
+    stream = "\u20ac" * 10
+    cap = DEFAULT_MESSAGE_MAX_BYTES - 30 - KAFKA_MESSAGE_OVERHEAD_BYTES
+    assert (
+        from_dict(
+            {"cdc": {"stream_name": stream, "max_record_bytes": cap}}
+        ).cdc.max_record_bytes
+        == cap
+    )
+    with pytest.raises(ValueError, match="30-byte cdc.stream_name key"):
+        from_dict({"cdc": {"stream_name": stream, "max_record_bytes": cap + 1}})
+
+
+def test_stream_name_leaving_no_record_budget_rejected() -> None:
+    """Verify a stream name that alone fills message.max.bytes is rejected."""
+    longest = "s" * (DEFAULT_MESSAGE_MAX_BYTES - KAFKA_MESSAGE_OVERHEAD_BYTES)
+    with pytest.raises(ValueError, match="cdc.stream_name"):
+        from_dict({"cdc": {"stream_name": longest}})
+
+
+def test_stream_name_too_long_for_any_version_end_rejected() -> None:
+    """Verify the name, counted as key and envelope field, must leave room.
+
+    For an L-byte name (L >= 16_384) the worst-case VersionEnd is L + 52 bytes
+    and the derived budget 999_964 - L, so 499_956 bytes is the longest name.
+    """
+    assert from_dict({"cdc": {"stream_name": "s" * 499_956}})
+    with pytest.raises(ValueError, match="smaller than the 500009-byte"):
+        from_dict({"cdc": {"stream_name": "s" * 499_957}})
+
+
+def test_explicit_cap_below_largest_version_end_rejected() -> None:
+    """Verify an explicit cap must hold the stream's worst-case VersionEnd."""
+    assert from_dict({"cdc": {"stream_name": "stream", "max_record_bytes": 56}})
+    with pytest.raises(ValueError, match="cdc.max_record_bytes \\(55\\) is smaller"):
+        from_dict({"cdc": {"stream_name": "stream", "max_record_bytes": 55}})

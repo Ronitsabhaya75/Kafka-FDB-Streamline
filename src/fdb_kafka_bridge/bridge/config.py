@@ -5,6 +5,13 @@ from __future__ import annotations
 from dataclasses import dataclass, field, fields
 from typing import Any
 
+from fdb_kafka_bridge.record_size import (
+    DEFAULT_MESSAGE_MAX_BYTES,
+    KAFKA_MESSAGE_OVERHEAD_BYTES,
+    max_record_bytes_for_key,
+    min_record_cap,
+)
+
 
 @dataclass(frozen=True, slots=True)
 class FDBConfig:
@@ -16,12 +23,17 @@ class FDBConfig:
 
 @dataclass(frozen=True, slots=True)
 class CDCConfig:
-    """FoundationDB Native CDC stream configuration."""
+    """FoundationDB Native CDC stream configuration.
+
+    ``max_record_bytes`` of ``None`` lets the listener derive the largest
+    record that fits Kafka's default ``message.max.bytes`` with the stream
+    name as the message key.
+    """
 
     stream_name: str = ""
     begin_key: bytes = b""
     end_key: bytes = b""
-    max_record_bytes: int = 1_000_000
+    max_record_bytes: int | None = None
     cursor_file: str | None = None
 
 
@@ -84,6 +96,55 @@ def _parse_key(key: Any, name: str) -> bytes:
     )
 
 
+def _check_message_fits(
+    max_record_bytes: int | None,
+    stream_name: str,
+    message_max_bytes: int = DEFAULT_MESSAGE_MAX_BYTES,
+) -> None:
+    """Reject a record cap whose largest Kafka message would exceed the limit.
+
+    Every produced message carries the stream name as its key, so a record at
+    the cap plus the key and librdkafka's per-message overhead must fit within
+    ``message.max.bytes``; otherwise produce() rejects it after CDC has already
+    delivered it. The name also sits in every record's envelope, so the cap must
+    still hold the stream's largest ``VersionEnd``.
+
+    Args:
+        max_record_bytes: Configured cap on one serialized record value, or
+            ``None`` for the cap derived from the key.
+        stream_name: CDC stream name, used verbatim as the Kafka message key.
+        message_max_bytes: Effective producer ``message.max.bytes``.
+
+    Raises:
+        ValueError: If an explicit cap exceeds the key's budget, or the
+            effective cap cannot hold the stream's largest ``VersionEnd``.
+    """
+    key = stream_name.encode("utf-8")
+    budget = max_record_bytes_for_key(key, message_max_bytes)
+    if max_record_bytes is not None and max_record_bytes > budget:
+        raise ValueError(
+            f"cdc.max_record_bytes ({max_record_bytes}) exceeds the "
+            f"{budget}-byte budget left by the {len(key)}-byte "
+            f"cdc.stream_name key and {KAFKA_MESSAGE_OVERHEAD_BYTES} bytes of "
+            f"message overhead within Kafka message.max.bytes "
+            f"({message_max_bytes})"
+        )
+    floor = min_record_cap(stream_name)
+    if max_record_bytes is not None and max_record_bytes < floor:
+        raise ValueError(
+            f"cdc.max_record_bytes ({max_record_bytes}) is smaller than the "
+            f"{floor}-byte largest VersionEnd for the {len(key)}-byte "
+            f"cdc.stream_name"
+        )
+    if max_record_bytes is None and budget < floor:
+        raise ValueError(
+            f"{len(key)}-byte cdc.stream_name, counted as the Kafka key and in "
+            f"every record, leaves a {budget}-byte record budget within Kafka "
+            f"message.max.bytes ({message_max_bytes}), smaller than the "
+            f"{floor}-byte largest VersionEnd"
+        )
+
+
 def from_dict(data: dict[str, Any]) -> BridgeConfig:
     """Parse a dictionary into a validated BridgeConfig instance.
 
@@ -98,8 +159,11 @@ def from_dict(data: dict[str, Any]) -> BridgeConfig:
             or if any string or numeric setting has an invalid type.
         ValueError: If any section has an unknown key, stream_name, topic or
             transactional_id is empty or whitespace-only, a key range is
-            one-sided or has begin_key >= end_key, a hex string is invalid, or
-            numeric intervals are not positive.
+            one-sided or has begin_key >= end_key, a hex string is invalid,
+            numeric intervals are not positive, an explicit max_record_bytes
+            plus the UTF-8 stream_name key and Kafka per-message overhead
+            exceeds the producer's message.max.bytes, or the effective
+            max_record_bytes cannot hold the stream's largest VersionEnd.
     """
     if not isinstance(data, dict):
         raise TypeError(
@@ -148,11 +212,13 @@ def from_dict(data: dict[str, Any]) -> BridgeConfig:
     if begin_key and begin_key >= end_key:
         raise ValueError("cdc.begin_key must be less than cdc.end_key")
 
-    max_record_bytes = cdc_dict.get("max_record_bytes", 1_000_000)
-    if not isinstance(max_record_bytes, int) or isinstance(max_record_bytes, bool):
-        raise TypeError("cdc.max_record_bytes must be an integer")
-    if max_record_bytes < 1:
-        raise ValueError("cdc.max_record_bytes must be positive")
+    max_record_bytes = cdc_dict.get("max_record_bytes")
+    if max_record_bytes is not None:
+        if not isinstance(max_record_bytes, int) or isinstance(max_record_bytes, bool):
+            raise TypeError("cdc.max_record_bytes must be an integer or None")
+        if max_record_bytes < 1:
+            raise ValueError("cdc.max_record_bytes must be positive")
+    _check_message_fits(max_record_bytes, stream_name)
 
     cursor_file = cdc_dict.get("cursor_file")
     if cursor_file is not None and not isinstance(cursor_file, str):

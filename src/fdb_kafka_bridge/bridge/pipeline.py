@@ -39,7 +39,11 @@ from fdb_kafka_bridge.bridge.config import BridgeConfig
 from fdb_kafka_bridge.cdc.client import FDBClient
 from fdb_kafka_bridge.cdc.errors import CDCRetryableError, CDCTerminalError
 from fdb_kafka_bridge.cdc.listener import FDBMutationListener
-from fdb_kafka_bridge.kafka import MutationProducer, is_fatal_kafka_error
+from fdb_kafka_bridge.kafka import (
+    MutationProducer,
+    is_fatal_kafka_error,
+    is_message_too_large_error,
+)
 from fdb_kafka_bridge.serialization.errors import SerializationError
 from fdbkafka.cdc.v1 import mutations_pb2
 
@@ -800,7 +804,8 @@ class Bridge:
         Raises:
             RuntimeError: If called before :meth:`start`.
             CDCTerminalError: If FDB CDC encounters an unrecoverable stream error.
-            KafkaException: If Kafka encounters a fatal unrecoverable error.
+            KafkaException: If Kafka encounters a fatal unrecoverable error, or
+                rejects a record as larger than ``message.max.bytes``.
             ValueError: If a checkpoint or cursor file is permanently invalid
                 (``SerializationError`` excepted, which triggers a rebuild).
         """
@@ -859,6 +864,14 @@ class Bridge:
                 if is_fatal_kafka_error(exc):
                     logger.error(
                         "Fatal Kafka error in bridge run loop: %s", exc, exc_info=True
+                    )
+                    self.request_shutdown()
+                    raise
+                if is_message_too_large_error(exc):
+                    logger.error(
+                        "Record exceeds Kafka message size limit: %s",
+                        exc,
+                        exc_info=True,
                     )
                     self.request_shutdown()
                     raise
