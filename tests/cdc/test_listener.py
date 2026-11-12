@@ -597,3 +597,44 @@ def test_constructor_accepts_integer_idle_ack_seconds() -> None:
 
     assert isinstance(listener.idle_ack_max_seconds, float)
     assert listener.idle_ack_max_seconds == 5.0
+
+
+def test_flush_idle_progress_returns_empty_when_no_progress() -> None:
+    listener, _, _ = _listener_with_batches(
+        [MockConsumeResult([], 100)], idle_ack_max_replies=3
+    )
+    assert not listener.has_pending_idle_progress
+    assert listener.flush_idle_progress() == []
+
+
+def test_flush_idle_progress_emits_watermark_record_and_requires_ack() -> None:
+    listener, _, consumer = _listener_with_batches(
+        [MockConsumeResult([], 100), MockConsumeResult([], 200)],
+        idle_ack_max_replies=5,
+    )
+    assert listener.poll_records(bridge_timestamp_ns=1) == []
+    assert listener.has_pending_idle_progress
+
+    flushed = listener.flush_idle_progress(bridge_timestamp_ns=2)
+    assert len(flushed) == 1
+    assert flushed[0].HasField("version_end")
+    assert flushed[0].version_end.fdb_version == 100
+    assert flushed[0].version_end.total_mutations == 0
+    assert not listener.has_pending_idle_progress
+
+    with pytest.raises(CDCError, match="Previous CDC reply has not been acknowledged"):
+        listener.flush_idle_progress()
+
+    listener.acknowledge()
+    assert not listener.has_pending_idle_progress
+    consumer.acknowledge.return_value.wait.assert_called_once()
+
+
+def test_flush_idle_progress_raises_when_closed() -> None:
+    listener, _, _ = _listener_with_batches(
+        [MockConsumeResult([], 100)], idle_ack_max_replies=5
+    )
+    listener.poll_records()
+    listener.close()
+    with pytest.raises(CDCConsumerClosedError):
+        listener.flush_idle_progress()

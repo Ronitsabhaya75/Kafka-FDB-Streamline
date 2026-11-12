@@ -644,3 +644,47 @@ def test_flush_timeout_seconds_reaches_flush_or_raise() -> None:
     (call,) = producer.flush_or_raise.call_args_list
     timeout = call.kwargs.get("timeout", call.args[0] if call.args else None)
     assert timeout == 4.5
+
+
+class TestFlushPendingIdle:
+    def test_flush_pending_idle_when_no_progress(self) -> None:
+        pipeline, producer, listener, checkpoint, _ = _make_pipeline()
+        listener.flush_idle_progress.return_value = []
+        assert pipeline.flush_pending_idle() == 0
+        producer.produce.assert_not_called()
+        checkpoint.assert_not_called()
+        listener.acknowledge.assert_not_called()
+
+    def test_flush_pending_idle_delivers_checkpoints_and_acks(self) -> None:
+        pipeline, producer, listener, checkpoint, cursor = _make_pipeline()
+        record = _make_record()
+        listener.flush_idle_progress.return_value = [record]
+
+        assert pipeline.flush_pending_idle() == 1
+        producer.produce.assert_called_once()
+        producer.flush_or_raise.assert_called_once()
+        checkpoint.assert_called_once_with(cursor)
+        listener.acknowledge.assert_called_once()
+
+    def test_flush_pending_idle_checkpoint_failure_does_not_ack(self) -> None:
+        checkpoint = MagicMock(side_effect=OSError("Disk full"))
+        pipeline, producer, listener, _, _ = _make_pipeline(checkpoint=checkpoint)
+        listener.flush_idle_progress.return_value = [_make_record()]
+
+        with pytest.raises(OSError, match="Disk full"):
+            pipeline.flush_pending_idle()
+
+        producer.flush_or_raise.assert_called_once()
+        checkpoint.assert_called_once()
+        listener.acknowledge.assert_not_called()
+
+    def test_flush_pending_idle_kafka_failure_does_not_checkpoint_or_ack(self) -> None:
+        pipeline, producer, listener, checkpoint, _ = _make_pipeline()
+        listener.flush_idle_progress.return_value = [_make_record()]
+        producer.flush_or_raise.side_effect = TimeoutError("Kafka flush timeout")
+
+        with pytest.raises(TimeoutError):
+            pipeline.flush_pending_idle()
+
+        checkpoint.assert_not_called()
+        listener.acknowledge.assert_not_called()

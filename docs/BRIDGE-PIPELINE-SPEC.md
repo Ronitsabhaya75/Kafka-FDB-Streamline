@@ -51,7 +51,9 @@ A produce failure or non-fatal abort-required commit failure aborts the open tra
 
 ### Checkpoint and acknowledgement
 
-`checkpoint` receives the object returned by `get_position()` and must make it durable. It runs only after Kafka delivery succeeds. If it raises, FDB is not acknowledged.
+`checkpoint` receives the object returned by `get_position()` and must make it durable. It runs only after Kafka delivery succeeds. If it raises, FDB is not acknowledged; the bridge never acknowledges a cursor that was not successfully persisted.
+
+When idle reply coalescing is active, empty replies returning `[]` bypass both checkpointing and acknowledgement. The final coalesced cursor is persisted to the cursor store only after Kafka delivery of the flushed watermark and before FoundationDB acknowledgement.
 
 `acknowledge()` is then retried up to `ack_retries` times on `CDCRetryableError`, with `ack_retry_delay_seconds` between attempts. Nothing is re-polled or re-produced.
 
@@ -78,13 +80,22 @@ If the checkpoint or the acknowledgement budget fails after delivery, the next `
 
 ### Configuration (`BridgeConfig`)
 
-Parsed via `from_dict(data)`:
+Parsed via `from_dict(data)`, `from_env(env)`, or via the CLI daemon entrypoint (`fdb_kafka_bridge.bridge.cli`):
 - `fdb`: `api_version` (default 800), `cluster_file` (optional path).
-- `cdc`: `stream_name` (required; empty or whitespace-only is rejected), `begin_key` / `end_key` (paired hex strings or bytes, `begin_key < end_key`), `max_record_bytes`, `cursor_file` (optional path).
+- `cdc`: `stream_name` (required; empty or whitespace-only is rejected), `begin_key` / `end_key` (paired hex strings or bytes, `begin_key < end_key`), `max_record_bytes`, `cursor_file` (optional path), `idle_ack_max_replies` (optional positive integer >= 1), `idle_ack_max_seconds` (optional finite float > 0).
 - `kafka`: `bootstrap_servers`, `topic`, `transactional_id` (optional non-empty string; setting it enables transactional mode).
 - `pipeline`: `flush_timeout_seconds`, `backoff_base_seconds`, `backoff_max_seconds`, `shutdown_timeout_seconds`.
 
 Unknown keys at any level raise `ValueError`, so a typo fails instead of silently falling back to a default.
+
+### Idle Reply Coalescing
+
+When `cdc.idle_ack_max_replies` or `cdc.idle_ack_max_seconds` is configured:
+1. Idle heartbeat replies that do not carry mutations return `[]` from the listener and bypass both Kafka production and disk checkpointing.
+2. When either threshold is reached, the listener emits a single `VersionEnd` record with `total_mutations=0` representing the latest watermark.
+3. The bridge publishes the watermark record to Kafka, persists the new cursor position to `cdc.cursor_file`, and invokes FoundationDB `acknowledge()`.
+4. Acknowledgement is cumulative, safely releasing retention for all intermediate skipped versions in one operation.
+5. If the bridge crashes before a coalesced flush, the uncheckpointed advancement is re-consumed after restart without losing data.
 
 ### Producer wiring
 
@@ -126,7 +137,8 @@ A `RecordTooLargeError` caused by the data itself recurs after every rebuild, so
 `Bridge.stop()`:
 1. Calls `request_shutdown()` and waits up to `shutdown_timeout_seconds` for the step lock. If a step is still running (typically parked in `consume()` on an idle stream), it closes the listener to unblock it and waits once more, then proceeds regardless.
 2. Only if it holds the step lock, and while `commit_outstanding`, calls `step()` until the commit resolves, an exception is raised, or `shutdown_timeout_seconds` elapses (rule 7). Closing the producer after that is logged as an error, because it aborts a commit that may still complete. FDB was not acknowledged, so the replay duplicates rather than loses data.
-3. Attempts every close (producer, listener, FDB client) and unsets all handles, then re-raises the first close error.
+3. While holding the step lock and within the remaining shutdown timeout budget, if idle coalescing has pending unacknowledged progress, `Bridge.stop()` flushes and checkpoints that pending progress via `flush_pending_idle()`. If the budget is exhausted or the flush/checkpoint fails, the progress remains unacknowledged in FoundationDB for safe replay upon resume.
+4. Attempts every close (producer, listener, FDB client) and unsets all handles, then re-raises the first close error.
 
 ---
 

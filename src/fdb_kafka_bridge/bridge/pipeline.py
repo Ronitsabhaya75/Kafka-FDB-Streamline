@@ -220,6 +220,39 @@ class BridgePipeline:
         self._pending_count = len(records)
         return self._finish_delivery()
 
+    def flush_pending_idle(self) -> int:
+        """Flush pending idle watermark progress, produce, checkpoint, and acknowledge.
+
+        If a Kafka transaction commit or delivery is already in progress, that
+        delivery is completed first. Otherwise, if the listener has pending
+        coalesced idle progress, it is serialized, produced to Kafka, persisted
+        to the cursor store, and acknowledged in FoundationDB.
+
+        Returns:
+            The number of records published (1 if flushed, 0 if nothing was pending).
+
+        Raises:
+            KafkaException: Delivery or commit failure. FDB is not acknowledged.
+            Exception: Checkpoint or acknowledge failure.
+        """
+        if self._commit_outstanding or self._delivered_unacked:
+            return self._finish_delivery()
+
+        flush_method = getattr(self._listener, "flush_idle_progress", None)
+        if not callable(flush_method):
+            return 0
+
+        records = flush_method()
+        if not records:
+            return 0
+
+        if self._producer.transactional:
+            self._begin_and_produce(records)
+        else:
+            self._produce_and_flush(records)
+        self._pending_count = len(records)
+        return self._finish_delivery()
+
     def _produce_all(self, records: list[mutations_pb2.FDBMutationRecord]) -> None:
         """Enqueue every record under the same partition key."""
         for record in records:
@@ -571,6 +604,24 @@ class _RecordCountingListener:
         self._last_records = []
         return records
 
+    def flush_idle_progress(
+        self, bridge_timestamp_ns: int | None = None
+    ) -> list[mutations_pb2.FDBMutationRecord]:
+        """Flush pending idle progress and buffer records for metric tallying.
+
+        Args:
+            bridge_timestamp_ns: Optional timestamp for record headers.
+
+        Returns:
+            List of Protobuf mutation records from the flush.
+        """
+        flush_fn = getattr(self._listener, "flush_idle_progress", None)
+        if not callable(flush_fn):
+            return []
+        records = flush_fn(bridge_timestamp_ns=bridge_timestamp_ns)
+        self._last_records = records
+        return records
+
     def __getattr__(self, name: str) -> Any:
         """Delegate attribute access to the underlying listener."""
         return getattr(self._listener, name)
@@ -712,6 +763,8 @@ class Bridge:
                     key_range=key_range,
                     cursor=cursor,
                     max_record_bytes=self.config.cdc.max_record_bytes,
+                    idle_ack_max_replies=self.config.cdc.idle_ack_max_replies,
+                    idle_ack_max_seconds=self.config.cdc.idle_ack_max_seconds,
                 )
                 self._listener.start()
 
@@ -921,6 +974,9 @@ class Bridge:
         """
         self.request_shutdown()
         timeout = self.config.pipeline.shutdown_timeout_seconds
+        start_time = time.monotonic()
+        deadline = start_time + timeout
+
         locked = self._step_lock.acquire(timeout=timeout)
         if not locked:
             # A blocked consume().wait() raises once its consumer is closed.
@@ -929,13 +985,19 @@ class Bridge:
                     self._listener.close()
                 except Exception:
                     logger.exception("Error closing listener to unblock step")
-            locked = self._step_lock.acquire(timeout=timeout)
+            remaining_lock_timeout = max(0.0, deadline - time.monotonic())
+            locked = self._step_lock.acquire(timeout=remaining_lock_timeout)
             if not locked:
                 logger.warning("Bridge step still running; closing handles anyway")
         try:
             # Without the lock the run thread may still be inside step().
             if locked:
-                self._finish_outstanding_commit(timeout)
+                remaining = max(0.0, deadline - time.monotonic())
+                if remaining > 0:
+                    self._finish_outstanding_commit(remaining)
+                remaining = max(0.0, deadline - time.monotonic())
+                if remaining > 0:
+                    self._flush_pending_idle(remaining)
             producer, listener, client = self._producer, self._listener, self._client
             self._producer = self._listener = self._client = None
             self._pipeline = None
@@ -984,6 +1046,29 @@ class Bridge:
                 break
         if pipeline.commit_outstanding:
             logger.error("Closing producer mid-commit; the batch will replay")
+
+    def _flush_pending_idle(self, timeout: float) -> None:
+        """Flush pending idle progress and checkpoint before shutdown if budget permits.
+
+        Args:
+            timeout: Maximum seconds allocated to flush and acknowledge.
+        """
+        pipeline = self._pipeline
+        if pipeline is None:
+            return
+        try:
+            flushed = pipeline.flush_pending_idle()
+            if flushed > 0 and self._counting_listener is not None:
+                records = self._counting_listener.pop_last_records()
+                self.metrics.records_published += len(records) if records else flushed
+                self.metrics.batches_acked += 1
+                logger.info("Gracefully flushed pending coalesced idle progress.")
+        except Exception:
+            logger.warning(
+                "Failed to flush pending idle progress during graceful shutdown; "
+                "leaving unacknowledged for replay",
+                exc_info=True,
+            )
 
 
 __all__ = [

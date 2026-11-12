@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import math
+import os
+from collections.abc import Mapping
 from dataclasses import dataclass, field, fields
 from typing import Any
 
@@ -23,6 +26,8 @@ class CDCConfig:
     end_key: bytes = b""
     max_record_bytes: int = 1_000_000
     cursor_file: str | None = None
+    idle_ack_max_replies: int | None = None
+    idle_ack_max_seconds: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -158,6 +163,28 @@ def from_dict(data: dict[str, Any]) -> BridgeConfig:
     if cursor_file is not None and not isinstance(cursor_file, str):
         raise TypeError("cdc.cursor_file must be a string or None")
 
+    idle_ack_max_replies = cdc_dict.get("idle_ack_max_replies")
+    if idle_ack_max_replies is not None:
+        if type(idle_ack_max_replies) is not int:
+            raise TypeError("cdc.idle_ack_max_replies must be an integer")
+        if idle_ack_max_replies < 1:
+            raise ValueError("cdc.idle_ack_max_replies must be positive")
+
+    idle_ack_max_seconds = cdc_dict.get("idle_ack_max_seconds")
+    if idle_ack_max_seconds is not None:
+        if not isinstance(idle_ack_max_seconds, (int, float)) or isinstance(
+            idle_ack_max_seconds, bool
+        ):
+            raise TypeError("cdc.idle_ack_max_seconds must be numeric")
+        try:
+            idle_ack_max_seconds = float(idle_ack_max_seconds)
+        except OverflowError:
+            raise ValueError("cdc.idle_ack_max_seconds must be finite") from None
+        if not math.isfinite(idle_ack_max_seconds):
+            raise ValueError("cdc.idle_ack_max_seconds must be finite")
+        if idle_ack_max_seconds <= 0:
+            raise ValueError("cdc.idle_ack_max_seconds must be positive")
+
     # Kafka validation
     bootstrap_servers = kafka_dict.get("bootstrap_servers", "localhost:9092")
     if not isinstance(bootstrap_servers, str) or not bootstrap_servers.strip():
@@ -218,6 +245,8 @@ def from_dict(data: dict[str, Any]) -> BridgeConfig:
             end_key=end_key,
             max_record_bytes=max_record_bytes,
             cursor_file=cursor_file,
+            idle_ack_max_replies=idle_ack_max_replies,
+            idle_ack_max_seconds=idle_ack_max_seconds,
         ),
         kafka=KafkaConfig(
             bootstrap_servers=bootstrap_servers,
@@ -231,3 +260,155 @@ def from_dict(data: dict[str, Any]) -> BridgeConfig:
             shutdown_timeout_seconds=float(shutdown_timeout),
         ),
     )
+
+
+def env_to_dict(env: Mapping[str, str] | None = None) -> dict[str, Any]:
+    """Map environment variables into a nested configuration dictionary.
+
+    Environment variables map as follows:
+        - FDB_API_VERSION -> fdb.api_version (int)
+        - FDB_CLUSTER_FILE -> fdb.cluster_file (str)
+        - FDB_CDC_STREAM_NAME or CDC_STREAM_NAME -> cdc.stream_name (str)
+        - FDB_CDC_BEGIN_KEY or CDC_BEGIN_KEY -> cdc.begin_key (hex str)
+        - FDB_CDC_END_KEY or CDC_END_KEY -> cdc.end_key (hex str)
+        - FDB_CDC_MAX_RECORD_BYTES or CDC_MAX_RECORD_BYTES -> cdc.max_record_bytes (int)
+        - FDB_CDC_CURSOR_FILE or CDC_CURSOR_FILE -> cdc.cursor_file (str)
+        - FDB_CDC_IDLE_ACK_MAX_REPLIES or CDC_IDLE_ACK_MAX_REPLIES ->
+          cdc.idle_ack_max_replies (int)
+        - FDB_CDC_IDLE_ACK_MAX_SECONDS or CDC_IDLE_ACK_MAX_SECONDS ->
+          cdc.idle_ack_max_seconds (float)
+        - KAFKA_BOOTSTRAP_SERVERS -> kafka.bootstrap_servers (str)
+        - KAFKA_TOPIC -> kafka.topic (str)
+        - KAFKA_TRANSACTIONAL_ID -> kafka.transactional_id (str)
+        - PIPELINE_FLUSH_TIMEOUT_SECONDS -> pipeline.flush_timeout_seconds (float)
+        - PIPELINE_BACKOFF_BASE_SECONDS -> pipeline.backoff_base_seconds (float)
+        - PIPELINE_BACKOFF_MAX_SECONDS -> pipeline.backoff_max_seconds (float)
+        - PIPELINE_SHUTDOWN_TIMEOUT_SECONDS -> pipeline.shutdown_timeout_seconds (float)
+
+    Args:
+        env: Optional mapping of environment variables; defaults to ``os.environ``.
+
+    Returns:
+        Nested dictionary suitable for passing to ``from_dict``.
+
+    Raises:
+        TypeError: If an environment value cannot be coerced to the expected type.
+        ValueError: If an environment value fails validation.
+    """
+    if env is None:
+        env = os.environ
+
+    fdb_dict: dict[str, Any] = {}
+    cdc_dict: dict[str, Any] = {}
+    kafka_dict: dict[str, Any] = {}
+    pipeline_dict: dict[str, Any] = {}
+
+    if "FDB_API_VERSION" in env:
+        try:
+            fdb_dict["api_version"] = int(env["FDB_API_VERSION"])
+        except ValueError as exc:
+            raise TypeError("fdb.api_version must be an integer") from exc
+    if "FDB_CLUSTER_FILE" in env:
+        fdb_dict["cluster_file"] = env["FDB_CLUSTER_FILE"]
+
+    stream = env.get("FDB_CDC_STREAM_NAME") or env.get("CDC_STREAM_NAME")
+    if stream is not None:
+        cdc_dict["stream_name"] = stream
+    begin = env.get("FDB_CDC_BEGIN_KEY") or env.get("CDC_BEGIN_KEY")
+    if begin is not None:
+        cdc_dict["begin_key"] = begin
+    end = env.get("FDB_CDC_END_KEY") or env.get("CDC_END_KEY")
+    if end is not None:
+        cdc_dict["end_key"] = end
+    max_rec = env.get("FDB_CDC_MAX_RECORD_BYTES") or env.get("CDC_MAX_RECORD_BYTES")
+    if max_rec is not None:
+        try:
+            cdc_dict["max_record_bytes"] = int(max_rec)
+        except ValueError as exc:
+            raise TypeError("cdc.max_record_bytes must be an integer") from exc
+    cursor = env.get("FDB_CDC_CURSOR_FILE") or env.get("CDC_CURSOR_FILE")
+    if cursor is not None:
+        cdc_dict["cursor_file"] = cursor
+    idle_replies = env.get("FDB_CDC_IDLE_ACK_MAX_REPLIES") or env.get(
+        "CDC_IDLE_ACK_MAX_REPLIES"
+    )
+    if idle_replies is not None:
+        try:
+            cdc_dict["idle_ack_max_replies"] = int(idle_replies)
+        except ValueError as exc:
+            raise TypeError("cdc.idle_ack_max_replies must be an integer") from exc
+    idle_secs = env.get("FDB_CDC_IDLE_ACK_MAX_SECONDS") or env.get(
+        "CDC_IDLE_ACK_MAX_SECONDS"
+    )
+    if idle_secs is not None:
+        try:
+            cdc_dict["idle_ack_max_seconds"] = float(idle_secs)
+        except ValueError as exc:
+            raise TypeError("cdc.idle_ack_max_seconds must be numeric") from exc
+
+    if "KAFKA_BOOTSTRAP_SERVERS" in env:
+        kafka_dict["bootstrap_servers"] = env["KAFKA_BOOTSTRAP_SERVERS"]
+    if "KAFKA_TOPIC" in env:
+        kafka_dict["topic"] = env["KAFKA_TOPIC"]
+    if "KAFKA_TRANSACTIONAL_ID" in env:
+        kafka_dict["transactional_id"] = env["KAFKA_TRANSACTIONAL_ID"]
+
+    if "PIPELINE_FLUSH_TIMEOUT_SECONDS" in env:
+        try:
+            pipeline_dict["flush_timeout_seconds"] = float(
+                env["PIPELINE_FLUSH_TIMEOUT_SECONDS"]
+            )
+        except ValueError as exc:
+            raise ValueError(
+                "pipeline.flush_timeout_seconds must be a positive number"
+            ) from exc
+    if "PIPELINE_BACKOFF_BASE_SECONDS" in env:
+        try:
+            pipeline_dict["backoff_base_seconds"] = float(
+                env["PIPELINE_BACKOFF_BASE_SECONDS"]
+            )
+        except ValueError as exc:
+            raise ValueError(
+                "pipeline.backoff_base_seconds must be a positive number"
+            ) from exc
+    if "PIPELINE_BACKOFF_MAX_SECONDS" in env:
+        try:
+            pipeline_dict["backoff_max_seconds"] = float(
+                env["PIPELINE_BACKOFF_MAX_SECONDS"]
+            )
+        except ValueError as exc:
+            raise ValueError(
+                "pipeline.backoff_max_seconds must be a positive number"
+            ) from exc
+    if "PIPELINE_SHUTDOWN_TIMEOUT_SECONDS" in env:
+        try:
+            pipeline_dict["shutdown_timeout_seconds"] = float(
+                env["PIPELINE_SHUTDOWN_TIMEOUT_SECONDS"]
+            )
+        except ValueError as exc:
+            raise ValueError(
+                "pipeline.shutdown_timeout_seconds must be a positive number"
+            ) from exc
+
+    return {
+        "fdb": fdb_dict,
+        "cdc": cdc_dict,
+        "kafka": kafka_dict,
+        "pipeline": pipeline_dict,
+    }
+
+
+def from_env(env: Mapping[str, str] | None = None) -> BridgeConfig:
+    """Parse environment variables into a validated BridgeConfig instance.
+
+    Args:
+        env: Optional mapping of environment variables; defaults to ``os.environ``.
+
+    Returns:
+        Structured and validated BridgeConfig instance.
+
+    Raises:
+        TypeError: If an environment value cannot be coerced to the expected type.
+        ValueError: If an environment value fails validation.
+    """
+    return from_dict(env_to_dict(env))
