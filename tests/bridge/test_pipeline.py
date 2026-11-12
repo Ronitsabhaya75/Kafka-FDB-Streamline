@@ -29,6 +29,7 @@ def _make_pipeline(
     commit_retries: int = 3,
     commit_retry_delay_seconds: float = 0.0,
     checkpoint: Callable[[object], None] | None = None,
+    flush_timeout_seconds: float = 10.0,
 ) -> tuple[BridgePipeline, MagicMock, MagicMock, MagicMock, object]:
     listener = create_autospec(FDBMutationListener, instance=True)
     listener.poll_records.return_value = records or []
@@ -57,6 +58,7 @@ def _make_pipeline(
         ack_retry_delay_seconds=ack_retry_delay_seconds,
         commit_retries=commit_retries,
         commit_retry_delay_seconds=commit_retry_delay_seconds,
+        flush_timeout_seconds=flush_timeout_seconds,
     )
     assert isinstance(checkpoint_mock, MagicMock)
     return pipeline, producer, listener, checkpoint_mock, cursor
@@ -688,3 +690,13 @@ class TestFlushPendingIdle:
 
         checkpoint.assert_not_called()
         listener.acknowledge.assert_not_called()
+
+    def test_flush_pending_idle_bounds_producer_flush_timeout(self) -> None:
+        pipeline, producer, listener, checkpoint, _ = _make_pipeline(
+            flush_timeout_seconds=10.0
+        )
+        record = _make_record()
+        listener.flush_idle_progress.return_value = [record]
+
+        assert pipeline.flush_pending_idle(timeout=2.5) == 1
+        producer.flush_or_raise.assert_called_once_with(2.5)

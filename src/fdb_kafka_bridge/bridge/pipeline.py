@@ -220,13 +220,17 @@ class BridgePipeline:
         self._pending_count = len(records)
         return self._finish_delivery()
 
-    def flush_pending_idle(self) -> int:
+    def flush_pending_idle(self, timeout: float | None = None) -> int:
         """Flush pending idle watermark progress, produce, checkpoint, and acknowledge.
 
         If a Kafka transaction commit or delivery is already in progress, that
         delivery is completed first. Otherwise, if the listener has pending
         coalesced idle progress, it is serialized, produced to Kafka, persisted
         to the cursor store, and acknowledged in FoundationDB.
+
+        Args:
+            timeout: Optional maximum seconds allocated for producer flush.
+                When provided, bounds the flush timeout.
 
         Returns:
             The number of records published (1 if flushed, 0 if nothing was pending).
@@ -246,10 +250,15 @@ class BridgePipeline:
         if not records:
             return 0
 
+        flush_timeout = (
+            self._flush_timeout_seconds
+            if timeout is None
+            else min(timeout, self._flush_timeout_seconds)
+        )
         if self._producer.transactional:
             self._begin_and_produce(records)
         else:
-            self._produce_and_flush(records)
+            self._produce_and_flush(records, flush_timeout=flush_timeout)
         self._pending_count = len(records)
         return self._finish_delivery()
 
@@ -259,12 +268,17 @@ class BridgePipeline:
             self._producer.produce(self._topic, record, key=self._partition_key)
 
     def _produce_and_flush(
-        self, records: list[mutations_pb2.FDBMutationRecord]
+        self,
+        records: list[mutations_pb2.FDBMutationRecord],
+        flush_timeout: float | None = None,
     ) -> None:
         """Publish a non-transactional batch, or close the producer and raise."""
+        timeout = (
+            self._flush_timeout_seconds if flush_timeout is None else flush_timeout
+        )
         try:
             self._produce_all(records)
-            self._producer.flush_or_raise(self._flush_timeout_seconds)
+            self._producer.flush_or_raise(timeout)
         except (KafkaException, BufferError, TimeoutError, RuntimeError):
             self._producer.close()
             raise
@@ -1057,7 +1071,7 @@ class Bridge:
         if pipeline is None:
             return
         try:
-            flushed = pipeline.flush_pending_idle()
+            flushed = pipeline.flush_pending_idle(timeout=timeout)
             if flushed > 0 and self._counting_listener is not None:
                 records = self._counting_listener.pop_last_records()
                 self.metrics.records_published += len(records) if records else flushed

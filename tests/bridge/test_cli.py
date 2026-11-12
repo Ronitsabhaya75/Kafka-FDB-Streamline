@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 from fdb_kafka_bridge.bridge.cli import build_parser, main, parse_config
@@ -99,6 +100,40 @@ def test_main_runs_bridge_and_handles_clean_exit() -> None:
         assert exit_code == 0
         mock_bridge.start.assert_called_once()
         mock_bridge.run.assert_called_once()
+        mock_bridge.stop.assert_called_once()
+
+
+def test_main_signal_handler_requests_shutdown() -> None:
+    handlers: dict[int, Any] = {}
+
+    def _fake_signal(signum: int, handler: Any) -> None:
+        handlers[signum] = handler
+
+    with (
+        patch("fdb_kafka_bridge.bridge.cli.Bridge") as mock_bridge_cls,
+        patch("fdb_kafka_bridge.bridge.cli.signal.signal", side_effect=_fake_signal),
+    ):
+        mock_bridge = MagicMock()
+        mock_bridge_cls.return_value = mock_bridge
+        exit_code = main(["--cdc-stream-name", "main_stream"])
+        assert exit_code == 0
+        assert 2 in handlers  # SIGINT
+        # Invoke signal handler
+        handlers[2](2, None)
+        mock_bridge.request_shutdown.assert_called_once()
+
+
+def test_main_handles_runtime_crash_and_cleans_up() -> None:
+    with (
+        patch("fdb_kafka_bridge.bridge.cli.Bridge") as mock_bridge_cls,
+        patch("fdb_kafka_bridge.bridge.cli.signal.signal"),
+    ):
+        mock_bridge = MagicMock()
+        mock_bridge.run.side_effect = RuntimeError("Bridge fatal crash")
+        mock_bridge_cls.return_value = mock_bridge
+        exit_code = main(["--cdc-stream-name", "main_stream"])
+        assert exit_code == 1
+        mock_bridge.stop.assert_called_once()
 
 
 def test_main_handles_config_error() -> None:

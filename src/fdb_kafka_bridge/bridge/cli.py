@@ -211,7 +211,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     def _signal_handler(signum: int, _frame: Any) -> None:
         logger.info("Signal %d received, requesting graceful shutdown...", signum)
-        bridge.stop()
+        bridge.request_shutdown()
 
     signal.signal(signal.SIGINT, _signal_handler)
     signal.signal(signal.SIGTERM, _signal_handler)
@@ -222,6 +222,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     except Exception as exc:
         logger.critical("Fatal daemon crash: %s", exc, exc_info=True)
         return 1
+    finally:
+        bridge.stop()
     return 0
 
 
