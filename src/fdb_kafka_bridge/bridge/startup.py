@@ -1,4 +1,4 @@
-"""Read-only stream validation before registration or checkpoint allocation."""
+"""Stream validation and ownership claim before registration or checkpoint advance."""
 
 import logging
 from typing import Any
@@ -7,7 +7,6 @@ from fdb_kafka_bridge.cdc.checkpoint import (
     CheckpointCursor,
     CheckpointStore,
     KeyRange,
-    check_overlap,
 )
 from fdb_kafka_bridge.cdc.client import FDBClient
 
@@ -24,7 +23,7 @@ def resolve_startup(
     stream_name: bytes,
     key_range: KeyRange | None,
 ) -> tuple[CheckpointCursor | None, bool]:
-    """Validate stream identity and storage ranges before making any writes.
+    """Validate ranges, claim ownership, and validate the resume cursor.
 
     Args:
         client: Active native CDC client.
@@ -48,19 +47,19 @@ def resolve_startup(
             raise StartupError("Configured range differs from registered stream")
     elif key_range is not None:
         captured = [key_range]
-    check_overlap((b"\xfe", b"\xff"), captured)
     store.open(create=False, forbidden_ranges=captured)
+    store.claim(stream_name)
     cursor = store.load(stream_name)
     if cursor is not None:
         if stream is None:
             raise StartupError("Checkpoint exists but stream is missing")
         if cursor.stream_id != stream.stream_id:
             raise StartupError("Checkpoint belongs to another stream registration")
+        client.validate_resume_cursor(stream_name, cursor)
     elif stream is None and key_range is None:
         raise StartupError("Stream is missing; provide --subspace-prefix to register")
     elif stream is not None:
         logger.warning("No checkpoint for %r; using cluster min_version", stream_name)
-    store.open(forbidden_ranges=captured)
     return cursor, stream is None
 
 
@@ -73,4 +72,7 @@ def stream_ranges(stream: Any) -> list[KeyRange]:
     Returns:
         List of half-open ranges.
     """
-    return [(stream.begin_key, stream.end_key)]
+    try:
+        return [(stream.begin_key, stream.end_key)]
+    except ValueError as exc:
+        raise StartupError("Bridge requires a single-range CDC stream") from exc

@@ -42,14 +42,32 @@ def test_resolution(
         assert all(c.kwargs.get("create") is False for c in store.open.call_args_list)
     else:
         assert resolve_startup(client, store, b"s", configured) == (cursor, register)
-        assert store.open.call_count == 2
+        assert store.open.call_count == 1
+        operations = [call[0] for call in store.method_calls]
+        assert operations.index("claim") < operations.index("load")
     client.register_cdc_stream.assert_not_called()
     store.save.assert_not_called()
 
 
-def test_directory_metadata_overlap_before_store_access() -> None:
+def test_overlap_refusal_precedes_claim() -> None:
     client, store = MagicMock(), MagicMock()
     client.list_cdc_streams.return_value = []
+    store.open.side_effect = CheckpointOverlapError("overlap")
     with pytest.raises(CheckpointOverlapError):
         resolve_startup(client, store, b"s", (b"a", b"\xff"))
-    store.open.assert_not_called()
+    store.claim.assert_not_called()
+
+
+def test_multi_range_stream_is_a_deterministic_refusal() -> None:
+    class MultiRange:
+        name = b"s"
+
+        @property
+        def begin_key(self) -> bytes:
+            raise ValueError("Use ranges")
+
+    client, store = MagicMock(), MagicMock()
+    client.list_cdc_streams.return_value = [MultiRange()]
+    with pytest.raises(StartupError, match="single-range"):
+        resolve_startup(client, store, b"s", None)
+    store.claim.assert_not_called()

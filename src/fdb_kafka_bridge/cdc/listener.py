@@ -1,13 +1,23 @@
 """FoundationDB CDC listener with explicit delivery and acknowledgement."""
 
+import math
+import threading
 import time
+from collections.abc import Callable
 from typing import Any, Final, Self
 
-from fdb_kafka_bridge.cdc.client import FDBClient, _raise_consume_failure, _to_bytes
+from fdb_kafka_bridge.cdc.client import (
+    FDB_CLIENT_INVALID_OPERATION,
+    FDBClient,
+    _native_error_code,
+    _raise_consume_failure,
+    _to_bytes,
+)
 from fdb_kafka_bridge.cdc.errors import (
     CDCConsumerClosedError,
     CDCError,
     CDCInvalidCursorError,
+    CDCRetryableError,
 )
 from fdb_kafka_bridge.serialization import (
     serialize_version_end,
@@ -81,6 +91,9 @@ class FDBMutationListener:
         max_record_bytes: int = DEFAULT_MAX_RECORD_BYTES,
         resume_timeout_seconds: float = DEFAULT_RESUME_TIMEOUT_SECONDS,
         resume_poll_interval_seconds: float = DEFAULT_RESUME_POLL_INTERVAL_SECONDS,
+        ack_timeout_seconds: float = 5.0,
+        proxy_consume_poll_timeout_seconds: float = 5.0,
+        before_ack: Callable[[], None] | None = None,
     ) -> None:
         """Initialize a CDC listener.
 
@@ -97,6 +110,10 @@ class FDBMutationListener:
             resume_timeout_seconds: Maximum wait for the cluster read version to
                 reach a resumed cursor.
             resume_poll_interval_seconds: Delay between resume read-version checks.
+            ack_timeout_seconds: Maximum wait for each acknowledgement.
+            proxy_consume_poll_timeout_seconds: Proxy's consume hold timeout; bounds
+                error 2000 retries on the first consume after resume.
+            before_ack: Optional ownership check before restoring a resumed ack.
 
         Raises:
             TypeError: If a numeric configuration value has an invalid type.
@@ -120,6 +137,17 @@ class FDBMutationListener:
             raise TypeError("resume_poll_interval_seconds must be numeric")
         if resume_poll_interval_seconds <= 0:
             raise ValueError("resume_poll_interval_seconds must be positive")
+        for name, value in (
+            ("ack_timeout_seconds", ack_timeout_seconds),
+            ("proxy_consume_poll_timeout_seconds", proxy_consume_poll_timeout_seconds),
+        ):
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+                or value <= 0
+            ):
+                raise ValueError(f"{name} must be finite and positive")
 
         self.client = client
         self.raw_stream_name = _to_bytes(stream_name)
@@ -135,6 +163,16 @@ class FDBMutationListener:
         self._is_closed = False
         self._awaiting_ack = False
         self._delivery_failed = False
+        self.ack_timeout_seconds = float(ack_timeout_seconds)
+        self.proxy_consume_poll_timeout_seconds = float(
+            proxy_consume_poll_timeout_seconds
+        )
+        self._operation_lock = threading.RLock()
+        self._pending_future: Any | None = None
+        self._pending_action: str | None = None
+        self._stopping = threading.Event()
+        self._restart_poll = cursor is not None
+        self._before_ack = before_ack
 
     def start(self) -> None:
         """Register when requested, then create or safely resume the consumer."""
@@ -163,6 +201,7 @@ class FDBMutationListener:
 
     def _reconcile_resumed_consumer(self) -> None:
         """Wait for the cursor version to be readable, then restore its ack."""
+        self.client.validate_resume_cursor(self.raw_stream_name, self.initial_cursor)
         target_version = self.initial_cursor.last_consumed_version
         deadline = time.monotonic() + self.resume_timeout_seconds
         while self.client.get_read_version() < target_version:
@@ -173,10 +212,43 @@ class FDBMutationListener:
                     f"resumed cursor version {target_version}"
                 )
             time.sleep(min(self.resume_poll_interval_seconds, remaining))
+        if self._before_ack is not None:
+            self._before_ack()
         try:
-            self.consumer.acknowledge().wait()
+            self._wait_operation("acknowledge", self.ack_timeout_seconds)
+        except TimeoutError as exc:
+            raise CDCRetryableError(
+                "Timed out restoring resumed CDC acknowledgement"
+            ) from exc
         except Exception as exc:
             _raise_consume_failure(exc, "restore resumed CDC position")
+
+    def _wait_operation(self, action: str, timeout: float | None = None) -> Any:
+        with self._operation_lock:
+            if self._is_closed or self._stopping.is_set():
+                raise CDCConsumerClosedError("CDC consumer is stopping")
+            future = getattr(self.consumer, action)()
+            self._pending_future = future
+            self._pending_action = action
+        try:
+            if timeout is not None and not future.is_ready():
+                ready = threading.Event()
+                future.on_ready(lambda _: ready.set())
+                if not ready.wait(timeout):
+                    future.cancel()
+                    raise TimeoutError(f"CDC {action} timed out after {timeout}s")
+            return future.wait()
+        finally:
+            with self._operation_lock:
+                self._pending_future = None
+                self._pending_action = None
+
+    def cancel_pending(self) -> None:
+        """Prevent new operations and cancel a parked consume without acking it."""
+        with self._operation_lock:
+            self._stopping.set()
+            if self._pending_future is not None and self._pending_action == "consume":
+                self._pending_future.cancel()
 
     @property
     def delivery_failed(self) -> bool:
@@ -209,12 +281,25 @@ class FDBMutationListener:
                 "The previous CDC reply must be durably processed and acknowledged "
                 "before polling again."
             )
-        try:
-            return self.consumer.consume().wait()
-        except Exception as exc:
-            if self._is_closed:
-                raise CDCConsumerClosedError("CDC consumer is closed.") from exc
-            _raise_consume_failure(exc, "consume CDC reply")
+        deadline = time.monotonic() + self.proxy_consume_poll_timeout_seconds
+        while True:
+            try:
+                batch = self._wait_operation("consume")
+                self._restart_poll = False
+                return batch
+            except Exception as exc:
+                if self._is_closed or self._stopping.is_set():
+                    raise CDCConsumerClosedError("CDC consumer is closed.") from exc
+                remaining = deadline - time.monotonic()
+                if (
+                    self._restart_poll
+                    and _native_error_code(exc) == FDB_CLIENT_INVALID_OPERATION
+                    and remaining > 0
+                ):
+                    self._stopping.wait(min(0.05, remaining))
+                    continue
+                self._restart_poll = False
+                _raise_consume_failure(exc, "consume CDC reply")
 
     def poll_records(
         self, bridge_timestamp_ns: int | None = None
@@ -291,7 +376,7 @@ class FDBMutationListener:
 
         Raises:
             CDCError: If no reply awaits acknowledgement or serialization failed.
-            CDCRetryableError: If the native ack failed with ``server_overloaded``.
+            CDCRetryableError: If the ack timed out or returned ``server_overloaded``.
             CDCTerminalError: If the native ack failed with a terminal code.
             CDCConsumerClosedError: If the listener is closed.
         """
@@ -304,7 +389,9 @@ class FDBMutationListener:
         if not self._awaiting_ack:
             raise CDCError("No delivered CDC reply is awaiting acknowledgement.")
         try:
-            self.consumer.acknowledge().wait()
+            self._wait_operation("acknowledge", self.ack_timeout_seconds)
+        except TimeoutError as exc:
+            raise CDCRetryableError("Timed out acknowledging CDC position") from exc
         except Exception as exc:
             if self._is_closed:
                 raise CDCConsumerClosedError("CDC consumer is closed.") from exc
@@ -316,10 +403,17 @@ class FDBMutationListener:
         return self.consumer.get_position()
 
     def close(self) -> None:
-        """Close the consumer without acknowledging or removing the stream."""
-        self._is_closed = True
-        consumer = self._consumer
-        self._consumer = None
+        """Cancel pending work and close without acknowledging or removing the stream.
+
+        Closing the native handle alone does not cancel its outstanding future.
+        """
+        with self._operation_lock:
+            self._is_closed = True
+            self._stopping.set()
+            if self._pending_future is not None:
+                self._pending_future.cancel()
+            consumer = self._consumer
+            self._consumer = None
         if consumer is not None:
             consumer.close()
 

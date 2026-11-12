@@ -5,6 +5,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from importlib import import_module
 from typing import Any, TypeVar
+from uuid import uuid4
 
 from fdb_kafka_bridge.cdc.client import FDBClient
 from fdb_kafka_bridge.cdc.listener import strinc
@@ -19,6 +20,10 @@ class CheckpointError(Exception):
 
 class CheckpointWriteError(CheckpointError):
     """A checkpoint operation exhausted its transaction retry budget."""
+
+
+class CheckpointFencedError(CheckpointError):
+    """Another process claimed ownership of the stream."""
 
 
 class CheckpointRegressionError(CheckpointError):
@@ -38,7 +43,7 @@ class CheckpointFormatError(CheckpointError):
 
 
 class CheckpointOverlapError(CheckpointError):
-    """Checkpoint data or directory metadata overlaps a captured range."""
+    """Checkpoint data overlaps a captured range."""
 
 
 @dataclass(frozen=True)
@@ -122,7 +127,7 @@ def check_overlap(key_range: KeyRange, captured: list[KeyRange]) -> None:
     if any(
         begin < other_end and other_begin < end for other_begin, other_end in captured
     ):
-        raise CheckpointOverlapError("Checkpoint or directory metadata overlaps CDC")
+        raise CheckpointOverlapError("Checkpoint subspace overlaps CDC")
 
 
 class CheckpointStore:
@@ -142,7 +147,7 @@ class CheckpointStore:
         Args:
             client: Active FDB client.
             sink: Kafka cluster and topic that received the checkpointed data.
-            path: Directory-layer path for checkpoint keys.
+            path: Tuple prefix for a stable plain subspace, without allocation.
             timeout_s: Transaction timeout, including retries.
             retry_limit: Maximum transaction retries.
 
@@ -164,9 +169,25 @@ class CheckpointStore:
         self.path = path
         self.timeout_s = timeout_s
         self.retry_limit = retry_limit
-        self._directory: Any = None
+        self._subspace: Any = None
+        self._owners: dict[bytes, tuple[int, bytes]] = {}
 
-    def _run(self, operation: Callable[[Any], T], *, write: bool = False) -> T:
+    def run_transaction(
+        self, operation: Callable[[Any], T], *, write: bool = False
+    ) -> T:
+        """Run an operation with transaction-local timeout and retry limits.
+
+        Args:
+            operation: Retry-safe transaction body.
+            write: Whether to commit the transaction before returning.
+
+        Returns:
+            The successful operation's result.
+
+        Raises:
+            CheckpointWriteError: If transient failures exhaust the retry budget.
+            CheckpointError: If FDB reports a non-retryable failure or timeout.
+        """
         fdb = import_module("fdb")
         tr = self.client.db.create_transaction()
         tr.options.set_timeout(max(1, int(self.timeout_s * 1000)))
@@ -180,6 +201,10 @@ class CheckpointStore:
                         tr.commit().wait()
                     return result
                 except fdb.FDBError as exc:
+                    if not fdb.predicates.is_retryable(exc):
+                        raise CheckpointError(
+                            f"Permanent checkpoint transaction failure ({exc.code})"
+                        ) from exc
                     if attempt == self.retry_limit:
                         raise CheckpointWriteError(
                             "Checkpoint retries exhausted"
@@ -187,6 +212,10 @@ class CheckpointStore:
                     attempt += 1
                     tr.on_error(exc.code).wait()
         except fdb.FDBError as exc:
+            if not fdb.predicates.is_retryable(exc):
+                raise CheckpointError(
+                    f"Permanent checkpoint transaction failure ({exc.code})"
+                ) from exc
             raise CheckpointWriteError("Checkpoint transaction failed") from exc
         finally:
             tr.cancel()
@@ -194,44 +223,101 @@ class CheckpointStore:
     def open(
         self, *, create: bool = True, forbidden_ranges: list[KeyRange] | None = None
     ) -> None:
-        """Resolve or allocate the directory, checking overlap before commit.
+        """Open the stable tuple subspace without reading or writing FDB.
 
         Args:
-            create: False performs a read-only lookup of an existing directory.
+            create: Retained for API compatibility; plain subspaces need no allocation.
             forbidden_ranges: Captured ranges that must exclude store writes.
 
         Raises:
             CheckpointOverlapError: If store writes could enter CDC.
-            CheckpointWriteError: If the transaction fails.
         """
-        directory = import_module("fdb").directory
         captured = forbidden_ranges or []
-        check_overlap((b"\xfe", b"\xff"), captured)
+        subspace = import_module("fdb").Subspace(self.path)
+        prefix = subspace.key()
+        check_overlap((prefix, strinc(prefix)), captured)
+        self._subspace = subspace
 
-        def resolve(tr: Any) -> Any:
-            if not create and not directory.exists(tr, self.path):
-                return None
-            subspace = (
-                directory.create_or_open(tr, self.path)
-                if create
-                else directory.open(tr, self.path)
-            )
-            prefix = subspace.key()
-            check_overlap((prefix, strinc(prefix)), captured)
-            return subspace
-
-        self._directory = self._run(resolve, write=create)
+    @property
+    def subspace(self) -> Any:
+        """Return the open subspace shared by checkpoint and ownership keys."""
+        if self._subspace is None:
+            raise CheckpointError("Checkpoint subspace is not open")
+        return self._subspace
 
     def key_range(self) -> KeyRange:
-        """Return the allocated checkpoint directory range.
+        """Return the complete checkpoint prefix range.
 
         Raises:
-            CheckpointError: If the directory has not been allocated.
+            CheckpointError: If the subspace has not been opened.
         """
-        if self._directory is None:
-            raise CheckpointError("Checkpoint directory is not open")
-        prefix = self._directory.key()
+        prefix = self.subspace.key()
         return prefix, strinc(prefix)
+
+    def claim(self, stream_name: bytes) -> None:
+        """Claim a stream once; subsequent calls verify the existing ownership.
+
+        Args:
+            stream_name: Raw stream name to own before loading its checkpoint.
+
+        Raises:
+            CheckpointFencedError: If an existing claim has been superseded.
+            CheckpointError: If ownership data is malformed or the claim fails.
+        """
+        key = self.subspace.pack((stream_name, "owner"))
+        token = uuid4().bytes
+
+        def claim(tr: Any) -> tuple[int, bytes]:
+            if stream_name in self._owners:
+                self._check_owner(tr, stream_name)
+                return self._owners[stream_name]
+            self._decode(tr.get(self.subspace.pack((stream_name,))).value)
+            value = tr.get(key).value
+            epoch, owner = self._decode_owner(value) if value is not None else (0, b"")
+            # A commit-unknown retry must not increment its own successful claim.
+            if owner == token:
+                return epoch, token
+            claimed = (epoch + 1, token)
+            tr[key] = import_module("fdb.tuple").pack(claimed)
+            return claimed
+
+        self._owners[stream_name] = self.run_transaction(claim, write=True)
+
+    def verify_owner(self, stream_name: bytes) -> None:
+        """Refuse acknowledgement or rebuild after another process takes ownership.
+
+        Args:
+            stream_name: Raw name of a previously claimed stream.
+
+        Raises:
+            CheckpointFencedError: If ownership is absent or has changed.
+        """
+        self.run_transaction(lambda tr: self._check_owner(tr, stream_name))
+
+    def _decode_owner(self, value: bytes) -> tuple[int, bytes]:
+        try:
+            fields = import_module("fdb.tuple").unpack(value)
+            if (
+                len(fields) != 2
+                or type(fields[0]) is not int
+                or fields[0] < 1
+                or not isinstance(fields[1], bytes)
+                or len(fields[1]) != 16
+            ):
+                raise ValueError("invalid owner")
+            return fields[0], fields[1]
+        except (ValueError, TypeError, IndexError) as exc:
+            raise CheckpointFormatError("Invalid checkpoint owner") from exc
+
+    def _check_owner(self, tr: Any, stream_name: bytes) -> None:
+        expected = self._owners.get(stream_name)
+        if expected is None:
+            raise CheckpointFencedError("Claim stream ownership before saving")
+        value = tr.get(self.subspace.pack((stream_name, "owner"))).value
+        if value is None or self._decode_owner(value) != expected:
+            raise CheckpointFencedError(
+                "Stream ownership changed; stopping stale owner"
+            )
 
     def _decode(self, value: bytes | None) -> CheckpointCursor | None:
         if value is None:
@@ -258,10 +344,14 @@ class CheckpointStore:
         Returns:
             Stored cursor, or None when no checkpoint exists.
         """
-        if self._directory is None:
-            return None
-        key = self._directory.pack((stream_name,))
-        return self._run(lambda tr: self._decode(tr.get(key).value))
+        key = self.subspace.pack((stream_name,))
+
+        def load(tr: Any) -> CheckpointCursor | None:
+            if stream_name in self._owners:
+                self._check_owner(tr, stream_name)
+            return self._decode(tr.get(key).value)
+
+        return self.run_transaction(load)
 
     def save(self, stream_name: bytes, cursor: Any) -> None:
         """Save a monotonic cursor after all its Kafka records are durable.
@@ -275,7 +365,7 @@ class CheckpointStore:
         """
         self.key_range()
         new = CheckpointCursor(cursor.stream_id, cursor.last_consumed_version)
-        key = self._directory.pack((stream_name,))
+        key = self.subspace.pack((stream_name,))
         value = import_module("fdb.tuple").pack(
             (
                 1,
@@ -288,10 +378,11 @@ class CheckpointStore:
 
         def save(tr: Any) -> None:
             stored = self._decode(tr.get(key).value)
+            self._check_owner(tr, stream_name)
             if validate_progress(stored, new):
                 tr[key] = value
 
-        self._run(save, write=True)
+        self.run_transaction(save, write=True)
 
     def delete(self, stream_name: bytes) -> None:
         """Delete one checkpoint for explicit operator recovery.
@@ -300,9 +391,9 @@ class CheckpointStore:
             stream_name: Raw stream name.
         """
         self.key_range()
-        key = self._directory.pack((stream_name,))
+        key = self.subspace.pack((stream_name,))
 
         def remove(tr: Any) -> None:
             del tr[key]
 
-        self._run(remove, write=True)
+        self.run_transaction(remove, write=True)

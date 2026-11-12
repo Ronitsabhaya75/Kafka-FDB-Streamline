@@ -27,6 +27,8 @@ class CDCConfig:
     checkpoint_path: tuple[str, ...] | None = None
     checkpoint_timeout_seconds: float = 5.0
     checkpoint_retry_limit: int = 10
+    ack_timeout_seconds: float = 5.0
+    proxy_consume_poll_timeout_seconds: float = 5.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -185,6 +187,18 @@ def from_dict(data: dict[str, Any]) -> BridgeConfig:
     if type(checkpoint_retries) is not int or checkpoint_retries < 0:
         raise ValueError("cdc.checkpoint_retry_limit must be a nonnegative integer")
 
+    cdc_timeouts = {}
+    for name in ("ack_timeout_seconds", "proxy_consume_poll_timeout_seconds"):
+        value = cdc_dict.get(name, 5.0)
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or value <= 0
+        ):
+            raise ValueError(f"cdc.{name} must be finite and positive")
+        cdc_timeouts[name] = float(value)
+
     # Kafka validation
     bootstrap_servers = kafka_dict.get("bootstrap_servers", "localhost:9092")
     if not isinstance(bootstrap_servers, str) or not bootstrap_servers.strip():
@@ -252,6 +266,7 @@ def from_dict(data: dict[str, Any]) -> BridgeConfig:
             checkpoint_path=checkpoint_path,
             checkpoint_timeout_seconds=float(checkpoint_timeout),
             checkpoint_retry_limit=checkpoint_retries,
+            **cdc_timeouts,
         ),
         kafka=KafkaConfig(
             bootstrap_servers=bootstrap_servers,

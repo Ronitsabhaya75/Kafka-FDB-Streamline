@@ -6,6 +6,7 @@ import os
 import re
 import signal
 import threading
+import time
 from types import FrameType
 from typing import Any
 
@@ -13,12 +14,10 @@ from fdb_kafka_bridge.bridge.config import BridgeConfig, from_dict
 from fdb_kafka_bridge.bridge.pipeline import Bridge
 from fdb_kafka_bridge.bridge.startup import StartupError
 from fdb_kafka_bridge.cdc.checkpoint import (
-    CheckpointFormatError,
-    CheckpointOverlapError,
-    CheckpointSinkMismatchError,
-    CheckpointStreamMismatchError,
+    CheckpointError,
+    CheckpointWriteError,
 )
-from fdb_kafka_bridge.cdc.errors import CDCInvalidCursorError
+from fdb_kafka_bridge.cdc.errors import CDCInvalidCursorError, CDCTerminalError
 from fdb_kafka_bridge.cdc.listener import subspace_to_key_range
 
 logger = logging.getLogger(__name__)
@@ -52,7 +51,9 @@ def load_config(argv: list[str] | None = None) -> BridgeConfig:
         "checkpoint-timeout-s": ("STREAMLINE_CHECKPOINT_TIMEOUT_S", "5", float),
         "checkpoint-retry-limit": ("STREAMLINE_CHECKPOINT_RETRY_LIMIT", "10", int),
         "flush-timeout-s": ("STREAMLINE_FLUSH_TIMEOUT_S", "30", float),
-        "shutdown-timeout-s": ("STREAMLINE_SHUTDOWN_TIMEOUT_S", "30", float),
+        "shutdown-timeout-s": ("STREAMLINE_SHUTDOWN_TIMEOUT_S", "20", float),
+        "ack-timeout-s": ("STREAMLINE_ACK_TIMEOUT_S", "5", float),
+        "proxy-consume-poll-timeout-s": ("CDC_PROXY_CONSUME_POLL_TIMEOUT", "5", float),
         "max-record-bytes": ("STREAMLINE_MAX_RECORD_BYTES", "900000", int),
     }
     for flag, (env, default, converter) in options.items():
@@ -81,6 +82,8 @@ def load_config(argv: list[str] | None = None) -> BridgeConfig:
             "checkpoint_path": args.checkpoint_path.split("/"),
             "checkpoint_timeout_seconds": args.checkpoint_timeout_s,
             "checkpoint_retry_limit": args.checkpoint_retry_limit,
+            "ack_timeout_seconds": args.ack_timeout_s,
+            "proxy_consume_poll_timeout_seconds": args.proxy_consume_poll_timeout_s,
         }
         if args.subspace_prefix is not None:
             prefix = args.subspace_prefix
@@ -123,14 +126,22 @@ def run_daemon(bridge: Bridge) -> None:
     stop_requested = threading.Event()
     handlers: dict[signal.Signals, Any] = {}
     worker: threading.Thread | None = None
+    shutdown_deadline: float | None = None
 
     def request_stop(signum: int, frame: FrameType | None) -> None:
+        nonlocal shutdown_deadline
+        if shutdown_deadline is None:
+            shutdown_deadline = (
+                time.monotonic() + bridge.config.pipeline.shutdown_timeout_seconds
+            )
         stop_requested.set()
         bridge.request_shutdown()
 
     def run() -> None:
         try:
-            bridge.run()
+            bridge.start()
+            if not stop_requested.is_set():
+                bridge.run()
         except BaseException as exc:
             failures.append(exc)
 
@@ -138,17 +149,20 @@ def run_daemon(bridge: Bridge) -> None:
         for sig in (signal.SIGINT, signal.SIGTERM):
             handlers[sig] = signal.getsignal(sig)
             signal.signal(sig, request_stop)
-        bridge.start()
         worker = threading.Thread(target=run, name="cdc-kafka-bridge", daemon=True)
         worker.start()
         while worker.is_alive() and not stop_requested.wait(0.1):
             worker.join(0.1)
     finally:
+        if shutdown_deadline is None:
+            shutdown_deadline = (
+                time.monotonic() + bridge.config.pipeline.shutdown_timeout_seconds
+            )
         try:
-            bridge.stop()
+            bridge.stop(deadline=shutdown_deadline)
         finally:
             if worker is not None:
-                worker.join(bridge.config.pipeline.shutdown_timeout_seconds)
+                worker.join(max(0, shutdown_deadline - time.monotonic()))
             for sig, handler in handlers.items():
                 signal.signal(sig, handler)
     if failures:
@@ -164,7 +178,7 @@ def main(argv: list[str] | None = None) -> int:
         argv: Command-line arguments without program name.
 
     Returns:
-        Zero on clean stop, one for runtime failures, three for unsafe startup.
+        Zero on clean stop, one for runtime failures, three for permanent refusals.
         Invalid configuration raises SystemExit with code two.
     """
     config = load_config(argv)
@@ -175,14 +189,16 @@ def main(argv: list[str] | None = None) -> int:
         run_daemon(Bridge(config))
     except (
         StartupError,
-        CheckpointFormatError,
-        CheckpointOverlapError,
-        CheckpointSinkMismatchError,
-        CheckpointStreamMismatchError,
         CDCInvalidCursorError,
     ):
         logger.exception("Unsafe startup or checkpoint; operator action required")
         return 3
+    except CheckpointError as exc:
+        logger.exception("Checkpoint failure; operator action required")
+        return 1 if isinstance(exc, CheckpointWriteError) else 3
+    except CDCTerminalError as exc:
+        logger.exception("Terminal CDC refusal")
+        return 3 if exc.code in (1007, 2000) else 1
     except Exception:
         logger.exception("Bridge failed")
         return 1

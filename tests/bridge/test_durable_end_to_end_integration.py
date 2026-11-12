@@ -6,7 +6,6 @@ import sys
 import time
 import uuid
 from collections.abc import Callable, Iterator
-from importlib import import_module
 from typing import Any
 
 import pytest
@@ -72,7 +71,8 @@ def live() -> Iterator[tuple[FDBClient, CheckpointStore, str, bytes, str, Consum
         consumer.close()
         client.remove_cdc_stream(name)
         del client.db[prefix : strinc(prefix)]
-        import_module("fdb").directory.remove_if_exists(client.db, store.path)
+        begin, end = store.key_range()
+        del client.db[begin:end]
         client.close()
         admin.delete_topics([topic])[topic].result(30)
 
@@ -80,6 +80,7 @@ def live() -> Iterator[tuple[FDBClient, CheckpointStore, str, bytes, str, Consum
 def _pipeline(
     listener: FDBMutationListener, producer: Any, store: CheckpointStore, topic: str
 ) -> BridgePipeline:
+    store.claim(listener.raw_stream_name)
     return BridgePipeline(
         listener,
         producer,

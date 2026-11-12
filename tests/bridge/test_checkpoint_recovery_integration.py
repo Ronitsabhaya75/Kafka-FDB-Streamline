@@ -3,7 +3,6 @@
 import os
 import uuid
 from collections.abc import Iterator
-from importlib import import_module
 from typing import Any
 
 import pytest
@@ -82,12 +81,14 @@ def resources() -> Iterator[tuple[FDBClient, CheckpointStore, bytes, bytes]]:
     )
     client.register_cdc_stream(name, prefix, strinc(prefix))
     store.open(forbidden_ranges=[(prefix, strinc(prefix))])
+    store.claim(name)
     try:
         yield client, store, name, prefix
     finally:
         client.remove_cdc_stream(name)
         del client.db[prefix : strinc(prefix)]
-        import_module("fdb").directory.remove_if_exists(client.db, store.path)
+        begin, end = store.key_range()
+        del client.db[begin:end]
         client.close()
 
 
@@ -212,7 +213,7 @@ def test_stream_reregistration_is_rejected(
 def test_fresh_consumer_skips_acked_data_and_foreign_ack_invalidates_old_cursor(
     resources: tuple[FDBClient, CheckpointStore, bytes, bytes],
 ) -> None:
-    from fdb_kafka_bridge.cdc.errors import CDCTerminalError
+    from fdb_kafka_bridge.cdc.errors import CDCInvalidCursorError
 
     client, store, name, prefix = resources
     sink = Sink()
@@ -236,9 +237,112 @@ def test_fresh_consumer_skips_acked_data_and_foreign_ack_invalidates_old_cursor(
     )
     stale = FDBMutationListener(client, name, cursor=saved)
     try:
-        with pytest.raises(CDCTerminalError) as error:
+        with pytest.raises(CDCInvalidCursorError):
             stale.start()
             stale.poll_records()
-        assert error.value.code == 1007
     finally:
         stale.close()
+
+
+@pytest.mark.parametrize("delta", [0, 1, 2])
+def test_live_retention_boundary(
+    resources: tuple[FDBClient, CheckpointStore, bytes, bytes], delta: int
+) -> None:
+    from fdb_kafka_bridge.cdc.checkpoint import CheckpointCursor
+    from fdb_kafka_bridge.cdc.errors import CDCInvalidCursorError
+
+    client, store, name, prefix = resources
+    stream = next(s for s in client.list_cdc_streams() if s.name == name)
+    cursor = CheckpointCursor(stream.stream_id, stream.min_version - delta)
+    if delta == 2:
+        with pytest.raises(CDCInvalidCursorError, match="retained history"):
+            client.validate_resume_cursor(name, cursor)
+        native = client.resume_cdc_consumer(cursor)
+        try:
+            with pytest.raises(Exception) as error:
+                native.acknowledge().wait()
+                native.consume().wait()
+            assert error.value.code == 1007
+        finally:
+            native.close()
+    else:
+        with FDBMutationListener(client, name, cursor=cursor) as listener:
+            client.db[prefix + b"boundary"] = b"ok"
+            records = listener.poll_records()
+            assert records
+
+
+def test_live_parked_consume_is_cancelled_on_stop(
+    resources: tuple[FDBClient, CheckpointStore, bytes, bytes],
+) -> None:
+    import threading
+    import time
+
+    from fdb_kafka_bridge.cdc.errors import CDCConsumerClosedError
+
+    client, store, name, prefix = resources
+    listener = FDBMutationListener(client, name)
+    listener.start()
+    failures = []
+
+    def consume() -> None:
+        try:
+            while True:
+                records = listener.poll_records()
+                if records:
+                    listener.acknowledge()
+        except CDCConsumerClosedError as exc:
+            failures.append(exc)
+
+    worker = threading.Thread(target=consume, daemon=True)
+    worker.start()
+    try:
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            with listener._operation_lock:
+                future = listener._pending_future
+                parked = (
+                    listener._pending_action == "consume"
+                    and future is not None
+                    and not future.is_ready()
+                )
+            if parked:
+                break
+            time.sleep(0.001)
+        else:
+            pytest.fail("Consumer did not park")
+        began = time.monotonic()
+        listener.cancel_pending()
+        worker.join(1)
+        assert not worker.is_alive()
+        assert time.monotonic() - began < 1
+        assert failures
+    finally:
+        listener.close()
+        worker.join(1)
+
+
+def test_ack_timeout_cancels_native_future(
+    resources: tuple[FDBClient, CheckpointStore, bytes, bytes],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from fdb_kafka_bridge.cdc.errors import CDCRetryableError
+
+    client, store, name, prefix = resources
+    listener = FDBMutationListener(client, name, ack_timeout_seconds=0.01)
+    listener.start()
+    tr = client.db.create_transaction()
+    pending = tr.watch(prefix + b"never-changes")
+    tr.commit().wait()
+    try:
+        listener._awaiting_ack = True
+        monkeypatch.setattr(listener.consumer, "acknowledge", lambda: pending)
+        with pytest.raises(CDCRetryableError, match="Timed out"):
+            listener.acknowledge()
+        with pytest.raises(Exception) as error:
+            pending.wait()
+        assert error.value.code == 1101
+        assert listener.awaiting_ack
+    finally:
+        pending.cancel()
+        listener.close()

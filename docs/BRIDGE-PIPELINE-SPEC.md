@@ -80,7 +80,7 @@ If the checkpoint or the acknowledgement budget fails after delivery, the next `
 
 Parsed via `from_dict(data)`:
 - `fdb`: `api_version` (default 800), `cluster_file` (optional path).
-- `cdc`: `stream_name` (required; empty or whitespace-only is rejected), `begin_key` / `end_key` (paired hex strings or bytes, `begin_key < end_key`), `max_record_bytes`, `cursor_file` (optional path).
+- `cdc`: `stream_name` (required; empty or whitespace-only is rejected), `begin_key` / `end_key` (paired hex strings or bytes, `begin_key < end_key`), `max_record_bytes`, `cursor_file` (optional path), `ack_timeout_seconds` (default 5), `proxy_consume_poll_timeout_seconds` (default 5; match the server knob).
 - `kafka`: `bootstrap_servers`, `topic`, `transactional_id` (optional non-empty string; setting it enables transactional mode).
 - `pipeline`: `flush_timeout_seconds`, `backoff_base_seconds`, `backoff_max_seconds`, `shutdown_timeout_seconds`.
 
@@ -108,7 +108,7 @@ On start and on every rebuild, if `cursor_file` exists it is parsed strictly. In
 
 In `Bridge.run()`:
 - **Terminal errors** (`CDCTerminalError`, fatal Kafka errors via `is_fatal_kafka_error`): sets shutdown, logs with `exc_info=True`, and re-raises.
-- **Permanent errors** (a `ValueError` that is not a `SerializationError`, e.g. invalid checkpoint coordinates or a corrupt or foreign cursor file on rebuild): sets shutdown and re-raises rather than retrying forever.
+- **Permanent errors** (a `ValueError` that is not a `SerializationError`, `CDCInvalidCursorError`, or a `CheckpointError` other than `CheckpointWriteError`, including failures during rebuild): sets shutdown and re-raises rather than retrying forever.
 - **Retry in place** (e.g. `CDCRetryableError` from poll, checkpoint or ack failure, retriable-commit exhaustion): backs off and calls `step()` again on the same pipeline.
 - **Rebuild** when the failure left state only a resume from checkpoint clears: producer `closed` or `fatal`, listener `delivery_failed` (`SerializationError`/`RecordTooLargeError`), or listener `awaiting_ack` after a non-fatal transactional abort (no `commit_outstanding`). `_rebuild_pipeline()`:
   1. Does nothing while `commit_outstanding` is set (rule 7); the next `step()` retries the commit.
@@ -123,10 +123,18 @@ A `RecordTooLargeError` caused by the data itself recurs after every rebuild, so
 
 ### Thread Safety and Teardown
 
-`Bridge.stop()`:
-1. Calls `request_shutdown()` and waits up to `shutdown_timeout_seconds` for the step lock. If a step is still running (typically parked in `consume()` on an idle stream), it closes the listener to unblock it and waits once more, then proceeds regardless.
-2. Only if it holds the step lock, and while `commit_outstanding`, calls `step()` until the commit resolves, an exception is raised, or `shutdown_timeout_seconds` elapses (rule 7). Closing the producer after that is logged as an error, because it aborts a commit that may still complete. FDB was not acknowledged, so the replay duplicates rather than loses data.
-3. Attempts every close (producer, listener, FDB client) and unsets all handles, then re-raises the first close error.
+`Bridge.stop(*, deadline=None)`:
+1. Requests shutdown and explicitly cancels a parked consume future, preventing new
+   native operations. It waits for the step lock using the remaining total budget.
+2. Under the step lock, attempts to finish an outstanding Kafka commit before closing
+   handles. An unknown commit outcome can still replay on restart; checkpointing and
+   acknowledgement never precede confirmed Kafka delivery.
+3. Attempts every close and re-raises the first close failure. The producer close receives
+   only the remaining budget. Handles are never closed concurrently with a pipeline step.
+
+One monotonic deadline covers the lock, commit handling and all closes. Cleanup runs
+on a daemon thread; an unresponsive call cannot make `stop()` exceed the deadline.
+Expiry raises `TimeoutError`. The CLI shares that deadline with its worker join.
 
 ---
 
@@ -146,7 +154,7 @@ A `RecordTooLargeError` caused by the data itself recurs after every rebuild, so
 Set `cdc.checkpoint_path` to enable sink-checked FDB cursor storage instead of
 `cdc.cursor_file`; the two settings are mutually exclusive. `Bridge` validates
 stream identity, configured range and checkpoint overlap before registration,
-and revalidates Kafka cluster/topic identity on rebuild. FDB checkpoint writes
+and revalidates Kafka cluster/topic identity and the original owner claim on rebuild. FDB checkpoint writes
 use the existing checkpoint callback and preserve phase-only retries. Permanent
 checkpoint errors stop the loop; transient transaction failures retry in place.
 

@@ -24,7 +24,7 @@ def _wiring() -> SimpleNamespace:
         {
             "cdc": {"stream_name": "s", "checkpoint_path": ["checkpoints"]},
             "kafka": {"topic": "t"},
-            "pipeline": {"shutdown_timeout_seconds": 0.01},
+            "pipeline": {"shutdown_timeout_seconds": 0.5},
         }
     )
     client = create_autospec(FDBClient, instance=True)
@@ -143,3 +143,51 @@ def test_store_client_is_shared_and_mismatched_client_is_rejected() -> None:
     assert bridge._client is deps.client
     with pytest.raises(ValueError, match="share the FDB client"):
         Bridge(config, client=MagicMock(), checkpoint_store=deps.store)
+
+
+def test_invalid_cursor_on_rebuild_is_permanent() -> None:
+    from fdb_kafka_bridge.cdc.errors import CDCInvalidCursorError
+
+    deps = _wiring()
+    with patch("fdb_kafka_bridge.bridge.pipeline.FDBMutationListener"):
+        deps.bridge.start()
+        deps.bridge._pipeline = MagicMock()
+        deps.bridge._pipeline.step.side_effect = RuntimeError("rebuild needed")
+        with (
+            patch.object(deps.bridge, "_needs_rebuild", return_value=True),
+            patch.object(
+                deps.bridge,
+                "_rebuild_pipeline",
+                side_effect=CDCInvalidCursorError("stale"),
+            ) as rebuild,
+            pytest.raises(CDCInvalidCursorError),
+        ):
+            deps.bridge.run()
+        rebuild.assert_called_once()
+        assert deps.bridge._shutdown_requested.is_set()
+        deps.bridge.stop()
+
+
+def test_takeover_prevents_ack_retry_after_successful_checkpoint() -> None:
+    from fdb_kafka_bridge.cdc.checkpoint import CheckpointFencedError
+    from fdb_kafka_bridge.cdc.errors import CDCRetryableError
+
+    deps = _wiring()
+    with patch("fdb_kafka_bridge.bridge.pipeline.FDBMutationListener") as factory:
+        listener = factory.return_value
+        listener.poll_records.return_value = [
+            mutations_pb2.FDBMutationRecord(stream_name="s")
+        ]
+        listener.get_position.return_value = CheckpointCursor(1, 20)
+        listener.acknowledge.side_effect = CDCRetryableError("overloaded")
+        deps.bridge.start()
+        deps.bridge._pipeline._ack_retries = 1
+        with pytest.raises(CDCRetryableError):
+            deps.bridge._pipeline.step()
+        deps.store.verify_owner.side_effect = CheckpointFencedError("taken over")
+        with pytest.raises(CheckpointFencedError):
+            deps.bridge._pipeline.step()
+        deps.store.save.assert_called_once()
+        listener.acknowledge.assert_called_once()
+        deps.producer.produce.assert_called_once()
+        deps.bridge.stop()

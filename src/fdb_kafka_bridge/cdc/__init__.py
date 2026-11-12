@@ -7,6 +7,7 @@ polling for FoundationDB 8.0 native CDC.
 from fdb_kafka_bridge.cdc.checkpoint import (
     CheckpointCursor,
     CheckpointError,
+    CheckpointFencedError,
     CheckpointFormatError,
     CheckpointOverlapError,
     CheckpointRegressionError,
@@ -41,6 +42,7 @@ from fdb_kafka_bridge.cdc.listener import (
 __all__ = [
     "CheckpointCursor",
     "CheckpointError",
+    "CheckpointFencedError",
     "CheckpointFormatError",
     "CheckpointOverlapError",
     "CheckpointRegressionError",

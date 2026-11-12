@@ -23,7 +23,8 @@ this key would remove earlier records of the stream.
 Delivery remains at least once. A crash after Kafka delivery but before the checkpoint
 can replay a partial or complete version. Consumers buffer through `VersionEnd` and
 ignore versions at or below the last completely applied version for the same stream
-registration. Kafka transactions add atomic visibility for `read_committed` consumers;
+name. Records do not carry the registration ID; re-registering a name requires an
+explicit downstream replay/reset plan. Kafka transactions add atomic visibility for `read_committed` consumers;
 they do not atomically commit the FDB cursor.
 
 ## Backend selection
@@ -60,8 +61,9 @@ and stop the run loop. Outstanding Kafka commits retain the existing retry/teard
 
 ## Storage and identity
 
-Default directory path: `("fdb-kafka-bridge", "checkpoints")`.
-Key: `directory.pack((raw_stream_name,))`.
+Default tuple prefix: `("fdb-kafka-bridge", "checkpoints")`.
+Subspace: `Subspace(("fdb-kafka-bridge", "checkpoints"))`.
+Key: `subspace.pack((raw_stream_name,))`.
 Value: tuple-packed `(1, stream_id, last_consumed_version, kafka_cluster_id, topic)`.
 
 `SinkIdentity` uses Kafka's broker-reported cluster ID, obtained through
@@ -71,11 +73,30 @@ Load and save reject a different cluster or topic before any progress can be ack
 Unknown formats, malformed values and the old experimental three-field values are rejected;
 there is no automatic migration that guesses which sink received earlier records.
 
+The prefix is deterministic and does not use Directory Layer allocation. Directory
+removal/recreation cannot redirect a new process to a different checkpoint prefix.
+This replaces the pre-merge experimental Directory Layer layout; existing experimental
+checkpoints need an explicit migration/replay plan before switching. No automatic
+fallback can infer whether absent progress is safe.
+
+Before loading a checkpoint, a process claims `(raw_stream_name, "owner")` by writing
+tuple-packed `(epoch + 1, random_instance_token)`. The token prevents an ABA match if
+an owner key is deleted and recreated. A retry after an uncertain claim commit reuses
+its token. Rebuilds verify the original claim; they never take ownership back.
+`subspace` and `run_transaction()` are public seams for future lease support.
+
+Every save reads and validates the owner in the same transaction, even for an equal
+cursor. A takeover conflicts with an in-flight save; subsequent saves by the old owner
+raise permanent `CheckpointFencedError`. Ownership is also checked before resume ack
+and every pipeline ack attempt, including retries after a successful checkpoint.
+These checks do not atomically fence a native ack already in flight or Kafka output.
+
 Every save is an optimistic FDB transaction that reads the stored value before writing:
 
 | Stored state | Result |
 |---|---|
-| No checkpoint | Write |
+| Missing/superseded claim | `CheckpointFencedError` |
+| No checkpoint, valid claim | Write |
 | Different Kafka cluster/topic | `CheckpointSinkMismatchError` |
 | Different stream registration ID | `CheckpointStreamMismatchError` |
 | Newer stored version | `CheckpointRegressionError` |
@@ -83,25 +104,32 @@ Every save is an optimistic FDB transaction that reads the stored value before w
 | Older stored version | Advance |
 
 Transactions have configurable total timeout and retry limit, defaulting to five seconds
-and ten retries. Exhausted native errors become `CheckpointWriteError` and prevent ack.
+and ten retries. Exhausted retryable native errors become `CheckpointWriteError` and
+prevent ack while allowing phase-only retry. Native non-retryable errors, including
+transaction timeout (1031), become permanent `CheckpointError` and stop the bridge.
+FDB's predicate receives the native exception; `on_error` receives its integer code.
 Cursors resume as-is, without adding one. The listener waits for the read version and
 re-acknowledges the saved cursor before consuming.
 
 ## Startup guards
 
-Before any stream registration or checkpoint allocation:
+Before stream registration or checkpoint advancement:
 
-1. Read current stream metadata and an existing checkpoint directory without writes.
-2. Validate that a saved cursor's stream exists and its registration ID matches.
-3. Validate a supplied key range against the registered range.
-4. Reject overlap between the captured range and either the checkpoint directory's
-   complete prefix range or Directory Layer metadata `[0xfe, 0xff)`.
-5. Require an explicit range if the stream does not exist.
+1. Read current stream metadata and reject multi-range streams or a different configured
+   range with `StartupError`.
+2. Open the plain subspace without writes and reject overlap between its complete prefix
+   range and the captured range. Directory Layer metadata needs no exclusion because
+   this backend never writes it.
+3. Claim ownership (or verify the existing claim on rebuild), then load the checkpoint.
+4. Require the saved registration to exist and match. Re-read stream metadata and check
+   `last_consumed_version + 1 >= min_version` before restoring an ack. A foreign ack
+   beyond this frontier raises `CDCInvalidCursorError`; automatic restart cannot recover
+   missing history. The native 1007 refusal is also terminal if retention changes later.
+5. Require an explicit range if the stream does not exist; only then register it.
 
-Only then may the directory be allocated and a missing stream registered. Allocation
-and its overlap check are in the same transaction, so an unsafe allocation rolls back.
 An existing stream with no checkpoint logs a warning and uses cluster `min_version`.
-No startup check removes or re-registers an existing stream.
+No startup check removes or re-registers an existing stream. If both registration and
+checkpoint are deleted, startup cannot detect the lost history and starts fresh.
 
 ## CLI
 
@@ -130,34 +158,51 @@ Flags override environment variables:
 | `--checkpoint-timeout-s` | `STREAMLINE_CHECKPOINT_TIMEOUT_S` | 5 |
 | `--checkpoint-retry-limit` | `STREAMLINE_CHECKPOINT_RETRY_LIMIT` | 10 |
 | `--flush-timeout-s` | `STREAMLINE_FLUSH_TIMEOUT_S` | 30 |
-| `--shutdown-timeout-s` | `STREAMLINE_SHUTDOWN_TIMEOUT_S` | 30 |
+| `--shutdown-timeout-s` | `STREAMLINE_SHUTDOWN_TIMEOUT_S` | 20 |
+| `--ack-timeout-s` | `STREAMLINE_ACK_TIMEOUT_S` | 5 |
+| `--proxy-consume-poll-timeout-s` | `CDC_PROXY_CONSUME_POLL_TIMEOUT` | 5 |
 | `--max-record-bytes` | `STREAMLINE_MAX_RECORD_BYTES` | 900000 |
 
 Prefixes are UTF-8 text or `0x`-prefixed hexadecimal bytes. A path is slash-separated
-non-empty directory components. The envelope default leaves room below Kafka's message
+non-empty tuple-prefix components. The envelope default leaves room below Kafka's message
 limit for framing and the key; broker limits must still accommodate the configured size.
 
-The CLI runs `Bridge.run()` in a worker thread. SIGINT/SIGTERM request shutdown; the main
-thread calls `Bridge.stop()` and restores previous signal handlers. That allows the
-existing stop logic to unblock an idle native consume and resolve outstanding commits.
-`shutdown_timeout_seconds` bounds individual waits, not the whole process teardown;
-allow for the step-lock waits, producer close and worker join in supervisor timeouts.
+The CLI runs startup and `Bridge.run()` in a worker thread. SIGINT/SIGTERM request
+shutdown; the main thread calls `Bridge.stop(deadline=...)` and restores previous
+signal handlers. The first signal establishes one monotonic deadline shared by cleanup
+and worker join. The default CLI budget is 20 seconds; configure the supervisor or
+Kubernetes termination grace period above that budget (the Kubernetes default is 30s).
+A parked consume future is explicitly cancelled before waiting for the step lock.
+Ack futures have their own bounded timeout and are cancelled on expiry, preserving
+checkpoint-before-ack ordering. Teardown never closes handles concurrently with a step.
+An unresponsive dependency causes `TimeoutError` at the total deadline; outstanding
+worker/cleanup threads are daemon threads, so they cannot hold the CLI process open.
 The daemon never removes streams or deletes checkpoints on shutdown.
 
-Exit statuses: 0 for clean shutdown, 1 for runtime/dependency failure, 2 for invalid
-configuration, 3 for unsafe startup or corrupt/foreign checkpoints.
+A resumed consumer retries 2000 only on its first consume, for at most the configured
+proxy consume poll timeout. Set this to the actual FDB `CDC_PROXY_CONSUME_POLL_TIMEOUT`;
+setting the CLI environment variable does not change the server knob. Subsequent 2000
+errors are terminal. Retry waits are interruptible by shutdown.
+
+Exit statuses: 0 for clean shutdown, 1 for runtime/dependency failure or shutdown timeout,
+2 for invalid configuration, 3 for deterministic startup/checkpoint/CDC refusals.
+Regression, fencing, invalid resume cursors (also on rebuild), unsupported multi-range
+streams and 1007 refusals require operator action rather than automatic retries.
 
 ## Scope and verification
 
-Exactly one process may own a stream. There are no leases, heartbeats or multi-pod
-failover in this backend. All deployments of a stream must use the same checkpoint
+Use `replicas: 1` and `strategy: Recreate` for Kubernetes deployments. Owner fencing
+protects checkpoint writes during accidental overlap, but cannot retract old in-flight
+Kafka records or native acknowledgements. There are no leases, heartbeats or automatic
+multi-pod failover in this backend. All deployments of a stream must use the same checkpoint
 path and sink. A sink change needs an explicit replay/backfill plan; deleting progress
 does not recover history that was already acknowledged. A stalled stream retains TLog
 history, so monitor progress and repeated failures.
 
 Unit tests cover backend wiring, sink changes during rebuild, retry-in-place, CLI
 precedence and signal cleanup. Live tests use real FDB transactions for monotonic saves,
-sink mismatches, corruption, overlap rollback, retry exhaustion and restart crash windows.
+sink mismatches, corruption, overlap rejection, retry exhaustion, ownership takeover,
+commit-unknown recovery, retention boundaries and restart crash windows.
 FDB-to-Kafka tests verify split version batches, partition ordering, both producer modes,
 rejected publication recovery, and CLI restart. Packaging tests invoke the installed
 entrypoint outside the source tree. The bridge CI job runs the live suite with 100%

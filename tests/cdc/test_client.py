@@ -171,3 +171,34 @@ def test_unrelated_runtime_error_is_not_reclassified() -> None:
 
     with pytest.raises(RuntimeError, match="network failed"):
         client.create_cdc_consumer("stream")
+
+
+@pytest.mark.parametrize("version", [99, 100, 101])
+def test_resume_retention_boundary(version: int) -> None:
+    from types import SimpleNamespace
+
+    from fdb_kafka_bridge.cdc.errors import CDCInvalidCursorError
+
+    client = FDBClient()
+    client.list_cdc_streams = MagicMock(
+        return_value=[SimpleNamespace(name=b"s", stream_id=1, min_version=101)]
+    )
+    cursor = SimpleNamespace(stream_id=1, last_consumed_version=version)
+    if version == 99:
+        with pytest.raises(CDCInvalidCursorError, match="retained history"):
+            client.validate_resume_cursor(b"s", cursor)
+    else:
+        client.validate_resume_cursor(b"s", cursor)
+
+
+def test_resume_missing_or_replaced_registration() -> None:
+    from types import SimpleNamespace
+
+    from fdb_kafka_bridge.cdc.errors import CDCInvalidCursorError
+
+    client = FDBClient()
+    cursor = SimpleNamespace(stream_id=1, last_consumed_version=100)
+    for streams in ([], [SimpleNamespace(name=b"s", stream_id=2)]):
+        client.list_cdc_streams = MagicMock(return_value=streams)
+        with pytest.raises(CDCInvalidCursorError, match="registration"):
+            client.validate_resume_cursor(b"s", cursor)

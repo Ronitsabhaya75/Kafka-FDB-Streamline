@@ -10,7 +10,14 @@ import pytest
 from fdb_kafka_bridge.bridge.cli import load_config, main, run_daemon
 from fdb_kafka_bridge.bridge.config import from_dict
 from fdb_kafka_bridge.bridge.startup import StartupError
-from fdb_kafka_bridge.cdc.checkpoint import CheckpointSinkMismatchError
+from fdb_kafka_bridge.cdc.checkpoint import (
+    CheckpointError,
+    CheckpointFencedError,
+    CheckpointRegressionError,
+    CheckpointSinkMismatchError,
+    CheckpointWriteError,
+)
+from fdb_kafka_bridge.cdc.errors import CDCInvalidCursorError, CDCTerminalError
 
 
 def test_config_defaults_and_overrides(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -66,6 +73,13 @@ def test_invalid_flags(args: list[str]) -> None:
         (RuntimeError("broker"), 1),
         (StartupError("range"), 3),
         (CheckpointSinkMismatchError("sink"), 3),
+        (CheckpointRegressionError("older"), 3),
+        (CheckpointFencedError("owner changed"), 3),
+        (CheckpointError("permanent"), 3),
+        (CheckpointWriteError("transient"), 1),
+        (CDCInvalidCursorError("invalid"), 3),
+        (CDCTerminalError("old", code=1007), 3),
+        (CDCTerminalError("collision", code=2000), 3),
     ],
 )
 def test_exit_codes(error: Exception | None, code: int) -> None:
@@ -86,6 +100,7 @@ def test_worker_failure_cleanup_and_signal_restore() -> None:
 
 def test_start_failure_cleanup() -> None:
     bridge = MagicMock()
+    bridge.config = from_dict({"cdc": {"stream_name": "s"}})
     bridge.start.side_effect = RuntimeError("start failed")
     with pytest.raises(RuntimeError, match="start failed"):
         run_daemon(bridge)
@@ -97,7 +112,7 @@ def test_sigterm_requests_shutdown_and_cleans_up() -> None:
     bridge.config = from_dict({"cdc": {"stream_name": "s"}})
     stopped = threading.Event()
     bridge.request_shutdown.side_effect = stopped.set
-    bridge.stop.side_effect = stopped.set
+    bridge.stop.side_effect = lambda **_: stopped.set()
 
     def run() -> None:
         os.kill(os.getpid(), signal.SIGTERM)
@@ -109,3 +124,49 @@ def test_sigterm_requests_shutdown_and_cleans_up() -> None:
     bridge.request_shutdown.assert_called_once()
     bridge.stop.assert_called_once()
     assert signal.getsignal(signal.SIGTERM) == previous
+
+
+def test_cli_operation_timeout_configuration(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("CDC_PROXY_CONSUME_POLL_TIMEOUT", "2")
+    monkeypatch.setenv("STREAMLINE_ACK_TIMEOUT_S", "3")
+    cfg = load_config(["--stream-name", "s"])
+    assert cfg.cdc.proxy_consume_poll_timeout_seconds == 2
+    assert cfg.cdc.ack_timeout_seconds == 3
+    cfg = load_config(
+        [
+            "--stream-name",
+            "s",
+            "--ack-timeout-s",
+            "1",
+            "--proxy-consume-poll-timeout-s",
+            "4",
+        ]
+    )
+    assert cfg.cdc.ack_timeout_seconds == 1
+    assert cfg.cdc.proxy_consume_poll_timeout_seconds == 4
+    assert cfg.pipeline.shutdown_timeout_seconds < 30
+
+
+def test_signal_during_startup_uses_total_join_deadline() -> None:
+    import time
+
+    bridge = MagicMock()
+    bridge.config = from_dict(
+        {"cdc": {"stream_name": "s"}, "pipeline": {"shutdown_timeout_seconds": 0.05}}
+    )
+    release = threading.Event()
+
+    def start() -> None:
+        os.kill(os.getpid(), signal.SIGTERM)
+        release.wait(2)
+
+    bridge.start.side_effect = start
+    previous = signal.getsignal(signal.SIGTERM)
+    began = time.monotonic()
+    try:
+        with pytest.raises(RuntimeError, match="shutdown budget"):
+            run_daemon(bridge)
+        assert time.monotonic() - began < 0.3
+        assert signal.getsignal(signal.SIGTERM) == previous
+    finally:
+        release.set()
