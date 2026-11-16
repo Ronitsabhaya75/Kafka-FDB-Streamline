@@ -22,6 +22,7 @@ MINIMUM_CDC_API_VERSION: Final[int] = 800
 # Native FoundationDB error codes the consumer classifies explicitly.
 # See CDC-DEEP-DIVE.md §3 "Errors we have to map".
 FDB_TRANSACTION_TOO_OLD: Final[int] = 1007
+FDB_OPERATION_CANCELLED: Final[int] = 1101
 FDB_SERVER_OVERLOADED: Final[int] = 1211
 FDB_CLIENT_INVALID_OPERATION: Final[int] = 2000
 

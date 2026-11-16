@@ -189,6 +189,28 @@ def test_corrupt_owner_is_fatal(store: CheckpointStore, value: bytes) -> None:
         store.claim(b"s")
 
 
+def test_unversioned_owner_is_rejected(store: CheckpointStore) -> None:
+    from uuid import uuid4
+
+    fdb = import_module("fdb")
+    store.open()
+    store.client.db[store.subspace.pack((b"s", "owner"))] = fdb.tuple.pack(
+        (1, uuid4().bytes)
+    )
+    with pytest.raises(CheckpointFormatError, match="owner"):
+        store.claim(b"s")
+
+
+def test_claim_writes_versioned_owner(store: CheckpointStore) -> None:
+    fdb = import_module("fdb")
+    store.open()
+    store.claim(b"s")
+    fields = fdb.tuple.unpack(store.client.db[store.subspace.pack((b"s", "owner"))])
+    assert fields[0] == 1
+    assert fields[1] == 1
+    assert isinstance(fields[2], bytes) and len(fields[2]) == 16
+
+
 def test_unopened_subspace_is_rejected(store: CheckpointStore) -> None:
     with pytest.raises(CheckpointError, match="not open"):
         store.key_range()
@@ -245,15 +267,28 @@ def test_save_conflicts_with_owner_takeover(store: CheckpointStore) -> None:
     assert error.value.code == 1020
 
 
-@pytest.mark.parametrize("code", [1031, 2004])
-def test_nonretryable_native_error_is_fatal(store: CheckpointStore, code: int) -> None:
+def test_transaction_timeout_is_write_error(store: CheckpointStore) -> None:
     fdb = import_module("fdb")
     calls = 0
 
     def fail(tr: Any) -> None:
         nonlocal calls
         calls += 1
-        raise fdb.FDBError(code)
+        raise fdb.FDBError(1031)
+
+    with pytest.raises(CheckpointWriteError):
+        store.run_transaction(fail)
+    assert calls == 1
+
+
+def test_nonretryable_native_error_is_fatal(store: CheckpointStore) -> None:
+    fdb = import_module("fdb")
+    calls = 0
+
+    def fail(tr: Any) -> None:
+        nonlocal calls
+        calls += 1
+        raise fdb.FDBError(2004)
 
     with pytest.raises(CheckpointError) as error:
         store.run_transaction(fail)
@@ -279,4 +314,4 @@ def test_error_during_backoff_is_classified(
 
     with pytest.raises(CheckpointError) as error:
         store.run_transaction(conflict)
-    assert isinstance(error.value, CheckpointWriteError) is (code == 1020)
+    assert isinstance(error.value, CheckpointWriteError)

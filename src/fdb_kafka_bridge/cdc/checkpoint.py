@@ -52,7 +52,9 @@ class SinkIdentity:
 
     Attributes:
         kafka_cluster_id: Broker-reported immutable cluster identity.
-        topic: Topic receiving the stream's records.
+        topic: Topic name receiving the stream's records. Topic ID (KIP-516) is
+            not stored; deleting and recreating a topic under the same name is
+            treated as the same sink (see FDB-CHECKPOINT-SPEC).
     """
 
     kafka_cluster_id: str
@@ -65,6 +67,10 @@ class SinkIdentity:
             for value in (self.kafka_cluster_id, self.topic)
         ):
             raise ValueError("Sink cluster ID and topic must be non-empty strings")
+
+
+OWNER_FORMAT_VERSION: int = 1
+FDB_TRANSACTION_TIMED_OUT: int = 1031
 
 
 @dataclass(frozen=True)
@@ -185,8 +191,9 @@ class CheckpointStore:
             The successful operation's result.
 
         Raises:
-            CheckpointWriteError: If transient failures exhaust the retry budget.
-            CheckpointError: If FDB reports a non-retryable failure or timeout.
+            CheckpointWriteError: If transient failures exhaust the retry budget,
+                or FDB reports ``transaction_timed_out`` (1031).
+            CheckpointError: If FDB reports any other non-retryable failure.
         """
         fdb = import_module("fdb")
         tr = self.client.db.create_transaction()
@@ -201,6 +208,10 @@ class CheckpointStore:
                         tr.commit().wait()
                     return result
                 except fdb.FDBError as exc:
+                    if exc.code == FDB_TRANSACTION_TIMED_OUT:
+                        raise CheckpointWriteError(
+                            f"Checkpoint transaction timed out ({exc.code})"
+                        ) from exc
                     if not fdb.predicates.is_retryable(exc):
                         raise CheckpointError(
                             f"Permanent checkpoint transaction failure ({exc.code})"
@@ -212,6 +223,10 @@ class CheckpointStore:
                     attempt += 1
                     tr.on_error(exc.code).wait()
         except fdb.FDBError as exc:
+            if exc.code == FDB_TRANSACTION_TIMED_OUT:
+                raise CheckpointWriteError(
+                    f"Checkpoint transaction timed out ({exc.code})"
+                ) from exc
             if not fdb.predicates.is_retryable(exc):
                 raise CheckpointError(
                     f"Permanent checkpoint transaction failure ({exc.code})"
@@ -278,7 +293,9 @@ class CheckpointStore:
             if owner == token:
                 return epoch, token
             claimed = (epoch + 1, token)
-            tr[key] = import_module("fdb.tuple").pack(claimed)
+            tr[key] = import_module("fdb.tuple").pack(
+                (OWNER_FORMAT_VERSION, claimed[0], claimed[1])
+            )
             return claimed
 
         self._owners[stream_name] = self.run_transaction(claim, write=True)
@@ -295,17 +312,26 @@ class CheckpointStore:
         self.run_transaction(lambda tr: self._check_owner(tr, stream_name))
 
     def _decode_owner(self, value: bytes) -> tuple[int, bytes]:
+        """Decode a versioned owner record as ``(epoch, token)``.
+
+        Stored layout is tuple-packed
+        ``(OWNER_FORMAT_VERSION, epoch, 16-byte token)``. Unversioned two-field
+        records are rejected so later lease fields can extend the format without
+        colliding with old binaries.
+        """
         try:
             fields = import_module("fdb.tuple").unpack(value)
             if (
-                len(fields) != 2
+                len(fields) != 3
                 or type(fields[0]) is not int
-                or fields[0] < 1
-                or not isinstance(fields[1], bytes)
-                or len(fields[1]) != 16
+                or fields[0] != OWNER_FORMAT_VERSION
+                or type(fields[1]) is not int
+                or fields[1] < 1
+                or not isinstance(fields[2], bytes)
+                or len(fields[2]) != 16
             ):
                 raise ValueError("invalid owner")
-            return fields[0], fields[1]
+            return fields[1], fields[2]
         except (ValueError, TypeError, IndexError) as exc:
             raise CheckpointFormatError("Invalid checkpoint owner") from exc
 

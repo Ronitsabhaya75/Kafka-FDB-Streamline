@@ -149,7 +149,8 @@ otherwise used as given; the caller owns the full budget, see
     not spin.
   - `CDCTerminalError`: `transaction_too_old` (1007) or `client_invalid_operation`
     (2000). 1007 requires operator recovery. The listener retries 2000 only on the
-    first consume after resume, within `proxy_consume_poll_timeout_seconds`, then
+    first consume of each new handle (fresh or resume), within
+    `proxy_consume_poll_timeout_seconds`, then
     raises it as terminal. Match that setting to the server's consume poll timeout.
 
 Only these three CDC error codes are classified ([CDC deep dive §3](CDC-DEEP-DIVE.md#errors-we-have-to-map-),

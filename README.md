@@ -32,7 +32,9 @@ streamline-daemon --stream-name orders --subspace-prefix orders: \
 ```
 
 The CLI publishes to `fdb.cdc.orders` and saves a sink-checked FDB cursor before
-acknowledging each delivered reply. Configuration, recovery and live tests:
+acknowledging each delivered reply. Run one replica per stream (`replicas: 1`,
+Kubernetes `strategy: Recreate`); overlapping replicas fence each other but cannot
+retract in-flight Kafka records. Configuration, recovery and live tests:
 [`FDB checkpoints and CLI`](docs/FDB-CHECKPOINT-SPEC.md).
 
 ## Contributing

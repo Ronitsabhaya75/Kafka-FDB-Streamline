@@ -19,6 +19,7 @@ from fdb_kafka_bridge.cdc.checkpoint import (
 )
 from fdb_kafka_bridge.cdc.errors import CDCInvalidCursorError, CDCTerminalError
 from fdb_kafka_bridge.cdc.listener import subspace_to_key_range
+from fdb_kafka_bridge.kafka.producer import is_message_too_large_error
 
 logger = logging.getLogger(__name__)
 
@@ -160,6 +161,10 @@ def run_daemon(bridge: Bridge) -> None:
             )
         try:
             bridge.stop(deadline=shutdown_deadline)
+        except Exception:
+            # Prefer the worker's failure over a teardown error so exit codes
+            # and logs reflect the original refusal (e.g. StartupError → 3).
+            logger.exception("Bridge stop failed during daemon teardown")
         finally:
             if worker is not None:
                 worker.join(max(0, shutdown_deadline - time.monotonic()))
@@ -199,7 +204,12 @@ def main(argv: list[str] | None = None) -> int:
     except CDCTerminalError as exc:
         logger.exception("Terminal CDC refusal")
         return 3 if exc.code in (1007, 2000) else 1
-    except Exception:
+    except Exception as exc:
+        if is_message_too_large_error(exc):
+            logger.exception(
+                "Record exceeds Kafka message size limit; operator action required"
+            )
+            return 3
         logger.exception("Bridge failed")
         return 1
     return 0

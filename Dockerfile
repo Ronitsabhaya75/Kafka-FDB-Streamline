@@ -1,5 +1,8 @@
 FROM --platform=linux/amd64 ubuntu:24.04
 
+# 8.0.0 predates apple/foundationdb#14351 (future free race on cancel). Prefer a
+# client build that includes that fix once a tagged 8.0.x release ships it; see
+# docs/FDB-CHECKPOINT-SPEC.md.
 ARG FDB_VERSION=8.0.0
 ARG FDB_RELEASE_URL=https://github.com/apple/foundationdb/releases/download/${FDB_VERSION}
 ARG FDBSERVER_SHA256=9ca9b1514650c3085eaf9a82f329d4dcc036a73ab2bb1fc9696ae2aa72033063

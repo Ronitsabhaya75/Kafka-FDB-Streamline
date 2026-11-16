@@ -67,11 +67,18 @@ Key: `subspace.pack((raw_stream_name,))`.
 Value: tuple-packed `(1, stream_id, last_consumed_version, kafka_cluster_id, topic)`.
 
 `SinkIdentity` uses Kafka's broker-reported cluster ID, obtained through
-`MutationProducer.cluster_id(timeout)`. Bootstrap addresses are not an identity:
-several addresses may name the same cluster. Missing cluster metadata fails startup.
-Load and save reject a different cluster or topic before any progress can be acknowledged.
-Unknown formats, malformed values and the old experimental three-field values are rejected;
-there is no automatic migration that guesses which sink received earlier records.
+`MutationProducer.cluster_id(timeout)`, plus the configured topic **name**. Bootstrap
+addresses are not an identity: several addresses may name the same cluster. Missing
+cluster metadata fails startup. Load and save reject a different cluster or topic
+before any progress can be acknowledged. Unknown formats, malformed values and the old
+experimental three-field values are rejected; there is no automatic migration that
+guesses which sink received earlier records.
+
+Topic ID (KIP-516) is intentionally not stored. Deleting a topic and recreating it under
+the same name still matches the checkpoint, so the bridge resumes and the new topic never
+receives earlier history. Operators who recreate a topic must delete or migrate the
+checkpoint and plan an explicit replay/backfill. Extending the sink record later would
+require a new cursor format version.
 
 The prefix is deterministic and does not use Directory Layer allocation. Directory
 removal/recreation cannot redirect a new process to a different checkpoint prefix.
@@ -80,9 +87,12 @@ checkpoints need an explicit migration/replay plan before switching. No automati
 fallback can infer whether absent progress is safe.
 
 Before loading a checkpoint, a process claims `(raw_stream_name, "owner")` by writing
-tuple-packed `(epoch + 1, random_instance_token)`. The token prevents an ABA match if
-an owner key is deleted and recreated. A retry after an uncertain claim commit reuses
-its token. Rebuilds verify the original claim; they never take ownership back.
+tuple-packed `(1, epoch + 1, random_instance_token)`. The leading `1` is the owner
+record format version so later lease/release fields can extend the layout without
+colliding with unversioned binaries. The token prevents an ABA match if an owner key
+is deleted and recreated. A retry after an uncertain claim commit reuses its token.
+Rebuilds verify the original claim; they never take ownership back. Unversioned
+two-field owner records are rejected as `CheckpointFormatError`.
 `subspace` and `run_transaction()` are public seams for future lease support.
 
 Every save reads and validates the owner in the same transaction, even for an equal
@@ -105,11 +115,23 @@ Every save is an optimistic FDB transaction that reads the stored value before w
 
 Transactions have configurable total timeout and retry limit, defaulting to five seconds
 and ten retries. Exhausted retryable native errors become `CheckpointWriteError` and
-prevent ack while allowing phase-only retry. Native non-retryable errors, including
-transaction timeout (1031), become permanent `CheckpointError` and stop the bridge.
+prevent ack while allowing phase-only retry. Transaction timeout (1031) is also a
+`CheckpointWriteError` (FDB does not retry it): the current phase retries, and the CLI
+maps exhaustion to exit 1 so a supervisor can restart. Other native non-retryable errors
+become permanent `CheckpointError` and stop the bridge (CLI exit 3).
 FDB's predicate receives the native exception; `on_error` receives its integer code.
 Cursors resume as-is, without adding one. The listener waits for the read version and
 re-acknowledges the saved cursor before consuming.
+
+Ack and consume futures that time out are cancelled, then `wait()`'d so the native
+outstanding-operation flag clears before the next call (swallowing `operation_cancelled`
+/ 1101). Without that wait, a quick retry can fail locally with 2000 and exit 3.
+
+Cancelling futures off the FDB network thread races in client builds that lack
+[apple/foundationdb#14351](https://github.com/apple/foundationdb/pull/14351). This
+project still ships FoundationDB **8.0.0** binaries (see `Dockerfile` `FDB_VERSION`);
+operators must treat a client that includes #14351 as the minimum once a tagged release
+contains it, or accept the allocator-corruption risk on 8.0.0 under cancel-heavy load.
 
 ## Startup guards
 
@@ -180,25 +202,30 @@ An unresponsive dependency causes `TimeoutError` at the total deadline; outstand
 worker/cleanup threads are daemon threads, so they cannot hold the CLI process open.
 The daemon never removes streams or deletes checkpoints on shutdown.
 
-A resumed consumer retries 2000 only on its first consume, for at most the configured
-proxy consume poll timeout. Set this to the actual FDB `CDC_PROXY_CONSUME_POLL_TIMEOUT`;
-setting the CLI environment variable does not change the server knob. Subsequent 2000
-errors are terminal. Retry waits are interruptible by shutdown.
+Every new consumer handle retries 2000 only on its first consume (fresh create or
+resume), for at most the configured proxy consume poll timeout. Set this to the actual
+FDB `CDC_PROXY_CONSUME_POLL_TIMEOUT`; setting the CLI environment variable does not
+change the server knob. Subsequent 2000 errors are terminal. Retry waits are
+interruptible by shutdown.
 
-Exit statuses: 0 for clean shutdown, 1 for runtime/dependency failure or shutdown timeout,
-2 for invalid configuration, 3 for deterministic startup/checkpoint/CDC refusals.
-Regression, fencing, invalid resume cursors (also on rebuild), unsupported multi-range
-streams and 1007 refusals require operator action rather than automatic retries.
+Exit statuses: 0 for clean shutdown, 1 for runtime/dependency failure, shutdown timeout,
+or exhausted checkpoint write retries (including 1031), 2 for invalid configuration,
+3 for deterministic startup/checkpoint/CDC refusals and permanent Kafka
+`MSG_SIZE_TOO_LARGE`. Regression, fencing, invalid resume cursors (also on rebuild),
+unsupported multi-range streams and 1007 refusals require operator action rather than
+automatic retries. If `Bridge.stop()` fails after the worker already failed, the CLI
+preserves and raises the worker's error (logged stop failure does not replace exit 3).
 
 ## Scope and verification
 
-Use `replicas: 1` and `strategy: Recreate` for Kubernetes deployments. Owner fencing
-protects checkpoint writes during accidental overlap, but cannot retract old in-flight
-Kafka records or native acknowledgements. There are no leases, heartbeats or automatic
-multi-pod failover in this backend. All deployments of a stream must use the same checkpoint
-path and sink. A sink change needs an explicit replay/backfill plan; deleting progress
-does not recover history that was already acknowledged. A stalled stream retains TLog
-history, so monitor progress and repeated failures.
+Use `replicas: 1` and `strategy: Recreate` for Kubernetes deployments (also document this
+in the README next to the CLI). Owner fencing protects checkpoint writes during
+accidental overlap, but cannot retract old in-flight Kafka records or native
+acknowledgements. There are no leases, heartbeats or automatic multi-pod failover in this
+backend. All deployments of a stream must use the same checkpoint path and sink. A sink
+change needs an explicit replay/backfill plan; deleting progress does not recover history
+that was already acknowledged. A stalled stream retains TLog history, so monitor progress
+and repeated failures.
 
 Unit tests cover backend wiring, sink changes during rebuild, retry-in-place, CLI
 precedence and signal cleanup. Live tests use real FDB transactions for monotonic saves,

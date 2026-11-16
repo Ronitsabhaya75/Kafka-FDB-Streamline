@@ -400,6 +400,8 @@ def test_ack_timeout_cancels_future_and_retains_pending_reply(resumed: bool) -> 
     with pytest.raises(CDCRetryableError, match="Timed out"):
         listener.start() if resumed else listener.acknowledge()
     assert pending.cancelled
+    # cancel() must be followed by wait() so the handle is clear before retry.
+    assert pending.ready.is_set()
     assert listener.awaiting_ack is not resumed
     if not resumed:
         consumer.acknowledge.return_value = MagicMock()
@@ -441,12 +443,9 @@ def test_cancel_parked_consume_without_ack(close: bool) -> None:
         listener.poll_records()
 
 
-def test_first_consume_collision_is_retried_only_after_resume() -> None:
+def test_first_consume_collision_is_retried_for_fresh_and_resumed() -> None:
     listener, client, consumer = _listener_with_batch(MockConsumeResult([], 100))
-    listener.initial_cursor = MockCursor(1, 90)
-    listener._restart_poll = True
-    client.resume_cdc_consumer.return_value = consumer
-    client.get_read_version.return_value = 100
+    assert listener._restart_poll is True
     consumer.consume.return_value.wait.side_effect = [
         _FakeFDBError(2000),
         MockConsumeResult([], 100),
@@ -459,10 +458,21 @@ def test_first_consume_collision_is_retried_only_after_resume() -> None:
     assert error.value.code == 2000
     assert consumer.consume.call_count == 3
 
+    resumed, client, consumer = _listener_with_batch(MockConsumeResult([], 100))
+    resumed.initial_cursor = MockCursor(1, 90)
+    client.resume_cdc_consumer.return_value = consumer
+    client.get_read_version.return_value = 100
+    consumer.consume.return_value.wait.side_effect = [
+        _FakeFDBError(2000),
+        MockConsumeResult([], 100),
+    ]
+    assert resumed._restart_poll is True
+    assert resumed.poll_records()
+    assert consumer.consume.call_count == 2
+
 
 def test_restart_collision_window_expires() -> None:
     listener = _listener_whose_consume_raises(_FakeFDBError(2000))
-    listener._restart_poll = True
     listener.proxy_consume_poll_timeout_seconds = 0.01
     with pytest.raises(CDCTerminalError) as error:
         listener.poll_records()

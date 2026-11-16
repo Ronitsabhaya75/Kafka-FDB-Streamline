@@ -8,6 +8,7 @@ from typing import Any, Final, Self
 
 from fdb_kafka_bridge.cdc.client import (
     FDB_CLIENT_INVALID_OPERATION,
+    FDB_OPERATION_CANCELLED,
     FDBClient,
     _native_error_code,
     _raise_consume_failure,
@@ -126,7 +127,7 @@ class FDBMutationListener:
             resume_poll_interval_seconds: Delay between resume read-version checks.
             ack_timeout_seconds: Maximum wait for each acknowledgement.
             proxy_consume_poll_timeout_seconds: Proxy's consume hold timeout; bounds
-                error 2000 retries on the first consume after resume.
+                error 2000 retries on the first consume of each new handle.
             before_ack: Optional ownership check before restoring a resumed ack.
             idle_ack_max_replies: Optional count of consecutive idle replies,
                 including the current one, at which a coalesced watermark is
@@ -226,7 +227,9 @@ class FDBMutationListener:
         self._pending_future: Any | None = None
         self._pending_action: str | None = None
         self._stopping = threading.Event()
-        self._restart_poll = cursor is not None
+        # Retry 2000 on the first consume for every new handle: resume and fresh
+        # create can both collide with a dead process's still-live proxy lease.
+        self._restart_poll = True
         self._before_ack = before_ack
         self.idle_ack_max_replies = idle_ack_max_replies
         self.idle_ack_max_seconds = idle_ack_max_seconds
@@ -297,6 +300,13 @@ class FDBMutationListener:
                 future.on_ready(lambda _: ready.set())
                 if not ready.wait(timeout):
                     future.cancel()
+                    # Cancel is asynchronous on the FDB network thread. Wait so a
+                    # follow-up ack/consume does not hit 2000 on the same handle.
+                    try:
+                        future.wait()
+                    except Exception as exc:
+                        if _native_error_code(exc) != FDB_OPERATION_CANCELLED:
+                            raise
                     raise TimeoutError(f"CDC {action} timed out after {timeout}s")
             return future.wait()
         finally:

@@ -6,6 +6,7 @@ import threading
 from unittest.mock import MagicMock, patch
 
 import pytest
+from confluent_kafka import KafkaError, KafkaException
 
 from fdb_kafka_bridge.bridge.cli import load_config, main, run_daemon
 from fdb_kafka_bridge.bridge.config import from_dict
@@ -67,6 +68,12 @@ def test_invalid_flags(args: list[str]) -> None:
     assert error.value.code == 2
 
 
+def _msg_size_too_large() -> KafkaException:
+    err = MagicMock()
+    err.code = MagicMock(return_value=KafkaError.MSG_SIZE_TOO_LARGE)
+    return KafkaException(err)
+
+
 @pytest.mark.parametrize(
     ("error", "code"),
     [
@@ -81,6 +88,7 @@ def test_invalid_flags(args: list[str]) -> None:
         (CDCInvalidCursorError("invalid"), 3),
         (CDCTerminalError("old", code=1007), 3),
         (CDCTerminalError("collision", code=2000), 3),
+        (_msg_size_too_large(), 3),
     ],
 )
 def test_exit_codes(error: Exception | None, code: int) -> None:
@@ -106,6 +114,18 @@ def test_start_failure_cleanup() -> None:
     with pytest.raises(RuntimeError, match="start failed"):
         run_daemon(bridge)
     bridge.stop.assert_called_once()
+
+
+def test_stop_failure_preserves_worker_error() -> None:
+    bridge = MagicMock()
+    bridge.config = from_dict({"cdc": {"stream_name": "s"}})
+    bridge.start.side_effect = StartupError("range mismatch")
+    bridge.stop.side_effect = TimeoutError("teardown stalled")
+    previous = signal.getsignal(signal.SIGTERM)
+    with pytest.raises(StartupError, match="range mismatch"):
+        run_daemon(bridge)
+    bridge.stop.assert_called_once()
+    assert signal.getsignal(signal.SIGTERM) == previous
 
 
 def test_sigterm_requests_shutdown_and_cleans_up() -> None:

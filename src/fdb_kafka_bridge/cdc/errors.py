@@ -54,6 +54,7 @@ class CDCTerminalError(CDCConsumeError):
 
     Raised for ``transaction_too_old`` (1007) and ``client_invalid_operation``
     (2000). 1007 means required history is unavailable and needs operator
-    recovery. The listener retries 2000 only on the first consume after resume,
-    within the configured proxy poll timeout; later occurrences are terminal.
+    recovery. The listener retries 2000 only on the first consume of each new
+    handle, within the configured proxy poll timeout; later occurrences are
+    terminal.
     """
