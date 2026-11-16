@@ -38,6 +38,10 @@ CLAUDE.local.md
 .DS_Store
 Thumbs.db
 
+# Local git worktrees + one-off cleanup backups (never commit checkouts)
+.worktrees/
+.worktree-backup/
+
 # FDB build artifacts (external drive binaries — not for version control)
 fdb-dist/
 
