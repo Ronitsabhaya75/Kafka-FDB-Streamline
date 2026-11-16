@@ -789,3 +789,72 @@ def test_coalesced_idle_watermark_survives_ack_timeout() -> None:
     assert not listener.awaiting_ack
     assert listener._skipped_idle_replies == 0
     assert consumer.consume.call_count == 2
+
+
+def test_ack_retry_waits_for_native_cancellation_completion() -> None:
+    import threading
+
+    listener, _, consumer = _listener_with_batch(
+        MockConsumeResult([], 100), ack_timeout_seconds=0.01
+    )
+    listener.poll_records()
+    cancel_requested = threading.Event()
+    completed = threading.Event()
+    waiting = threading.Event()
+    pending = MagicMock()
+    pending.is_ready.return_value = False
+    pending.cancel.side_effect = cancel_requested.set
+
+    def wait() -> None:
+        waiting.set()
+        assert completed.wait(2)
+        raise _FakeFDBError(1101)
+
+    pending.wait.side_effect = wait
+    consumer.acknowledge.side_effect = [pending, MagicMock()]
+    failures = []
+
+    def acknowledge() -> None:
+        try:
+            listener.acknowledge()
+        except CDCRetryableError as exc:
+            failures.append(exc)
+
+    worker = threading.Thread(target=acknowledge)
+    worker.start()
+    try:
+        assert cancel_requested.wait(2)
+        assert waiting.wait(2)
+        assert worker.is_alive()
+        assert listener._pending_future is pending
+        assert not failures
+        consumer.acknowledge.assert_called_once()
+    finally:
+        completed.set()
+        worker.join(2)
+    assert not worker.is_alive()
+    assert len(failures) == 1
+    assert listener.awaiting_ack
+    listener.acknowledge()
+    assert consumer.acknowledge.call_count == 2
+    consumer.consume.assert_called_once()
+
+
+@pytest.mark.parametrize("code", [None, 1007, 1211])
+def test_ack_timeout_preserves_result_racing_with_cancellation(
+    code: int | None,
+) -> None:
+    listener, _, consumer = _listener_with_batch(
+        MockConsumeResult([], 100), ack_timeout_seconds=0.001
+    )
+    listener.poll_records()
+    future = MagicMock()
+    future.is_ready.return_value = False
+    future.wait.side_effect = None if code is None else _FakeFDBError(code)
+    consumer.acknowledge.return_value = future
+    error_type = CDCTerminalError if code == 1007 else CDCRetryableError
+    with pytest.raises(error_type) as error:
+        listener.acknowledge()
+    future.cancel.assert_called_once()
+    future.wait.assert_called_once()
+    assert error.value.code == code

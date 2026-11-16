@@ -34,7 +34,14 @@ streamline-daemon --stream-name orders --subspace-prefix orders: \
 The CLI publishes to `fdb.cdc.orders` and saves a sink-checked FDB cursor before
 acknowledging each delivered reply. Run one replica per stream (`replicas: 1`,
 Kubernetes `strategy: Recreate`); overlapping replicas fence each other but cannot
-retract in-flight Kafka records. Configuration, recovery and live tests:
+retract in-flight Kafka records.
+
+This daemon requires a patched native FDB client
+containing [FoundationDB #14351](https://github.com/apple/foundationdb/pull/14351);
+the unpatched 8.0.0 client pinned by the development Dockerfile does not qualify.
+See [native client minimum](docs/FDB-CHECKPOINT-SPEC.md#native-client-minimum) for the
+exact `release-8.0` revision and artifact verification requirements.
+Configuration, recovery and live tests:
 [`FDB checkpoints and CLI`](docs/FDB-CHECKPOINT-SPEC.md).
 
 ## Contributing

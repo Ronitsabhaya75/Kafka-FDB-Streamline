@@ -191,3 +191,50 @@ def test_signal_during_startup_uses_total_join_deadline() -> None:
         assert signal.getsignal(signal.SIGTERM) == previous
     finally:
         release.set()
+
+
+@pytest.mark.parametrize("phase", ["start", "run"])
+@pytest.mark.parametrize(
+    "error", [StartupError("unsafe stream"), RuntimeError("worker failed")]
+)
+def test_worker_error_survives_teardown_failure(
+    phase: str, error: Exception, caplog: pytest.LogCaptureFixture
+) -> None:
+    bridge = MagicMock()
+    bridge.config = from_dict({"cdc": {"stream_name": "s"}})
+    getattr(bridge, phase).side_effect = error
+    bridge.stop.side_effect = TimeoutError("teardown expired")
+    previous = signal.getsignal(signal.SIGTERM)
+    with pytest.raises(type(error)) as raised:
+        run_daemon(bridge)
+    assert raised.value is error
+    assert "Bridge teardown failed" in caplog.text
+    assert "teardown expired" in caplog.text
+    assert signal.getsignal(signal.SIGTERM) == previous
+
+
+@pytest.mark.parametrize(
+    "error,expected",
+    [(StartupError("unsafe"), 3), (CheckpointWriteError("FDB timeout"), 1)],
+)
+def test_main_preserves_worker_exit_code_when_stop_fails(
+    error: Exception, expected: int, caplog: pytest.LogCaptureFixture
+) -> None:
+    bridge = MagicMock()
+    bridge.config = from_dict({"cdc": {"stream_name": "s"}})
+    bridge.start.side_effect = error
+    bridge.stop.side_effect = TimeoutError("teardown expired")
+    with patch("fdb_kafka_bridge.bridge.cli.Bridge", return_value=bridge):
+        assert main(["--stream-name", "s"]) == expected
+    assert str(error) in caplog.text
+    assert "teardown expired" in caplog.text
+
+
+def test_teardown_error_propagates_when_worker_succeeds() -> None:
+    bridge = MagicMock()
+    bridge.config = from_dict({"cdc": {"stream_name": "s"}})
+    error = TimeoutError("teardown expired")
+    bridge.stop.side_effect = error
+    with pytest.raises(TimeoutError) as raised:
+        run_daemon(bridge)
+    assert raised.value is error

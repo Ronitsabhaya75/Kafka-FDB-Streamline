@@ -96,9 +96,9 @@ def test_transaction_timeout_is_wrapped(store: CheckpointStore) -> None:
         time.sleep(0.01)
         tr.get(b"bridge-timeout-test").wait()
 
-    with pytest.raises(CheckpointError) as error:
+    with pytest.raises(CheckpointWriteError) as error:
         store.run_transaction(expired)
-    assert not isinstance(error.value, CheckpointWriteError)
+    assert error.value.__cause__.code == 1031
 
 
 def test_retry_conflict_and_exhaustion(store: CheckpointStore) -> None:
@@ -296,7 +296,7 @@ def test_nonretryable_native_error_is_fatal(store: CheckpointStore) -> None:
     assert calls == 1
 
 
-@pytest.mark.parametrize("code", [1031, 1020])
+@pytest.mark.parametrize("code", [1031, 1020, 2004])
 def test_error_during_backoff_is_classified(
     store: CheckpointStore, monkeypatch: pytest.MonkeyPatch, code: int
 ) -> None:
@@ -314,4 +314,55 @@ def test_error_during_backoff_is_classified(
 
     with pytest.raises(CheckpointError) as error:
         store.run_transaction(conflict)
-    assert isinstance(error.value, CheckpointWriteError)
+    assert isinstance(error.value, CheckpointWriteError) is (code in (1031, 1020))
+
+
+def test_timeout_save_retries_checkpoint_without_republication(
+    store: CheckpointStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import time
+    from collections.abc import Callable
+    from unittest.mock import MagicMock
+
+    from fdb_kafka_bridge.bridge.pipeline import BridgePipeline
+    from fdbkafka.cdc.v1 import mutations_pb2
+
+    store.open()
+    store.claim(b"s")
+    run_transaction = store.run_transaction
+    first = True
+
+    def timeout_once(operation: Callable[[Any], Any], *, write: bool = False) -> Any:
+        nonlocal first
+        if first and write:
+            first = False
+
+            def expired(tr: Any) -> Any:
+                tr.options.set_timeout(1)
+                time.sleep(0.01)
+                return operation(tr)
+
+            return run_transaction(expired, write=write)
+        return run_transaction(operation, write=write)
+
+    monkeypatch.setattr(store, "run_transaction", timeout_once)
+    listener, producer = MagicMock(), MagicMock()
+    listener.raw_stream_name = b"s"
+    listener.poll_records.return_value = [
+        mutations_pb2.FDBMutationRecord(stream_name="s")
+    ]
+    listener.get_position.return_value = CheckpointCursor(1, 10)
+    producer.transactional = False
+    pipeline = BridgePipeline(
+        listener, producer, "topic", lambda cursor: store.save(b"s", cursor)
+    )
+    with pytest.raises(CheckpointWriteError) as error:
+        pipeline.step()
+    assert error.value.__cause__.code == 1031
+    listener.acknowledge.assert_not_called()
+    assert store.load(b"s") is None
+    assert pipeline.step() == 1
+    listener.poll_records.assert_called_once()
+    producer.produce.assert_called_once()
+    listener.acknowledge.assert_called_once()
+    assert store.load(b"s") == CheckpointCursor(1, 10)

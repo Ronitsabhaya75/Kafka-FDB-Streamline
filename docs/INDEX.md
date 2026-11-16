@@ -4,7 +4,7 @@ Map of the project's docs. Check here before reading docs wholesale, then open o
 
 | Doc | Read it for |
 |-----|-------------|
-| [`../README.md`](../README.md) | Setup, installation and durable bridge CLI invocation. |
+| [`../README.md`](../README.md) | Setup, installation, durable bridge CLI invocation and patched native-client requirement. |
 | [`../Proposal.md`](../Proposal.md) | Project scope, goals, architecture, sponsor requirements |
 | [`conventions.md`](conventions.md) | Repo layout, branching, code style, local setup (incl. Trello MCP), PR rules |
 | [PR review skill](../.agents/skills/review-streamline-pr/SKILL.md) | Agent workflow for reviewing a pull request and drafting source-linked feedback. |
@@ -13,7 +13,7 @@ Map of the project's docs. Check here before reading docs wholesale, then open o
 | [`KAFKA-PRODUCER-SPEC.md`](KAFKA-PRODUCER-SPEC.md) | `fdb_kafka_bridge.kafka.MutationProducer` contract: mandatory durability settings, transactional mode, sticky errors, fatal and closed states, close behaviour (purge and release), flush_or_raise, cluster identity lookup, record-size limits and headroom, and local Kafka verification commands. |
 | [`SERIALIZATION-SPEC.md`](SERIALIZATION-SPEC.md) | `src/fdb_kafka_bridge/serialization/` contract: public API, wire mapping, input rules, errors and decode failures, reader contract for a version group |
 | [`BRIDGE-PIPELINE-SPEC.md`](BRIDGE-PIPELINE-SPEC.md) | `fdb_kafka_bridge.bridge` contract: `BridgePipeline` single-step coordinator and `Bridge` autonomous daemon (strict configuration incl. `transactional_id` and record-size validation, producer wiring, durable stream-checked cursor persistence, recovery and rebuild retry, one total shutdown deadline, permanent `MSG_SIZE_TOO_LARGE`, caller checklist incl. the `commit_outstanding` rule), FDB checkpoint backend and production CLI. |
-| [`CDC-CONSUMER-SPEC.md`](CDC-CONSUMER-SPEC.md) | `src/fdb_kafka_bridge/cdc/` contract: FDBClient, stream lifecycle, bounded record polling with derived per-stream record caps, opt-in idle-reply ack coalescing, retention-checked resume, bounded acknowledgement, consume cancellation, durable checkpoint exports |
+| [`CDC-CONSUMER-SPEC.md`](CDC-CONSUMER-SPEC.md) | `src/fdb_kafka_bridge/cdc/` contract: FDBClient, stream lifecycle, bounded record polling with derived per-stream record caps, opt-in idle-reply ack coalescing, retention-checked resume, bounded acknowledgement with cancellation completion, consume cancellation, durable checkpoint exports |
 | [`../demo/README.md`](../demo/README.md) | Live 10,000-mutation bridge demo: prerequisites, Docker Compose setup, CLI flags. |
-| [`FDB-CHECKPOINT-SPEC.md`](FDB-CHECKPOINT-SPEC.md) | Stable subspace checkpoints, owner-epoch fencing, retention guards, FDB error classification, bounded ack/shutdown, CLI and live verification. |
+| [`FDB-CHECKPOINT-SPEC.md`](FDB-CHECKPOINT-SPEC.md) | Stable subspace checkpoints, owner-epoch fencing, retention guards, transient transaction timeouts, ack cancellation completion, worker-error precedence, patched native-client minimum, card/backend scope, offline reset runbook, CLI and live verification. |
 | [`../benchmarks/0.1.0v/README.md`](../benchmarks/0.1.0v/README.md) | v0.1.0 end-to-end benchmarks: 10-min sustained run (9.45M muts core loop, -0.049 backlog slope), 58,417 mut/s unthrottled throughput, and 6,537 atomic checkpoints. |

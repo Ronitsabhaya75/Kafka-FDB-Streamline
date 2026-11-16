@@ -3,7 +3,41 @@
 Contract for `fdb_kafka_bridge.cdc.checkpoint`, `bridge.startup`, and `bridge.cli`.
 Related: [bridge state machine](BRIDGE-PIPELINE-SPEC.md),
 [CDC listener](CDC-CONSUMER-SPEC.md), [producer](KAFKA-PRODUCER-SPEC.md).
-Trello: [Wire FDB Listener into Kafka Mutation Producer](https://trello.com/c/IidPiFIp).
+Trello: [FoundationDB Commit Version Checkpointing](https://trello.com/c/QmqdoJy5)
+(card #59; daemon card #61 is only partially covered).
+
+## Scope and card alignment
+
+This change covers card #59's FDB checkpoint backend and sink validation, building on
+the existing listener-to-Kafka pipeline from card #29. It does not complete card #61.
+The signal-aware `streamline-daemon` / `python -m fdb_kafka_bridge.bridge` entrypoints
+are included; JSON `--config`, `--checkpoint-backend`, an observability listen address,
+and the package-root `python -m fdb_kafka_bridge` entrypoint remain daemon follow-ups.
+
+A shared file/FDB checkpoint-store interface is deferred. `cdc.cursor_file` retains its
+existing helpers for local/development use; it does not provide the FDB backend's sink
+validation or ownership fence. Use `cdc.checkpoint_path` for the durable daemon. No
+automatic migration between file and FDB progress is provided.
+
+## Native client minimum
+
+The durable bridge requires an API-800 native `libfdb_c` build containing
+[FoundationDB #14351](https://github.com/apple/foundationdb/pull/14351), which fixes
+an `onMainThread` completion-lifetime race during client-thread future release.
+For `release-8.0`, the minimum source revision is
+[`edc84bc37975fa83a3665bcd28b500838654b108`](https://github.com/apple/foundationdb/commit/edc84bc37975fa83a3665bcd28b500838654b108),
+or a descendant/backport containing that fix. The upstream mainline fix is
+`1ac38607cf0181f5ffd27b494f93e305fd84f4c9`.
+
+The unpatched **8.0.0 release binaries do not meet this requirement**. The repository's
+Dockerfile still pins those binaries as a development/CI fixture; it is not a supported
+production image for the durable bridge. Supply a patched native client before deploying
+this daemon. The Python `foundationdb` package version alone does not identify whether
+`libfdb_c` contains the fix, and installing/upgrading that package does not patch the
+native library. Verify the source revision or vendor backport provenance of the actual
+client artifact, retaining its checksum with the deployment. No runtime check currently
+verifies this provenance. Passing bridge or cancellation tests does not prove an
+unpatched client is free of the race.
 
 ## Delivery boundary
 
@@ -66,6 +100,13 @@ Subspace: `Subspace(("fdb-kafka-bridge", "checkpoints"))`.
 Key: `subspace.pack((raw_stream_name,))`.
 Value: tuple-packed `(1, stream_id, last_consumed_version, kafka_cluster_id, topic)`.
 
+The stream name is intentionally stored in the key, rather than duplicated in the value;
+startup separately checks the checkpoint's registration ID against that named stream.
+There is no `updated_by_instance` audit field in the cursor value. Process identity is
+kept in the separate owner record's random token for fencing, not as a human-readable
+writer history. A separate last-writer audit field remains a follow-up; deployments
+still require one active process per stream.
+
 `SinkIdentity` uses Kafka's broker-reported cluster ID, obtained through
 `MutationProducer.cluster_id(timeout)`, plus the configured topic **name**. Bootstrap
 addresses are not an identity: several addresses may name the same cluster. Missing
@@ -76,8 +117,8 @@ guesses which sink received earlier records.
 
 Topic ID (KIP-516) is intentionally not stored. Deleting a topic and recreating it under
 the same name still matches the checkpoint, so the bridge resumes and the new topic never
-receives earlier history. Operators who recreate a topic must delete or migrate the
-checkpoint and plan an explicit replay/backfill. Extending the sink record later would
+receives earlier history. Operators who recreate a topic must plan an explicit replay/backfill before changing
+the checkpoint; deleting progress alone cannot restore acknowledged history. Extending the sink record later would
 require a new cursor format version.
 
 The prefix is deterministic and does not use Directory Layer allocation. Directory
@@ -114,24 +155,21 @@ Every save is an optimistic FDB transaction that reads the stored value before w
 | Older stored version | Advance |
 
 Transactions have configurable total timeout and retry limit, defaulting to five seconds
-and ten retries. Exhausted retryable native errors become `CheckpointWriteError` and
-prevent ack while allowing phase-only retry. Transaction timeout (1031) is also a
-`CheckpointWriteError` (FDB does not retry it): the current phase retries, and the CLI
-maps exhaustion to exit 1 so a supervisor can restart. Other native non-retryable errors
-become permanent `CheckpointError` and stop the bridge (CLI exit 3).
+and ten retries. Exhausted retryable native errors and transaction timeout (1031)
+become `CheckpointWriteError` and prevent ack while allowing phase-only retry in a new
+transaction. FDB's native retry predicate excludes 1031 because the timed-out transaction
+cannot be reused; the bridge can safely retry the idempotent operation in a fresh one.
+Other native non-retryable errors become permanent `CheckpointError` and stop the bridge.
 FDB's predicate receives the native exception; `on_error` receives its integer code.
 Cursors resume as-is, without adding one. The listener waits for the read version and
 re-acknowledges the saved cursor before consuming.
 
-Ack and consume futures that time out are cancelled, then `wait()`'d so the native
-outstanding-operation flag clears before the next call (swallowing `operation_cancelled`
-/ 1101). Without that wait, a quick retry can fail locally with 2000 and exit 3.
-
-Cancelling futures off the FDB network thread races in client builds that lack
-[apple/foundationdb#14351](https://github.com/apple/foundationdb/pull/14351). This
-project still ships FoundationDB **8.0.0** binaries (see `Dockerfile` `FDB_VERSION`);
-operators must treat a client that includes #14351 as the minimum once a tagged release
-contains it, or accept the allocator-corruption risk on 8.0.0 under cancel-heavy load.
+`run_transaction()` waits for `commit().wait()` before returning and only then reaches
+its `finally: tr.cancel()`. That cleanup cannot roll back a confirmed commit. Cancelling
+while a commit outcome is still unknown is different: the write may have committed,
+which is why equal-cursor saves and claim-token reconciliation remain required. See
+[FoundationDB transaction cancellation](https://apple.github.io/foundationdb/api-python.html#fdb.Transaction.cancel).
+The live save/load and commit-unknown tests exercise cleanup with the shipped binding.
 
 ## Startup guards
 
@@ -196,8 +234,12 @@ signal handlers. The first signal establishes one monotonic deadline shared by c
 and worker join. The default CLI budget is 20 seconds; configure the supervisor or
 Kubernetes termination grace period above that budget (the Kubernetes default is 30s).
 A parked consume future is explicitly cancelled before waiting for the step lock.
-Ack futures have their own bounded timeout and are cancelled on expiry, preserving
-checkpoint-before-ack ordering. Teardown never closes handles concurrently with a step.
+Ack futures have their own timeout. On expiry the listener requests cancellation and
+waits for the future to settle before allowing another operation on that handle. Only
+1101 (`operation_cancelled`) is swallowed; another native result/error is preserved.
+Cancellation completion can extend the ack wait beyond its timeout; the separate total
+shutdown deadline still bounds CLI teardown. Checkpoint-before-ack ordering is preserved.
+Teardown never closes handles concurrently with a step.
 An unresponsive dependency causes `TimeoutError` at the total deadline; outstanding
 worker/cleanup threads are daemon threads, so they cannot hold the CLI process open.
 The daemon never removes streams or deletes checkpoints on shutdown.
@@ -213,13 +255,40 @@ or exhausted checkpoint write retries (including 1031), 2 for invalid configurat
 3 for deterministic startup/checkpoint/CDC refusals and permanent Kafka
 `MSG_SIZE_TOO_LARGE`. Regression, fencing, invalid resume cursors (also on rebuild),
 unsupported multi-range streams and 1007 refusals require operator action rather than
-automatic retries. If `Bridge.stop()` fails after the worker already failed, the CLI
-preserves and raises the worker's error (logged stop failure does not replace exit 3).
+automatic retries.
+
+A worker failure takes precedence over a secondary `stop()` failure: teardown errors are
+logged, but the original worker error and its exit code are preserved. A teardown failure
+without a worker error remains a runtime failure with exit 1. Checkpoint transaction
+timeouts during startup likewise return 1; in the run loop they retry the current phase.
+
+## Operator recovery: checkpoint reset
+
+`CheckpointStore.delete(stream_name)` is an offline operator API. It deletes only the
+cursor key, does not check ownership, and is not exposed by the CLI. Never use it to
+bypass a live owner's checks or to make a sink mismatch disappear during normal startup.
+
+1. Stop every bridge process for the stream and disable supervisor restarts. A takeover
+   alone is insufficient: an old process can still have Kafka output in flight.
+2. Preserve the cursor bytes, owner bytes, stream registration/range/retention metadata,
+   and original Kafka sink identity before changing anything. Determine whether the
+   target is the original topic, a recreated topic, or a different destination.
+3. Establish the required replay/backfill source and downstream dedup/reset plan. FDB
+   may already have released acknowledged history. If that history is needed, restore
+   it from an independent snapshot/log or backfill before choosing a safe resume point.
+   Deleting a cursor or re-registering a stream does not recreate that history.
+4. Prefer restoring/migrating a verified checkpoint belonging to the same stream and
+   sink. If intentionally resetting, open a store with the same `checkpoint_path` and
+   call `delete(raw_stream_name)` only after accepting startup from the stream's current
+   `min_version`. Leave the owner key intact; the replacement process claims a new epoch.
+   Corrupt/incompatible owner data requires a separately planned offline migration.
+5. Start one bridge process against the agreed sink and verify end-to-end progress and
+   downstream state before re-enabling automatic restarts. Keep the preserved metadata
+   with the recovery record.
 
 ## Scope and verification
 
-Use `replicas: 1` and `strategy: Recreate` for Kubernetes deployments (also document this
-in the README next to the CLI). Owner fencing protects checkpoint writes during
+Use `replicas: 1` and `strategy: Recreate` for Kubernetes deployments. Owner fencing protects checkpoint writes during
 accidental overlap, but cannot retract old in-flight Kafka records or native
 acknowledgements. There are no leases, heartbeats or automatic multi-pod failover in this
 backend. All deployments of a stream must use the same checkpoint path and sink. A sink

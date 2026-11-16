@@ -175,6 +175,14 @@ for the storage layout, overlap guards and bridge integration.
 Resume checks the current stream registration and requires `cursor + 1 >= min_version`
 before restoring an ack. A stale cursor raises `CDCInvalidCursorError`. Both restored
 and normal ack futures use `ack_timeout_seconds`; expiry explicitly cancels the future
-and leaves the delivered reply pending for retry. `cancel_pending()` prevents new
-operations and cancels a parked consume. `close()` cancels any pending future before
+and waits for cancellation completion before returning a retryable timeout. Only native
+1101 (`operation_cancelled`) is suppressed; a racing success still permits safe ack
+retry, while other native errors keep their original classification. The delivered
+reply remains pending for retry. Waiting for cancellation can exceed the ack timeout;
+the daemon's separate total shutdown deadline still bounds process teardown.
+`cancel_pending()` prevents new operations and cancels a parked consume. `close()` cancels any pending future before
 releasing the handle; closing the native handle alone does not cancel a consume.
+
+Native-client deployment requirements, including the `release-8.0` future-lifetime
+fix required for off-network-thread cancellation/release, are in
+[FDB checkpoint specification](FDB-CHECKPOINT-SPEC.md#native-client-minimum).

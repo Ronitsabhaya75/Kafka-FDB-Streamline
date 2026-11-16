@@ -128,6 +128,7 @@ def run_daemon(bridge: Bridge) -> None:
     handlers: dict[signal.Signals, Any] = {}
     worker: threading.Thread | None = None
     shutdown_deadline: float | None = None
+    teardown_error: Exception | None = None
 
     def request_stop(signum: int, frame: FrameType | None) -> None:
         nonlocal shutdown_deadline
@@ -161,10 +162,9 @@ def run_daemon(bridge: Bridge) -> None:
             )
         try:
             bridge.stop(deadline=shutdown_deadline)
-        except Exception:
-            # Prefer the worker's failure over a teardown error so exit codes
-            # and logs reflect the original refusal (e.g. StartupError → 3).
-            logger.exception("Bridge stop failed during daemon teardown")
+        except Exception as exc:
+            teardown_error = exc
+            logger.exception("Bridge teardown failed")
         finally:
             if worker is not None:
                 worker.join(max(0, shutdown_deadline - time.monotonic()))
@@ -172,6 +172,8 @@ def run_daemon(bridge: Bridge) -> None:
                 signal.signal(sig, handler)
     if failures:
         raise failures[0]
+    if teardown_error is not None:
+        raise teardown_error
     if worker is not None and worker.is_alive():
         raise RuntimeError("Bridge worker did not stop within the shutdown budget")
 
@@ -198,9 +200,12 @@ def main(argv: list[str] | None = None) -> int:
     ):
         logger.exception("Unsafe startup or checkpoint; operator action required")
         return 3
-    except CheckpointError as exc:
+    except CheckpointWriteError:
+        logger.exception("Transient checkpoint failure")
+        return 1
+    except CheckpointError:
         logger.exception("Checkpoint failure; operator action required")
-        return 1 if isinstance(exc, CheckpointWriteError) else 3
+        return 3
     except CDCTerminalError as exc:
         logger.exception("Terminal CDC refusal")
         return 3 if exc.code in (1007, 2000) else 1
