@@ -13,7 +13,13 @@ import uuid
 from collections.abc import Iterator
 
 import pytest
-from confluent_kafka import Consumer, KafkaException, TopicPartition
+from confluent_kafka import (
+    OFFSET_BEGINNING,
+    Consumer,
+    KafkaError,
+    KafkaException,
+    TopicPartition,
+)
 from confluent_kafka.admin import AdminClient, NewTopic
 
 from fdb_kafka_bridge.bridge.pipeline import BridgePipeline
@@ -93,6 +99,19 @@ def _consume_n(
         if msg is None:
             continue
         if msg.error():
+            if (
+                msg.error().code()
+                in (
+                    KafkaError._PARTITION_EOF,
+                    KafkaError.UNKNOWN_TOPIC_OR_PART,
+                    KafkaError.NOT_COORDINATOR,
+                    KafkaError.COORDINATOR_LOAD_IN_PROGRESS,
+                    KafkaError.COORDINATOR_NOT_AVAILABLE,
+                )
+                or msg.error().retriable()
+            ):
+                time.sleep(0.1)
+                continue
             raise KafkaException(msg.error())
         found.append((msg.partition(), msg.key()))
     if len(found) < count:
@@ -139,7 +158,10 @@ def test_step_places_batch_on_one_partition(topic: str) -> None:
         assert listener.acked is True
 
         consumer.assign(
-            [TopicPartition(topic, partition) for partition in range(PARTITIONS)]
+            [
+                TopicPartition(topic, partition, OFFSET_BEGINNING)
+                for partition in range(PARTITIONS)
+            ]
         )
         placed = _consume_n(consumer, RECORD_COUNT)
     finally:
