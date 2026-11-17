@@ -1,6 +1,7 @@
 """Durable, identity-checked CDC cursors stored outside captured key ranges."""
 
 import math
+import struct
 from collections.abc import Callable
 from dataclasses import dataclass
 from importlib import import_module
@@ -332,7 +333,7 @@ class CheckpointStore:
             ):
                 raise ValueError("invalid owner")
             return fields[1], fields[2]
-        except (ValueError, TypeError, IndexError) as exc:
+        except (ValueError, TypeError, IndexError, struct.error) as exc:
             raise CheckpointFormatError("Invalid checkpoint owner") from exc
 
     def _check_owner(self, tr: Any, stream_name: bytes) -> None:
@@ -358,7 +359,7 @@ class CheckpointStore:
                     f"Stored sink {stored_sink}; configured sink {self.sink}"
                 )
             return CheckpointCursor(fields[1], fields[2])
-        except (ValueError, TypeError, IndexError, OverflowError) as exc:
+        except (ValueError, TypeError, IndexError, OverflowError, struct.error) as exc:
             raise CheckpointFormatError("Invalid checkpoint data") from exc
 
     def load(self, stream_name: bytes) -> CheckpointCursor | None:

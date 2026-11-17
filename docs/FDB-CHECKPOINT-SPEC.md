@@ -39,7 +39,35 @@ client artifact, retaining its checksum with the deployment. No runtime check cu
 verifies this provenance. Passing bridge or cancellation tests does not prove an
 unpatched client is free of the race.
 
+To obtain a patched client, build `release-8.0` at the revision above or a verified
+later descendant using the [upstream build environment and prerequisites](https://github.com/apple/foundationdb/blob/release-8.0/README.md#compiling-from-source).
+The upstream `foundationdb/build` container supplies the compiler/toolchain dependencies;
+the commands below assume that environment (or an equivalently provisioned host):
+
+```bash
+git clone --branch release-8.0 https://github.com/apple/foundationdb.git foundationdb
+git -C foundationdb checkout edc84bc37975fa83a3665bcd28b500838654b108
+CC=clang CXX=clang++ LD=lld cmake -S foundationdb -B fdb-build -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release -DUSE_LD=LLD -DUSE_LIBCXX=1
+cmake --build fdb-build --target fdb_c
+```
+
+Install the resulting native library (`libfdb_c.so` on Linux, `libfdb_c.dylib` on macOS)
+from the build tree into the bridge runtime's library search path, replacing the
+unpatched client there. Record `git -C foundationdb rev-parse HEAD` and the installed
+artifact's checksum. Keep the API-800 Python bindings and a CDC-enabled FDB cluster;
+building the client does not install the Python package or enable server-side CDC.
+A vendor build is also suitable if its provenance confirms this fix. These are upstream
+build instructions, not an assertion that this repository builds or ships that artifact.
+
 ## Delivery boundary
+
+Only **unordered native CDC streams** are supported. Ordered streams are unsupported,
+even with a single partition: ack cancellation may reset their native cursor backwards,
+so a successful ack retry can be followed by replay below the stored checkpoint and a
+fatal `CheckpointRegressionError`. Stream metadata does not expose ordered mode, so this
+restriction is currently an operator precondition, not a reliable startup rejection.
+Rejecting ordered streams or checking post-retry position remains follow-up work.
 
 The FDB backend extends the existing `Bridge` and `BridgePipeline`. Both producer modes
 retain their existing ordering:
@@ -187,6 +215,12 @@ Before stream registration or checkpoint advancement:
    missing history. The native 1007 refusal is also terminal if retention changes later.
 5. Require an explicit range if the stream does not exist; only then register it.
 
+Ownership is claimed before the saved stream ID and resume cursor are validated.
+Consequently a starter that later fails either check still evicts the live owner: the
+old owner's next ownership check/save fails, even though the replacement also stopped.
+This is a known availability limitation. Keep one active starter and use `Recreate`;
+pre-validating an unclaimed read and rechecking after claim is follow-up work.
+
 An existing stream with no checkpoint logs a warning and uses cluster `min_version`.
 No startup check removes or re-registers an existing stream. If both registration and
 checkpoint are deleted, startup cannot detect the lost history and starts fresh.
@@ -285,6 +319,27 @@ bypass a live owner's checks or to make a sink mismatch disappear during normal 
 5. Start one bridge process against the agreed sink and verify end-to-end progress and
    downstream state before re-enabling automatic restarts. Keep the preserved metadata
    with the recovery record.
+
+After completing steps 1–3 above, an intentional offline reset can use the following
+library API. Replace the example values with the preserved deployment metadata; this
+snippet deletes progress and is not a backfill mechanism:
+
+```python
+from fdb_kafka_bridge.cdc import CheckpointStore, FDBClient, SinkIdentity
+
+with FDBClient(cluster_file="/etc/foundationdb/fdb.cluster") as client:
+    store = CheckpointStore(
+        client,
+        sink=SinkIdentity("original-kafka-cluster-id", "fdb.cdc.orders"),
+        path=("fdb-kafka-bridge", "checkpoints"),
+    )
+    store.open(create=False)
+    store.delete(b"orders")
+```
+
+The context manager opens and closes the FDB client. `store.open()` resolves the plain
+subspace without claiming ownership; `delete()` removes only this stream's cursor key.
+All bridge processes must remain stopped for this operation.
 
 ## Scope and verification
 

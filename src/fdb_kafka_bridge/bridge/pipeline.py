@@ -891,22 +891,28 @@ class Bridge:
         Other errors are retried with backoff. When one leaves the producer
         closed or fatal, or the listener unable to poll, the pipeline is rebuilt
         from the last checkpoint; a failed rebuild is itself retried.
+        Returns immediately if shutdown was requested, even after teardown.
 
         Raises:
-            RuntimeError: If called before :meth:`start`.
+            RuntimeError: If called before :meth:`start` without a shutdown request.
             CDCTerminalError: If FDB CDC encounters an unrecoverable stream error.
             KafkaException: If Kafka encounters a fatal unrecoverable error, or
                 rejects a record as larger than ``message.max.bytes``.
             ValueError: If a checkpoint or cursor file is permanently invalid
                 (``SerializationError`` excepted, which triggers a rebuild).
         """
-        if (
-            self._listener is None
-            or self._producer is None
-            or self._pipeline is None
-            or self._counting_listener is None
-        ):
-            raise RuntimeError("Bridge must be started before calling run()")
+        if self._shutdown_requested.is_set():
+            return
+        with self._step_lock:
+            if self._shutdown_requested.is_set():
+                return
+            if (
+                self._listener is None
+                or self._producer is None
+                or self._pipeline is None
+                or self._counting_listener is None
+            ):
+                raise RuntimeError("Bridge must be started before calling run()")
 
         backoff = self.config.pipeline.backoff_base_seconds
         rebuild_pending = False
@@ -920,6 +926,8 @@ class Bridge:
                     if rebuild_pending or self._pipeline is None:
                         self._rebuild_pipeline()
                         rebuild_pending = False
+                    if self._shutdown_requested.is_set():
+                        break
                     published = self._pipeline.step()
                     if published == 0:
                         records = []

@@ -22,7 +22,7 @@ pip install .
 
 Installs the `fdb-kafka-bridge` distribution, which provides the import packages `fdb_kafka_bridge` (subpackages `bridge`, `cdc`, `kafka`, `serialization`) and `fdbkafka` (generated Protobuf).
 
-`libfdb_c` is a system requirement that pip does not install. The `foundationdb` Python package depends on it at runtime: `import fdb` succeeds without it, but `fdb.api_version()` raises `Unable to locate the FoundationDB API shared library!`. Install the client library from the [FoundationDB release](https://github.com/apple/foundationdb/releases) that matches `FDB_VERSION` in the [`Dockerfile`](Dockerfile), which shows the Linux setup.
+`libfdb_c` is a system requirement that pip does not install. The `foundationdb` Python package depends on it at runtime: `import fdb` succeeds without it, but `fdb.api_version()` raises `Unable to locate the FoundationDB API shared library!`. For the durable bridge, install an API-800 native client containing the patch specified in [native client minimum and build instructions](docs/FDB-CHECKPOINT-SPEC.md#native-client-minimum). The 8.0.0 binary in the [`Dockerfile`](Dockerfile) is a development/CI fixture and does not meet that deployment minimum; matching its version alone is insufficient.
 
 ## Run the durable bridge
 

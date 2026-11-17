@@ -70,7 +70,7 @@ def test_live_store_guards_and_restart(store: CheckpointStore) -> None:
     assert store.load(b"s") is None
 
 
-@pytest.mark.parametrize("value", [b"bad", b"", b"\x15\x02", b"\x00"])
+@pytest.mark.parametrize("value", [b"bad", b"", b"\x15\x02", b"\x00", b"\x21\x00"])
 def test_corrupt_value_rejected(store: CheckpointStore, value: bytes) -> None:
     store.open()
     key = store.subspace.pack((b"s",))
@@ -181,7 +181,7 @@ def test_removed_owner_is_fatal(store: CheckpointStore) -> None:
         store.save(b"s", CheckpointCursor(1, 10))
 
 
-@pytest.mark.parametrize("value", [b"bad", b"", b"\x15\x01", b"\x00"])
+@pytest.mark.parametrize("value", [b"bad", b"", b"\x15\x01", b"\x00", b"\x21\x00"])
 def test_corrupt_owner_is_fatal(store: CheckpointStore, value: bytes) -> None:
     store.open()
     store.client.db[store.subspace.pack((b"s", "owner"))] = value
@@ -366,3 +366,30 @@ def test_timeout_save_retries_checkpoint_without_republication(
     producer.produce.assert_called_once()
     listener.acknowledge.assert_called_once()
     assert store.load(b"s") == CheckpointCursor(1, 10)
+
+
+@pytest.mark.parametrize("record", ["cursor", "owner"])
+def test_truncated_tuple_returns_terminal_cli_exit(
+    store: CheckpointStore, monkeypatch: pytest.MonkeyPatch, record: str
+) -> None:
+    from unittest.mock import MagicMock
+
+    from fdb_kafka_bridge.bridge.cli import main
+    from fdb_kafka_bridge.bridge.config import from_dict
+    from fdb_kafka_bridge.bridge.pipeline import Bridge
+
+    store.open()
+    key = (b"s",) if record == "cursor" else (b"s", "owner")
+    store.client.db[store.subspace.pack(key)] = b"\x21\x00"
+    config = from_dict(
+        {
+            "cdc": {"stream_name": "s", "begin_key": b"s/", "end_key": b"s0"},
+            "kafka": {"topic": "topic"},
+        }
+    )
+    producer = MagicMock()
+    producer.transactional = False
+    producer.cluster_id.return_value = "cluster"
+    bridge = Bridge(config, checkpoint_store=store, producer=producer)
+    monkeypatch.setattr("fdb_kafka_bridge.bridge.cli.Bridge", lambda config: bridge)
+    assert main(["--stream-name", "s"]) == 3
