@@ -117,8 +117,8 @@ message FDBMutationRecord {
     FDBDirectoryContext directory = 6;
 
     // Native CDC stream identifier (distinguishes deleted/recreated streams using the same name)
-    uint64 stream_id = 7;
+    optional uint64 stream_id = 7;
 
     // Stable operator-configured identity for the FDB source cluster/deployment
-    string source_id = 8;
+    optional string source_id = 8;
 }

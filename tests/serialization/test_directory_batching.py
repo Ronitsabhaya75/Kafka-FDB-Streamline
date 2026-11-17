@@ -5,6 +5,12 @@ from __future__ import annotations
 from typing import NamedTuple
 
 import pytest
+from google.protobuf import (
+    descriptor_pb2,
+    descriptor_pool,
+    message_factory,
+    timestamp_pb2,
+)
 
 from fdb_kafka_bridge.serialization.deserializer import deserialize_record
 from fdb_kafka_bridge.serialization.errors import SerializationError
@@ -222,6 +228,100 @@ def test_v010_old_record_new_reader_compatibility() -> None:
 
 
 def test_v020_new_record_old_reader_compatibility() -> None:
+    # Build an actual v0.1.0 prototype in an isolated descriptor pool that
+    # only defines fields 1-5 and has no knowledge of fields 6, 7, 8.
+    pool = descriptor_pool.DescriptorPool()
+    dp_ts = descriptor_pb2.FileDescriptorProto()
+    timestamp_pb2.DESCRIPTOR.CopyToProto(dp_ts)
+    pool.Add(dp_ts)
+
+    file_dp = descriptor_pb2.FileDescriptorProto()
+    file_dp.name = "fdbkafka/cdc/v1/mutations_legacy.proto"
+    file_dp.package = "fdbkafka.cdc.v1.legacy"
+    file_dp.syntax = "proto3"
+    file_dp.dependency.append("google/protobuf/timestamp.proto")
+
+    msg_vi = file_dp.message_type.add()
+    msg_vi.name = "FDBVersionIndex"
+    msg_vi.field.add(
+        name="fdb_version",
+        number=1,
+        type=descriptor_pb2.FieldDescriptorProto.TYPE_UINT64,
+        label=descriptor_pb2.FieldDescriptorProto.LABEL_OPTIONAL,
+    )
+    msg_vi.field.add(
+        name="sequence_no",
+        number=2,
+        type=descriptor_pb2.FieldDescriptorProto.TYPE_UINT32,
+        label=descriptor_pb2.FieldDescriptorProto.LABEL_OPTIONAL,
+    )
+
+    msg_skm = file_dp.message_type.add()
+    msg_skm.name = "FDBSingleKeyMutation"
+    msg_skm.field.add(
+        name="key",
+        number=1,
+        type=descriptor_pb2.FieldDescriptorProto.TYPE_BYTES,
+        label=descriptor_pb2.FieldDescriptorProto.LABEL_OPTIONAL,
+    )
+    msg_skm.field.add(
+        name="value",
+        number=2,
+        type=descriptor_pb2.FieldDescriptorProto.TYPE_BYTES,
+        label=descriptor_pb2.FieldDescriptorProto.LABEL_OPTIONAL,
+    )
+    msg_skm.field.add(
+        name="mutation_type",
+        number=3,
+        type=descriptor_pb2.FieldDescriptorProto.TYPE_INT32,
+        label=descriptor_pb2.FieldDescriptorProto.LABEL_OPTIONAL,
+    )
+
+    msg_m = file_dp.message_type.add()
+    msg_m.name = "FDBMutation"
+    msg_m.field.add(
+        name="version_index",
+        number=1,
+        type=descriptor_pb2.FieldDescriptorProto.TYPE_MESSAGE,
+        type_name=".fdbkafka.cdc.v1.legacy.FDBVersionIndex",
+        label=descriptor_pb2.FieldDescriptorProto.LABEL_OPTIONAL,
+    )
+    msg_m.field.add(
+        name="single_key_mutation",
+        number=2,
+        type=descriptor_pb2.FieldDescriptorProto.TYPE_MESSAGE,
+        type_name=".fdbkafka.cdc.v1.legacy.FDBSingleKeyMutation",
+        label=descriptor_pb2.FieldDescriptorProto.LABEL_OPTIONAL,
+    )
+
+    msg_rec = file_dp.message_type.add()
+    msg_rec.name = "FDBMutationRecord"
+    msg_rec.field.add(
+        name="stream_name",
+        number=1,
+        type=descriptor_pb2.FieldDescriptorProto.TYPE_STRING,
+        label=descriptor_pb2.FieldDescriptorProto.LABEL_OPTIONAL,
+    )
+    msg_rec.field.add(
+        name="bridge_timestamp",
+        number=2,
+        type=descriptor_pb2.FieldDescriptorProto.TYPE_MESSAGE,
+        type_name=".google.protobuf.Timestamp",
+        label=descriptor_pb2.FieldDescriptorProto.LABEL_OPTIONAL,
+    )
+    msg_rec.field.add(
+        name="mutation",
+        number=3,
+        type=descriptor_pb2.FieldDescriptorProto.TYPE_MESSAGE,
+        type_name=".fdbkafka.cdc.v1.legacy.FDBMutation",
+        label=descriptor_pb2.FieldDescriptorProto.LABEL_OPTIONAL,
+    )
+
+    pool.Add(file_dp)
+    legacy_cls = message_factory.GetMessageClass(
+        pool.FindMessageTypeByName("fdbkafka.cdc.v1.legacy.FDBMutationRecord")
+    )
+
     dir_ctx = FDBDirectoryContext(path=("legacy", "compat"), subspace_prefix=b"\x99")
     wire = serialize_mutation(
         _FakeNativeMutation(MutationType.SET_VALUE, b"\x99key", b"val"),
@@ -235,12 +335,14 @@ def test_v020_new_record_old_reader_compatibility() -> None:
     )
 
     # An old v0.1.0 reader parsing the wire into protobuf:
-    parsed = mutations_pb2.FDBMutationRecord.FromString(wire)
-    # Fields 1-5 decode perfectly
+    parsed = legacy_cls()
+    parsed.ParseFromString(wire)
+    # Fields 1-3 decode perfectly
     assert parsed.stream_name == "compat_stream"
-    assert parsed.WhichOneof("record") == "mutation"
     assert parsed.mutation.version_index.fdb_version == 6000
     assert parsed.mutation.single_key_mutation.key == b"\x99key"
+    # Unknown fields (6, 7, 8) are preserved upon re-serialization
+    assert len(parsed.SerializeToString()) == len(wire)
 
 
 def test_deduplication_identity() -> None:
@@ -267,3 +369,44 @@ def test_deduplication_identity() -> None:
     )
     # Legacy fallback: (fdb_version, sequence_no)
     assert legacy_deduplication_identity(rec.body) == (7000, 5)
+
+    # stream_id == 0 boundary test: must decode as 0, not None
+    wire_zero = serialize_mutation(
+        _FakeNativeMutation(MutationType.SET_VALUE, b"\x01key", b"val"),
+        fdb_version=7000,
+        sequence_no=5,
+        stream_name="stream_dedup",
+        bridge_timestamp_ns=1000,
+        directory=dir_ctx,
+        stream_id=0,
+        source_id="source-prod-0",
+    )
+    rec_zero = deserialize_record(wire_zero)
+    assert rec_zero.stream_id == 0
+    assert deduplication_identity(rec_zero, rec_zero.body) == (
+        "source-prod-0",
+        0,
+        7000,
+        5,
+    )
+
+    # stream_id == UINT64_MAX boundary test
+    uint64_max = (1 << 64) - 1
+    wire_max = serialize_mutation(
+        _FakeNativeMutation(MutationType.SET_VALUE, b"\x01key", b"val"),
+        fdb_version=7000,
+        sequence_no=5,
+        stream_name="stream_dedup",
+        bridge_timestamp_ns=1000,
+        directory=dir_ctx,
+        stream_id=uint64_max,
+        source_id="source-prod-max",
+    )
+    rec_max = deserialize_record(wire_max)
+    assert rec_max.stream_id == uint64_max
+    assert deduplication_identity(rec_max, rec_max.body) == (
+        "source-prod-max",
+        uint64_max,
+        7000,
+        5,
+    )

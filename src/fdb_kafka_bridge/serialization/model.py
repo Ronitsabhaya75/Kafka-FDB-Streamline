@@ -150,7 +150,7 @@ class LeaderLease:
     owner_instance_id: str
     lease_epoch: int
     heartbeat_sequence: int
-    expiration_timestamp_ns: int | None
+    expiration_timestamp_ns: int
 
 
 type DedupKey = tuple[str | None, int | None, int, int]

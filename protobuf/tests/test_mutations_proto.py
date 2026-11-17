@@ -796,8 +796,23 @@ class TestFDBMutationRecordV2Fields(unittest.TestCase):
         parsed = mutations_pb2.FDBMutationRecord.FromString(data)
         self.assertEqual(parsed.stream_name, "legacy_stream")
         self.assertFalse(parsed.HasField("directory"))
+        self.assertFalse(parsed.HasField("stream_id"))
+        self.assertFalse(parsed.HasField("source_id"))
+
+    def test_record_stream_id_zero_presence(self) -> None:
+        rec = mutations_pb2.FDBMutationRecord(
+            stream_name="zero_stream",
+            stream_id=0,
+            source_id="fdb-src",
+            version_end=mutations_pb2.VersionEnd(fdb_version=1000),
+        )
+        data = rec.SerializeToString()
+        parsed = mutations_pb2.FDBMutationRecord.FromString(data)
+        self.assertEqual(parsed.stream_name, "zero_stream")
+        self.assertTrue(parsed.HasField("stream_id"))
         self.assertEqual(parsed.stream_id, 0)
-        self.assertEqual(parsed.source_id, "")
+        self.assertTrue(parsed.HasField("source_id"))
+        self.assertEqual(parsed.source_id, "fdb-src")
 
 
 if __name__ == "__main__":

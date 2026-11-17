@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Final
+
 from google.protobuf.message import DecodeError
 from google.protobuf.timestamp_pb2 import Timestamp
 
@@ -18,20 +20,239 @@ from fdb_kafka_bridge.serialization.model import (
 )
 from fdbkafka.bridge.state.v1 import state_pb2
 
+CURRENT_FORMAT_VERSION: Final[int] = 1
+SUPPORTED_FORMAT_VERSIONS: Final[frozenset[int]] = frozenset({CURRENT_FORMAT_VERSION})
+UINT64_MAX: Final[int] = (1 << 64) - 1
+NANOS_PER_SECOND: Final[int] = 10**9
 
-def _timestamp_from_ns(timestamp_ns: int | None) -> Timestamp | None:
-    """Convert integer Unix nanoseconds to google.protobuf.Timestamp."""
+
+def _timestamp_from_ns(
+    timestamp_ns: int | None,
+    *,
+    field: str = "timestamp",
+) -> Timestamp | None:
+    """Convert integer Unix nanoseconds to google.protobuf.Timestamp.
+
+    Args:
+        timestamp_ns: Integer Unix nanoseconds since epoch, or None.
+        field: Name of the field for error reporting.
+
+    Returns:
+        google.protobuf.Timestamp or None.
+
+    Raises:
+        InputTypeError: If timestamp_ns is not int or None.
+        InputValueError: If timestamp_ns is negative.
+    """
     if timestamp_ns is None:
         return None
-    seconds, nanos = divmod(timestamp_ns, 10**9)
+    if type(timestamp_ns) is not int:
+        raise InputTypeError(
+            f"{field} must be int, got {type(timestamp_ns).__name__}",
+            field=field,
+        )
+    if timestamp_ns < 0:
+        raise InputValueError(
+            f"{field} must be non-negative int, got {timestamp_ns}",
+            field=field,
+        )
+    seconds, nanos = divmod(timestamp_ns, NANOS_PER_SECOND)
     return Timestamp(seconds=seconds, nanos=nanos)
 
 
-def _ns_from_timestamp(msg: Timestamp | None) -> int | None:
-    """Convert google.protobuf.Timestamp to integer Unix nanoseconds."""
-    if msg is None or not (msg.seconds or msg.nanos):
-        return None
-    return msg.seconds * 10**9 + msg.nanos
+def _ns_from_timestamp(msg: Timestamp) -> int:
+    """Convert google.protobuf.Timestamp to integer Unix nanoseconds.
+
+    Args:
+        msg: Protobuf Timestamp message.
+
+    Returns:
+        Integer nanoseconds since Unix epoch.
+
+    Raises:
+        RecordDecodeError: If timestamp is malformed or out of range.
+    """
+    if not (0 <= msg.nanos < NANOS_PER_SECOND):
+        raise RecordDecodeError(
+            f"Invalid timestamp nanos: {msg.nanos}",
+            reason=DecodeFailure.MALFORMED_WIRE,
+        )
+    if msg.seconds < 0:
+        raise RecordDecodeError(
+            f"Invalid timestamp seconds: {msg.seconds}",
+            reason=DecodeFailure.MALFORMED_WIRE,
+        )
+    return msg.seconds * NANOS_PER_SECOND + msg.nanos
+
+
+def validate_checkpoint_model(checkpoint: CDCCheckpoint) -> None:
+    """Validate a CDCCheckpoint model before serialization.
+
+    Args:
+        checkpoint: The CDCCheckpoint instance to validate.
+
+    Raises:
+        InputTypeError: If any field has an invalid Python type.
+        InputValueError: If any value is out of its permitted domain.
+    """
+    if not isinstance(checkpoint, CDCCheckpoint):
+        raise InputTypeError(
+            f"checkpoint must be CDCCheckpoint, got {type(checkpoint).__name__}",
+            field="checkpoint",
+        )
+    if type(checkpoint.format_version) is not int:
+        raise InputTypeError(
+            f"format_version must be int, got "
+            f"{type(checkpoint.format_version).__name__}",
+            field="format_version",
+        )
+    if checkpoint.format_version not in SUPPORTED_FORMAT_VERSIONS:
+        supported = sorted(SUPPORTED_FORMAT_VERSIONS)
+        raise InputValueError(
+            f"format_version must be in {supported}, got {checkpoint.format_version!r}",
+            field="format_version",
+        )
+    if not isinstance(checkpoint.source_id, str):
+        raise InputTypeError("source_id must be str", field="source_id")
+    if not checkpoint.source_id:
+        raise InputValueError("source_id must be non-empty str", field="source_id")
+
+    if not isinstance(checkpoint.stream_name, str):
+        raise InputTypeError("stream_name must be str", field="stream_name")
+    if not checkpoint.stream_name:
+        raise InputValueError("stream_name must be non-empty str", field="stream_name")
+
+    if type(checkpoint.stream_id) is not int:
+        raise InputTypeError("stream_id must be int", field="stream_id")
+    if not (0 <= checkpoint.stream_id <= UINT64_MAX):
+        raise InputValueError(
+            f"stream_id must be in 0..{UINT64_MAX}, got {checkpoint.stream_id}",
+            field="stream_id",
+        )
+
+    if type(checkpoint.last_consumed_version) is not int:
+        raise InputTypeError(
+            "last_consumed_version must be int", field="last_consumed_version"
+        )
+    if not (0 <= checkpoint.last_consumed_version <= UINT64_MAX):
+        raise InputValueError(
+            f"last_consumed_version must be in 0..{UINT64_MAX}, "
+            f"got {checkpoint.last_consumed_version}",
+            field="last_consumed_version",
+        )
+
+    if not isinstance(checkpoint.sink, KafkaSinkIdentity):
+        raise InputTypeError(
+            f"sink must be KafkaSinkIdentity, got {type(checkpoint.sink).__name__}",
+            field="sink",
+        )
+    if (
+        not isinstance(checkpoint.sink.cluster_id, str)
+        or not checkpoint.sink.cluster_id
+    ):
+        raise InputValueError("sink.cluster_id must be non-empty str", field="sink")
+    if not isinstance(checkpoint.sink.topic, str) or not checkpoint.sink.topic:
+        raise InputValueError("sink.topic must be non-empty str", field="sink")
+
+    if not isinstance(checkpoint.updating_instance_id, str):
+        raise InputTypeError(
+            "updating_instance_id must be str", field="updating_instance_id"
+        )
+    if not checkpoint.updating_instance_id:
+        raise InputValueError(
+            "updating_instance_id must be non-empty str",
+            field="updating_instance_id",
+        )
+
+    if checkpoint.update_timestamp_ns is not None:
+        if type(checkpoint.update_timestamp_ns) is not int:
+            raise InputTypeError(
+                "update_timestamp_ns must be int or None",
+                field="update_timestamp_ns",
+            )
+        if checkpoint.update_timestamp_ns < 0:
+            raise InputValueError(
+                "update_timestamp_ns must be non-negative int",
+                field="update_timestamp_ns",
+            )
+
+    if type(checkpoint.lease_epoch) is not int:
+        raise InputTypeError("lease_epoch must be int", field="lease_epoch")
+    if not (0 <= checkpoint.lease_epoch <= UINT64_MAX):
+        raise InputValueError(
+            f"lease_epoch must be in 0..{UINT64_MAX}, got {checkpoint.lease_epoch}",
+            field="lease_epoch",
+        )
+
+    if not isinstance(checkpoint.range_config_fingerprint, str):
+        raise InputTypeError(
+            "range_config_fingerprint must be str",
+            field="range_config_fingerprint",
+        )
+
+
+def validate_lease_model(lease: LeaderLease) -> None:
+    """Validate a LeaderLease model before serialization.
+
+    Args:
+        lease: The LeaderLease instance to validate.
+
+    Raises:
+        InputTypeError: If any field has an invalid Python type.
+        InputValueError: If any value is out of its permitted domain.
+    """
+    if not isinstance(lease, LeaderLease):
+        raise InputTypeError(
+            f"lease must be LeaderLease, got {type(lease).__name__}",
+            field="lease",
+        )
+    if not isinstance(lease.source_id, str):
+        raise InputTypeError("source_id must be str", field="source_id")
+    if not lease.source_id:
+        raise InputValueError("source_id must be non-empty str", field="source_id")
+
+    if not isinstance(lease.stream_name, str):
+        raise InputTypeError("stream_name must be str", field="stream_name")
+    if not lease.stream_name:
+        raise InputValueError("stream_name must be non-empty str", field="stream_name")
+
+    if not isinstance(lease.owner_instance_id, str):
+        raise InputTypeError("owner_instance_id must be str", field="owner_instance_id")
+    if not lease.owner_instance_id:
+        raise InputValueError(
+            "owner_instance_id must be non-empty str",
+            field="owner_instance_id",
+        )
+
+    if type(lease.lease_epoch) is not int:
+        raise InputTypeError("lease_epoch must be int", field="lease_epoch")
+    if not (0 <= lease.lease_epoch <= UINT64_MAX):
+        raise InputValueError(
+            f"lease_epoch must be in 0..{UINT64_MAX}, got {lease.lease_epoch}",
+            field="lease_epoch",
+        )
+
+    if type(lease.heartbeat_sequence) is not int:
+        raise InputTypeError(
+            "heartbeat_sequence must be int", field="heartbeat_sequence"
+        )
+    if not (0 <= lease.heartbeat_sequence <= UINT64_MAX):
+        raise InputValueError(
+            f"heartbeat_sequence must be in 0..{UINT64_MAX}, "
+            f"got {lease.heartbeat_sequence}",
+            field="heartbeat_sequence",
+        )
+
+    if type(lease.expiration_timestamp_ns) is not int:
+        raise InputTypeError(
+            "expiration_timestamp_ns must be int",
+            field="expiration_timestamp_ns",
+        )
+    if lease.expiration_timestamp_ns < 0:
+        raise InputValueError(
+            "expiration_timestamp_ns must be non-negative int",
+            field="expiration_timestamp_ns",
+        )
 
 
 def serialize_checkpoint(checkpoint: CDCCheckpoint) -> bytes:
@@ -47,70 +268,15 @@ def serialize_checkpoint(checkpoint: CDCCheckpoint) -> bytes:
         InputTypeError: If checkpoint or any field has an invalid Python type.
         InputValueError: If any value is out of its permitted domain.
     """
-    if not isinstance(checkpoint, CDCCheckpoint):
-        raise InputTypeError(
-            f"checkpoint must be CDCCheckpoint, got {type(checkpoint).__name__}",
-            field="checkpoint",
-        )
-    if type(checkpoint.format_version) is not int or checkpoint.format_version < 1:
-        raise InputValueError(
-            f"format_version must be int >= 1, got {checkpoint.format_version!r}",
-            field="format_version",
-        )
-    if not isinstance(checkpoint.source_id, str):
-        raise InputTypeError("source_id must be str", field="source_id")
-    if not isinstance(checkpoint.stream_name, str) or not checkpoint.stream_name:
-        raise InputValueError("stream_name must be non-empty str", field="stream_name")
-    if type(checkpoint.stream_id) is not int or checkpoint.stream_id < 0:
-        raise InputValueError("stream_id must be non-negative int", field="stream_id")
-    if (
-        type(checkpoint.last_consumed_version) is not int
-        or checkpoint.last_consumed_version < 0
-    ):
-        raise InputValueError(
-            "last_consumed_version must be non-negative int",
-            field="last_consumed_version",
-        )
-    if not isinstance(checkpoint.sink, KafkaSinkIdentity):
-        raise InputTypeError(
-            f"sink must be KafkaSinkIdentity, got {type(checkpoint.sink).__name__}",
-            field="sink",
-        )
-    if (
-        not isinstance(checkpoint.sink.cluster_id, str)
-        or not checkpoint.sink.cluster_id
-    ):
-        raise InputValueError("sink.cluster_id must be non-empty str", field="sink")
-    if not isinstance(checkpoint.sink.topic, str) or not checkpoint.sink.topic:
-        raise InputValueError("sink.topic must be non-empty str", field="sink")
-    if (
-        not isinstance(checkpoint.updating_instance_id, str)
-        or not checkpoint.updating_instance_id
-    ):
-        raise InputValueError(
-            "updating_instance_id must be non-empty str", field="updating_instance_id"
-        )
-    if (
-        checkpoint.update_timestamp_ns is not None
-        and type(checkpoint.update_timestamp_ns) is not int
-    ):
-        raise InputTypeError(
-            "update_timestamp_ns must be int or None", field="update_timestamp_ns"
-        )
-    if type(checkpoint.lease_epoch) is not int or checkpoint.lease_epoch < 0:
-        raise InputValueError(
-            "lease_epoch must be non-negative int", field="lease_epoch"
-        )
-    if not isinstance(checkpoint.range_config_fingerprint, str):
-        raise InputTypeError(
-            "range_config_fingerprint must be str", field="range_config_fingerprint"
-        )
+    validate_checkpoint_model(checkpoint)
 
     sink_msg = state_pb2.KafkaSinkIdentity(
         cluster_id=checkpoint.sink.cluster_id,
         topic=checkpoint.sink.topic,
     )
-    ts_msg = _timestamp_from_ns(checkpoint.update_timestamp_ns)
+    ts_msg = _timestamp_from_ns(
+        checkpoint.update_timestamp_ns, field="update_timestamp_ns"
+    )
 
     msg = state_pb2.CDCCheckpoint(
         format_version=checkpoint.format_version,
@@ -138,7 +304,7 @@ def deserialize_checkpoint(data: bytes) -> CDCCheckpoint:
 
     Raises:
         InputTypeError: If data is not bytes.
-        RecordDecodeError: If bytes are malformed or missing required sink identity.
+        RecordDecodeError: If bytes are malformed, unsupported, or incomplete.
     """
     if not isinstance(data, bytes):
         raise InputTypeError(
@@ -153,9 +319,24 @@ def deserialize_checkpoint(data: bytes) -> CDCCheckpoint:
             reason=DecodeFailure.MALFORMED_WIRE,
         ) from exc
 
-    if msg.format_version == 0:
+    if msg.format_version not in SUPPORTED_FORMAT_VERSIONS:
         raise RecordDecodeError(
-            "Checkpoint format_version is 0 or missing",
+            f"Checkpoint format_version {msg.format_version} is unsupported",
+            reason=DecodeFailure.MALFORMED_WIRE,
+        )
+    if not msg.source_id:
+        raise RecordDecodeError(
+            "Checkpoint missing or empty source_id",
+            reason=DecodeFailure.MALFORMED_WIRE,
+        )
+    if not msg.stream_name:
+        raise RecordDecodeError(
+            "Checkpoint missing or empty stream_name",
+            reason=DecodeFailure.MALFORMED_WIRE,
+        )
+    if not msg.updating_instance_id:
+        raise RecordDecodeError(
+            "Checkpoint missing or empty updating_instance_id",
             reason=DecodeFailure.MALFORMED_WIRE,
         )
     if not msg.HasField("sink"):
@@ -203,37 +384,11 @@ def serialize_leader_lease(lease: LeaderLease) -> bytes:
         InputTypeError: If lease or any field has an invalid Python type.
         InputValueError: If any value is out of its permitted domain.
     """
-    if not isinstance(lease, LeaderLease):
-        raise InputTypeError(
-            f"lease must be LeaderLease, got {type(lease).__name__}",
-            field="lease",
-        )
-    if not isinstance(lease.source_id, str):
-        raise InputTypeError("source_id must be str", field="source_id")
-    if not isinstance(lease.stream_name, str) or not lease.stream_name:
-        raise InputValueError("stream_name must be non-empty str", field="stream_name")
-    if not isinstance(lease.owner_instance_id, str) or not lease.owner_instance_id:
-        raise InputValueError(
-            "owner_instance_id must be non-empty str", field="owner_instance_id"
-        )
-    if type(lease.lease_epoch) is not int or lease.lease_epoch < 0:
-        raise InputValueError(
-            "lease_epoch must be non-negative int", field="lease_epoch"
-        )
-    if type(lease.heartbeat_sequence) is not int or lease.heartbeat_sequence < 0:
-        raise InputValueError(
-            "heartbeat_sequence must be non-negative int", field="heartbeat_sequence"
-        )
-    if (
-        lease.expiration_timestamp_ns is not None
-        and type(lease.expiration_timestamp_ns) is not int
-    ):
-        raise InputTypeError(
-            "expiration_timestamp_ns must be int or None",
-            field="expiration_timestamp_ns",
-        )
+    validate_lease_model(lease)
 
-    ts_msg = _timestamp_from_ns(lease.expiration_timestamp_ns)
+    ts_msg = _timestamp_from_ns(
+        lease.expiration_timestamp_ns, field="expiration_timestamp_ns"
+    )
     msg = state_pb2.LeaderLease(
         source_id=lease.source_id,
         stream_name=lease.stream_name,
@@ -256,7 +411,7 @@ def deserialize_leader_lease(data: bytes) -> LeaderLease:
 
     Raises:
         InputTypeError: If data is not bytes.
-        RecordDecodeError: If bytes are malformed or missing required owner identity.
+        RecordDecodeError: If bytes are malformed, unsupported, or incomplete.
     """
     if not isinstance(data, bytes):
         raise InputTypeError(
@@ -271,17 +426,28 @@ def deserialize_leader_lease(data: bytes) -> LeaderLease:
             reason=DecodeFailure.MALFORMED_WIRE,
         ) from exc
 
+    if not msg.source_id:
+        raise RecordDecodeError(
+            "LeaderLease missing or empty source_id",
+            reason=DecodeFailure.MALFORMED_WIRE,
+        )
+    if not msg.stream_name:
+        raise RecordDecodeError(
+            "LeaderLease missing or empty stream_name",
+            reason=DecodeFailure.MALFORMED_WIRE,
+        )
     if not msg.owner_instance_id:
         raise RecordDecodeError(
-            "LeaderLease missing owner_instance_id",
+            "LeaderLease missing or empty owner_instance_id",
+            reason=DecodeFailure.MALFORMED_WIRE,
+        )
+    if not msg.HasField("expiration_timestamp"):
+        raise RecordDecodeError(
+            "LeaderLease missing required expiration_timestamp",
             reason=DecodeFailure.MALFORMED_WIRE,
         )
 
-    exp_ts = (
-        _ns_from_timestamp(msg.expiration_timestamp)
-        if msg.HasField("expiration_timestamp")
-        else None
-    )
+    exp_ts = _ns_from_timestamp(msg.expiration_timestamp)
 
     return LeaderLease(
         source_id=msg.source_id,

@@ -1,8 +1,10 @@
-"""Tests for state serialization and deserialization (checkpoints and leases)."""
+"""Tests for v0.2.0 bridge control-plane state serialization and deserialization."""
 
 from __future__ import annotations
 
+from google.protobuf.timestamp_pb2 import Timestamp
 import pytest
+from google.protobuf.timestamp_pb2 import Timestamp
 
 from fdb_kafka_bridge.serialization.errors import (
     DecodeFailure,
@@ -16,6 +18,7 @@ from fdb_kafka_bridge.serialization.model import (
     LeaderLease,
 )
 from fdb_kafka_bridge.serialization.state import (
+    UINT64_MAX,
     deserialize_checkpoint,
     deserialize_leader_lease,
     serialize_checkpoint,
@@ -23,10 +26,22 @@ from fdb_kafka_bridge.serialization.state import (
 )
 from fdbkafka.bridge.state.v1 import state_pb2
 
+CP_GOLDEN = bytes.fromhex(
+    "0801120e6664622d7072696d6172792d64631a0d6f72646572735f73747265616d20cec2f105"
+    "2896d5d02f321f0a0f636c75737465722d70726f642d3031120c6f72646572732d746f706963"
+    "3a116272696467652d696e7374616e63652d31420b0880e2cfaa0610959aef3a482a521e7368"
+    "613235363a66696e6765727072696e745f686173685f616263313233"
+)
 
-def test_checkpoint_roundtrip() -> None:
+LEASE_GOLDEN = bytes.fromhex(
+    "0a0b6664622d7072696d617279120d74656e616e745f73747265616d1a0e706f642d6e6f6465"
+    "2d616c706861200f289506320608f4e5cfaa06"
+)
+
+
+def _sample_checkpoint() -> CDCCheckpoint:
     sink = KafkaSinkIdentity(cluster_id="cluster-prod-01", topic="orders-topic")
-    cp = CDCCheckpoint(
+    return CDCCheckpoint(
         format_version=1,
         source_id="fdb-primary-dc",
         stream_name="orders_stream",
@@ -39,37 +54,78 @@ def test_checkpoint_roundtrip() -> None:
         range_config_fingerprint="sha256:fingerprint_hash_abc123",
     )
 
+
+def _sample_lease() -> LeaderLease:
+    return LeaderLease(
+        source_id="fdb-primary",
+        stream_name="tenant_stream",
+        owner_instance_id="pod-node-alpha",
+        lease_epoch=15,
+        heartbeat_sequence=789,
+        expiration_timestamp_ns=1700000500_000000000,
+    )
+
+
+def test_checkpoint_roundtrip() -> None:
+    cp = _sample_checkpoint()
     data = serialize_checkpoint(cp)
     assert isinstance(data, bytes)
-
     decoded = deserialize_checkpoint(data)
     assert decoded == cp
 
 
 def test_checkpoint_golden_bytes() -> None:
+    cp = _sample_checkpoint()
+    wire = serialize_checkpoint(cp)
+    assert wire == CP_GOLDEN
+    restored = deserialize_checkpoint(CP_GOLDEN)
+    assert restored == cp
+
+
+def test_checkpoint_uint64_and_epoch_boundaries() -> None:
     sink = KafkaSinkIdentity(cluster_id="c1", topic="t1")
-    cp = CDCCheckpoint(
+
+    # Boundary 1: uint64 minimum (0) and epoch zero timestamp (0 ns)
+    cp_zero = CDCCheckpoint(
         format_version=1,
         source_id="s1",
-        stream_name="stream1",
-        stream_id=100,
-        last_consumed_version=200,
+        stream_name="str1",
+        stream_id=0,
+        last_consumed_version=0,
         sink=sink,
-        updating_instance_id="inst1",
-        update_timestamp_ns=1000_000_000,
-        lease_epoch=2,
-        range_config_fingerprint="fp1",
+        updating_instance_id="i1",
+        update_timestamp_ns=0,
+        lease_epoch=0,
+        range_config_fingerprint="fp0",
     )
-    wire = serialize_checkpoint(cp)
-    # Wire bytes must decode cleanly back to identical model
-    restored = deserialize_checkpoint(wire)
-    assert restored == cp
-    # Direct proto parse check
-    msg = state_pb2.CDCCheckpoint.FromString(wire)
-    assert msg.format_version == 1
-    assert msg.source_id == "s1"
-    assert msg.sink.cluster_id == "c1"
-    assert msg.sink.topic == "t1"
+    wire_zero = serialize_checkpoint(cp_zero)
+    decoded_zero = deserialize_checkpoint(wire_zero)
+    assert decoded_zero == cp_zero
+    assert decoded_zero.stream_id == 0
+    assert decoded_zero.last_consumed_version == 0
+    assert decoded_zero.lease_epoch == 0
+    assert decoded_zero.update_timestamp_ns == 0
+
+    # Boundary 2: uint64 maximum (2**64 - 1) and None timestamp
+    cp_max = CDCCheckpoint(
+        format_version=1,
+        source_id="s1",
+        stream_name="str1",
+        stream_id=UINT64_MAX,
+        last_consumed_version=UINT64_MAX,
+        sink=sink,
+        updating_instance_id="i1",
+        update_timestamp_ns=None,
+        lease_epoch=UINT64_MAX,
+        range_config_fingerprint="fp_max",
+    )
+    wire_max = serialize_checkpoint(cp_max)
+    decoded_max = deserialize_checkpoint(wire_max)
+    assert decoded_max == cp_max
+    assert decoded_max.stream_id == UINT64_MAX
+    assert decoded_max.last_consumed_version == UINT64_MAX
+    assert decoded_max.lease_epoch == UINT64_MAX
+    assert decoded_max.update_timestamp_ns is None
 
 
 def test_checkpoint_validation_errors() -> None:
@@ -78,11 +134,30 @@ def test_checkpoint_validation_errors() -> None:
     with pytest.raises(InputTypeError, match="checkpoint must be CDCCheckpoint"):
         serialize_checkpoint("not_a_checkpoint")  # type: ignore[arg-type]
 
-    with pytest.raises(InputValueError, match="format_version must be int >= 1"):
+    # Unsupported format versions
+    for bad_ver in (0, 2, -1):
+        with pytest.raises(InputValueError, match="format_version"):
+            serialize_checkpoint(
+                CDCCheckpoint(
+                    format_version=bad_ver,
+                    source_id="s1",
+                    stream_name="str1",
+                    stream_id=1,
+                    last_consumed_version=1,
+                    sink=sink,
+                    updating_instance_id="i1",
+                    update_timestamp_ns=None,
+                    lease_epoch=1,
+                    range_config_fingerprint="fp",
+                )
+            )
+
+    # Empty required string identities
+    with pytest.raises(InputValueError, match="source_id"):
         serialize_checkpoint(
             CDCCheckpoint(
-                format_version=0,
-                source_id="s1",
+                format_version=1,
+                source_id="",
                 stream_name="str1",
                 stream_id=1,
                 last_consumed_version=1,
@@ -94,7 +169,7 @@ def test_checkpoint_validation_errors() -> None:
             )
         )
 
-    with pytest.raises(InputValueError, match="stream_name must be non-empty str"):
+    with pytest.raises(InputValueError, match="stream_name"):
         serialize_checkpoint(
             CDCCheckpoint(
                 format_version=1,
@@ -110,6 +185,90 @@ def test_checkpoint_validation_errors() -> None:
             )
         )
 
+    with pytest.raises(InputValueError, match="updating_instance_id"):
+        serialize_checkpoint(
+            CDCCheckpoint(
+                format_version=1,
+                source_id="s1",
+                stream_name="str1",
+                stream_id=1,
+                last_consumed_version=1,
+                sink=sink,
+                updating_instance_id="",
+                update_timestamp_ns=None,
+                lease_epoch=1,
+                range_config_fingerprint="fp",
+            )
+        )
+
+    # Sink errors
+    with pytest.raises(InputValueError, match="sink.cluster_id"):
+        serialize_checkpoint(
+            CDCCheckpoint(
+                format_version=1,
+                source_id="s1",
+                stream_name="str1",
+                stream_id=1,
+                last_consumed_version=1,
+                sink=KafkaSinkIdentity(cluster_id="", topic="t1"),
+                updating_instance_id="i1",
+                update_timestamp_ns=None,
+                lease_epoch=1,
+                range_config_fingerprint="fp",
+            )
+        )
+
+    with pytest.raises(InputValueError, match="sink.topic"):
+        serialize_checkpoint(
+            CDCCheckpoint(
+                format_version=1,
+                source_id="s1",
+                stream_name="str1",
+                stream_id=1,
+                last_consumed_version=1,
+                sink=KafkaSinkIdentity(cluster_id="c1", topic=""),
+                updating_instance_id="i1",
+                update_timestamp_ns=None,
+                lease_epoch=1,
+                range_config_fingerprint="fp",
+            )
+        )
+
+    # uint64 domain errors
+    for bad_id in (-1, UINT64_MAX + 1):
+        with pytest.raises(InputValueError, match="stream_id"):
+            serialize_checkpoint(
+                CDCCheckpoint(
+                    format_version=1,
+                    source_id="s1",
+                    stream_name="str1",
+                    stream_id=bad_id,
+                    last_consumed_version=1,
+                    sink=sink,
+                    updating_instance_id="i1",
+                    update_timestamp_ns=None,
+                    lease_epoch=1,
+                    range_config_fingerprint="fp",
+                )
+            )
+
+    # Negative timestamp
+    with pytest.raises(InputValueError, match="update_timestamp_ns"):
+        serialize_checkpoint(
+            CDCCheckpoint(
+                format_version=1,
+                source_id="s1",
+                stream_name="str1",
+                stream_id=1,
+                last_consumed_version=1,
+                sink=sink,
+                updating_instance_id="i1",
+                update_timestamp_ns=-100,
+                lease_epoch=1,
+                range_config_fingerprint="fp",
+            )
+        )
+
 
 def test_checkpoint_decode_errors() -> None:
     with pytest.raises(InputTypeError, match="data must be bytes"):
@@ -119,45 +278,198 @@ def test_checkpoint_decode_errors() -> None:
         deserialize_checkpoint(b"\xff\xff\xff\xff\xff")
     assert exc_info.value.reason == DecodeFailure.MALFORMED_WIRE
 
+    # Unsupported format versions on wire
+    for bad_ver in (0, 2):
+        wire_bad_ver = state_pb2.CDCCheckpoint(
+            format_version=bad_ver,
+            source_id="s1",
+            stream_name="st1",
+            updating_instance_id="i1",
+            sink=state_pb2.KafkaSinkIdentity(cluster_id="c1", topic="t1"),
+        ).SerializeToString()
+        with pytest.raises(RecordDecodeError, match="format_version"):
+            deserialize_checkpoint(wire_bad_ver)
+
+    # Missing / empty identities on wire
+    wire_empty_source = state_pb2.CDCCheckpoint(
+        format_version=1,
+        source_id="",
+        stream_name="st1",
+        updating_instance_id="i1",
+        sink=state_pb2.KafkaSinkIdentity(cluster_id="c1", topic="t1"),
+    ).SerializeToString()
+    with pytest.raises(RecordDecodeError, match="source_id"):
+        deserialize_checkpoint(wire_empty_source)
+
+    wire_empty_stream = state_pb2.CDCCheckpoint(
+        format_version=1,
+        source_id="s1",
+        stream_name="",
+        updating_instance_id="i1",
+        sink=state_pb2.KafkaSinkIdentity(cluster_id="c1", topic="t1"),
+    ).SerializeToString()
+    with pytest.raises(RecordDecodeError, match="stream_name"):
+        deserialize_checkpoint(wire_empty_stream)
+
+    wire_empty_updater = state_pb2.CDCCheckpoint(
+        format_version=1,
+        source_id="s1",
+        stream_name="st1",
+        updating_instance_id="",
+        sink=state_pb2.KafkaSinkIdentity(cluster_id="c1", topic="t1"),
+    ).SerializeToString()
+    with pytest.raises(RecordDecodeError, match="updating_instance_id"):
+        deserialize_checkpoint(wire_empty_updater)
+
     # Missing sink
-    raw_no_sink = state_pb2.CDCCheckpoint(
+    wire_no_sink = state_pb2.CDCCheckpoint(
         format_version=1,
         source_id="s1",
         stream_name="st1",
         updating_instance_id="i1",
     ).SerializeToString()
-
     with pytest.raises(RecordDecodeError, match="missing Kafka sink identity"):
-        deserialize_checkpoint(raw_no_sink)
+        deserialize_checkpoint(wire_no_sink)
 
     # Empty sink topic
-    raw_empty_topic = state_pb2.CDCCheckpoint(
+    wire_empty_topic = state_pb2.CDCCheckpoint(
         format_version=1,
         source_id="s1",
         stream_name="st1",
         updating_instance_id="i1",
         sink=state_pb2.KafkaSinkIdentity(cluster_id="c1", topic=""),
     ).SerializeToString()
-
     with pytest.raises(RecordDecodeError, match="empty cluster_id or topic"):
-        deserialize_checkpoint(raw_empty_topic)
+        deserialize_checkpoint(wire_empty_topic)
+
+    # Malformed timestamp nanos on wire
+    wire_bad_nanos = state_pb2.CDCCheckpoint(
+        format_version=1,
+        source_id="s1",
+        stream_name="st1",
+        updating_instance_id="i1",
+        sink=state_pb2.KafkaSinkIdentity(cluster_id="c1", topic="t1"),
+        update_timestamp=Timestamp(seconds=100, nanos=1_000_000_000),
+    ).SerializeToString()
+    with pytest.raises(RecordDecodeError, match="Invalid timestamp nanos"):
+        deserialize_checkpoint(wire_bad_nanos)
 
 
 def test_leader_lease_roundtrip() -> None:
-    lease = LeaderLease(
-        source_id="fdb-primary",
-        stream_name="tenant_stream",
-        owner_instance_id="pod-node-alpha",
-        lease_epoch=15,
-        heartbeat_sequence=789,
-        expiration_timestamp_ns=1700000500_000000000,
-    )
-
+    lease = _sample_lease()
     data = serialize_leader_lease(lease)
     assert isinstance(data, bytes)
-
     decoded = deserialize_leader_lease(data)
     assert decoded == lease
+
+
+def test_leader_lease_golden_bytes() -> None:
+    lease = _sample_lease()
+    wire = serialize_leader_lease(lease)
+    assert wire == LEASE_GOLDEN
+    restored = deserialize_leader_lease(LEASE_GOLDEN)
+    assert restored == lease
+
+
+def test_leader_lease_uint64_and_epoch_boundaries() -> None:
+    # Boundary 1: epoch zero expiration timestamp (0 ns) and zero epochs
+    lease_zero = LeaderLease(
+        source_id="s1",
+        stream_name="str1",
+        owner_instance_id="pod1",
+        lease_epoch=0,
+        heartbeat_sequence=0,
+        expiration_timestamp_ns=0,
+    )
+    wire_zero = serialize_leader_lease(lease_zero)
+    decoded_zero = deserialize_leader_lease(wire_zero)
+    assert decoded_zero == lease_zero
+    assert decoded_zero.expiration_timestamp_ns == 0
+    assert decoded_zero.lease_epoch == 0
+    assert decoded_zero.heartbeat_sequence == 0
+
+    # Boundary 2: uint64 maximum
+    lease_max = LeaderLease(
+        source_id="s1",
+        stream_name="str1",
+        owner_instance_id="pod1",
+        lease_epoch=UINT64_MAX,
+        heartbeat_sequence=UINT64_MAX,
+        expiration_timestamp_ns=2000000000_000000000,
+    )
+    wire_max = serialize_leader_lease(lease_max)
+    decoded_max = deserialize_leader_lease(wire_max)
+    assert decoded_max == lease_max
+    assert decoded_max.lease_epoch == UINT64_MAX
+    assert decoded_max.heartbeat_sequence == UINT64_MAX
+
+
+def test_leader_lease_validation_errors() -> None:
+    with pytest.raises(InputTypeError, match="lease must be LeaderLease"):
+        serialize_leader_lease("not_a_lease")  # type: ignore[arg-type]
+
+    # Missing required identities
+    with pytest.raises(InputValueError, match="source_id"):
+        serialize_leader_lease(
+            LeaderLease(
+                source_id="",
+                stream_name="str1",
+                owner_instance_id="pod1",
+                lease_epoch=1,
+                heartbeat_sequence=1,
+                expiration_timestamp_ns=1000,
+            )
+        )
+
+    with pytest.raises(InputValueError, match="stream_name"):
+        serialize_leader_lease(
+            LeaderLease(
+                source_id="s1",
+                stream_name="",
+                owner_instance_id="pod1",
+                lease_epoch=1,
+                heartbeat_sequence=1,
+                expiration_timestamp_ns=1000,
+            )
+        )
+
+    with pytest.raises(InputValueError, match="owner_instance_id"):
+        serialize_leader_lease(
+            LeaderLease(
+                source_id="s1",
+                stream_name="str1",
+                owner_instance_id="",
+                lease_epoch=1,
+                heartbeat_sequence=1,
+                expiration_timestamp_ns=1000,
+            )
+        )
+
+    # None expiration timestamp
+    with pytest.raises(InputTypeError, match="expiration_timestamp_ns"):
+        serialize_leader_lease(
+            LeaderLease(
+                source_id="s1",
+                stream_name="str1",
+                owner_instance_id="pod1",
+                lease_epoch=1,
+                heartbeat_sequence=1,
+                expiration_timestamp_ns=None,  # type: ignore[arg-type]
+            )
+        )
+
+    # Negative expiration timestamp
+    with pytest.raises(InputValueError, match="expiration_timestamp_ns"):
+        serialize_leader_lease(
+            LeaderLease(
+                source_id="s1",
+                stream_name="str1",
+                owner_instance_id="pod1",
+                lease_epoch=1,
+                heartbeat_sequence=1,
+                expiration_timestamp_ns=-1000,
+            )
+        )
 
 
 def test_leader_lease_decode_errors() -> None:
@@ -167,12 +479,51 @@ def test_leader_lease_decode_errors() -> None:
     with pytest.raises(RecordDecodeError):
         deserialize_leader_lease(b"\xff\xff\xff\xff\xff")
 
-    # Missing owner_instance_id
-    raw_no_owner = state_pb2.LeaderLease(
+    # Missing source_id on wire
+    wire_no_source = state_pb2.LeaderLease(
+        source_id="",
+        stream_name="st1",
+        owner_instance_id="pod1",
+        expiration_timestamp=Timestamp(seconds=100, nanos=0),
+    ).SerializeToString()
+    with pytest.raises(RecordDecodeError, match="source_id"):
+        deserialize_leader_lease(wire_no_source)
+
+    # Missing stream_name on wire
+    wire_no_stream = state_pb2.LeaderLease(
+        source_id="s1",
+        stream_name="",
+        owner_instance_id="pod1",
+        expiration_timestamp=Timestamp(seconds=100, nanos=0),
+    ).SerializeToString()
+    with pytest.raises(RecordDecodeError, match="stream_name"):
+        deserialize_leader_lease(wire_no_stream)
+
+    # Missing owner_instance_id on wire
+    wire_no_owner = state_pb2.LeaderLease(
         source_id="s1",
         stream_name="st1",
         owner_instance_id="",
+        expiration_timestamp=Timestamp(seconds=100, nanos=0),
     ).SerializeToString()
+    with pytest.raises(RecordDecodeError, match="owner_instance_id"):
+        deserialize_leader_lease(wire_no_owner)
 
-    with pytest.raises(RecordDecodeError, match="missing owner_instance_id"):
-        deserialize_leader_lease(raw_no_owner)
+    # Missing expiration timestamp on wire
+    wire_no_exp = state_pb2.LeaderLease(
+        source_id="s1",
+        stream_name="st1",
+        owner_instance_id="pod1",
+    ).SerializeToString()
+    with pytest.raises(RecordDecodeError, match="expiration_timestamp"):
+        deserialize_leader_lease(wire_no_exp)
+
+    # Malformed timestamp nanos on wire
+    wire_bad_nanos = state_pb2.LeaderLease(
+        source_id="s1",
+        stream_name="st1",
+        owner_instance_id="pod1",
+        expiration_timestamp=Timestamp(seconds=100, nanos=1_000_000_000),
+    ).SerializeToString()
+    with pytest.raises(RecordDecodeError, match="Invalid timestamp nanos"):
+        deserialize_leader_lease(wire_bad_nanos)
