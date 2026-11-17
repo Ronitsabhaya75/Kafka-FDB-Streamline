@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from google.protobuf.timestamp_pb2 import Timestamp
 import pytest
+from google.protobuf.timestamp_pb2 import Timestamp
 
 from fdb_kafka_bridge.serialization.errors import (
     DecodeFailure,
