@@ -7,69 +7,135 @@ Contract for control-plane state schemas defined in
 ## 1. Overview
 
 FoundationDB CDC bridges require coordinated distributed state for:
-1. **Durable checkpointing**: Storing the last safely delivered commit version in FoundationDB.
-2. **Sink-mismatch protection**: Guarding against writing to or resuming from mismatched Kafka clusters/topics.
-3. **Active leader leasing & fencing**: Ensuring exactly one active bridge worker produces per stream.
+1. **Durable checkpointing**: Persisting the last safely acknowledged commit version in FoundationDB.
+2. **Sink-mismatch protection**: Guarding against writing to or resuming from mismatched Kafka clusters or topics.
+3. **Active leader leasing & fencing**: Ensuring exactly one active bridge worker produces per stream and guarding against split-brain execution.
 
-Control-plane infrastructure state is kept strictly separate from data-plane mutation records (`mutations.proto`).
+Control-plane state is kept strictly separate from data-plane mutation records (`mutations.proto`). State records are committed in dedicated FoundationDB control-plane keyspace subspaces.
 
 ## 2. Schemas & Models
 
+Defined in package `fdbkafka.bridge.state.v1`:
+
 ### 2.1 KafkaSinkIdentity
 
-Identifies the destination Kafka cluster and topic:
+Identifies the destination Kafka cluster and topic sink:
 
-```protobuf
-message KafkaSinkIdentity {
-    string cluster_id = 1;
-    string topic = 2;
-}
-```
+| Field | Protobuf Type | Validation Rules | Description |
+|---|---|---|---|
+| `cluster_id` | `string` | Non-empty UTF-8 `str` | Destination Kafka cluster identifier. |
+| `topic` | `string` | Non-empty UTF-8 `str` | Target Kafka topic name. |
 
 ### 2.2 CDCCheckpoint
 
 Durable checkpoint state committed inside FoundationDB:
 
-| Field | Type | Description |
-|---|---|---|
-| `format_version` | `uint32` | State schema format version (e.g. `1` for v0.2.0). |
-| `source_id` | `string` | Stable operator-configured identity for the FDB source. |
-| `stream_name` | `string` | Registered CDC stream name. |
-| `stream_id` | `uint64` | Native CDC stream ID (distinguishes recreated streams). |
-| `last_consumed_version` | `uint64` | Highest commit version fully acknowledged. |
-| `sink` | `KafkaSinkIdentity` | Destination Kafka cluster and topic. |
-| `updating_instance_id` | `string` | Unique instance ID of the bridge worker. |
-| `update_timestamp` | `google.protobuf.Timestamp` | Wall-clock timestamp when checkpoint was committed. |
-| `lease_epoch` | `uint64` | Active leader lease epoch during commit. |
-| `range_config_fingerprint` | `string` | Fingerprint of Directory Layer range configuration. |
+| Field | Protobuf Type | Validation Rules | Description |
+|---|---|---|---|
+| `format_version` | `uint32` | Must equal `1` | State schema format version. |
+| `source_id` | `string` | Non-empty UTF-8 `str` | Stable operator-configured identity for the FDB cluster. |
+| `stream_name` | `string` | Non-empty UTF-8 `str` | Registered CDC stream name. |
+| `stream_id` | `optional uint64` | `0..2**64 - 1` or unset | Native CDC stream ID (distinguishes recreated streams; 0 is distinct from unset). |
+| `last_consumed_version` | `int64` | `-1..2**63 - 1` | Highest commit version fully acknowledged to Kafka (`-1` indicates fresh cursor). |
+| `sink` | `KafkaSinkIdentity` | Valid `KafkaSinkIdentity` | Destination Kafka cluster and topic. |
+| `updating_instance_id` | `string` | Non-empty UTF-8 `str` | Unique instance ID of the bridge worker that wrote this checkpoint. |
+| `update_timestamp` | `google.protobuf.Timestamp` | `0 <= seconds <= 253402300799`, `0 <= nanos < 10**9` | Wall-clock timestamp when checkpoint was committed. |
+| `lease_epoch` | `uint64` | `0..2**64 - 1` | Leader lease epoch during which this checkpoint was committed. |
+| `range_config_fingerprint` | `bytes` | `bytes` (may be empty) | Binary fingerprint of Directory Layer range configuration. |
 
 ### 2.3 LeaderLease
 
-Leader lease state committed inside FoundationDB:
+Leader lease state committed inside FoundationDB for active leader coordination:
 
-| Field | Type | Description |
-|---|---|---|
-| `source_id` | `string` | Stable operator-configured identity for the FDB source. |
-| `stream_name` | `string` | Registered CDC stream name. |
-| `owner_instance_id` | `string` | Unique instance ID of the active leaseholder. |
-| `lease_epoch` | `uint64` | Monotonically increasing lease epoch. |
-| `heartbeat_sequence` | `uint64` | Monotonically increasing heartbeat sequence number. |
-| `expiration_timestamp` | `google.protobuf.Timestamp` | Lease expiration wall-clock timestamp. |
+| Field | Protobuf Type | Validation Rules | Description |
+|---|---|---|---|
+| `format_version` | `uint32` | Must equal `1` | State schema format version. |
+| `source_id` | `string` | Non-empty UTF-8 `str` | Stable operator-configured identity for the FDB cluster. |
+| `stream_name` | `string` | Non-empty UTF-8 `str` | Registered CDC stream name. |
+| `owner_instance_id` | `string` | Non-empty UTF-8 `str` | Unique instance ID of the active leaseholder. |
+| `lease_epoch` | `uint64` | `0..2**64 - 1` | Monotonically increasing lease epoch. |
+| `heartbeat_sequence` | `uint64` | `0..2**64 - 1` | Monotonically increasing heartbeat sequence number within the epoch. |
+| `expiration_timestamp` | `google.protobuf.Timestamp` | `0 <= seconds <= 253402300799`, `0 <= nanos < 10**9` | Lease expiration wall-clock timestamp. |
+| `stream_id` | `optional uint64` | `0..2**64 - 1` or unset | Optional native CDC stream ID bound to this lease. |
 
-> [!NOTE]
-> The schema defines state representations only. Lease correctness requires
-> transactional acquisition, conflict ranges, fencing checks, renewal, and takeover logic.
+## 3. Operational Invariants & Semantics
 
-## 3. Python API
+### 3.1 Inclusive Cursor Semantics
+
+- `last_consumed_version` is **inclusive**: it records the highest FDB commit version whose mutations have been fully persisted in Kafka and acknowledged.
+- A fresh CDC stream with no prior committed versions is initialized with `last_consumed_version = -1`.
+- When resuming replication, the bridge reads mutations starting after `last_consumed_version` (i.e. `begin_version = last_consumed_version` for an inclusive cursor, or `begin_version = last_consumed_version + 1`).
+
+### 3.2 Leader Lease Fencing & Recovery
+
+- Exactly one bridge instance may hold an active lease for a given `(source_id, stream_name)` pair.
+- Checkpoint updates require transactional verification against the active lease in FoundationDB: if `checkpoint.lease_epoch` does not match the active `LeaderLease.lease_epoch`, the transaction aborts.
+- During failover, a new leader increments `lease_epoch`, updates `owner_instance_id`, resets `heartbeat_sequence = 0`, and writes a new `expiration_timestamp`.
+- Fenced former leaders attempting to commit stale checkpoints are rejected by FDB conflict detection or explicit epoch mismatch.
+
+### 3.3 Sink Mismatch Protection
+
+- The `sink` field records destination Kafka coordinates (`cluster_id`, `topic`).
+- On bridge startup, the worker compares its configured Kafka target against `checkpoint.sink`. If they do not match, the worker refuses to start, preventing cross-cluster corruption or duplicate delivery across disjoint clusters.
+
+## 4. Error Handling & Fail-Closed Contract
+
+Control-plane state operations differ fundamentally from streaming mutation records:
+
+- **Fail-Closed**: In streaming data ingestion, corrupt records may optionally be dead-lettered to preserve stream continuity. In contrast, corrupt or unparseable control-plane state (`CDCCheckpoint` or `LeaderLease`) must **fail closed**. The bridge must abort execution and raise an alert rather than skipping or guessing state coordinates.
+- **Error Types**:
+  - `InputTypeError`: An argument has the wrong Python type (e.g. non-bytes passed to deserializer).
+  - `InputValueError`: A model field value is outside its valid domain (e.g. invalid format version, negative epoch).
+  - `StateDecodeError`: Raised when decoding malformed or unsupported state bytes:
+    - `DecodeFailure.UNSUPPORTED_FORMAT_VERSION`: `format_version` not in supported set (currently only `1`).
+    - `DecodeFailure.VERSION_OUT_OF_RANGE`: `last_consumed_version` outside `-1..2**63 - 1`.
+    - `DecodeFailure.MALFORMED_WIRE`: Corrupt protobuf bytes, missing required identities, or invalid timestamp components.
+
+## 5. Python API
 
 ```python
 from fdb_kafka_bridge.serialization import (
     CDCCheckpoint,
     KafkaSinkIdentity,
     LeaderLease,
+    StateDecodeError,
     deserialize_checkpoint,
     deserialize_leader_lease,
     serialize_checkpoint,
     serialize_leader_lease,
 )
+
+# Example Checkpoint Serialization
+checkpoint = CDCCheckpoint(
+    format_version=1,
+    source_id="fdb-primary",
+    stream_name="orders",
+    stream_id=12345,
+    last_consumed_version=1000500,
+    sink=KafkaSinkIdentity(cluster_id="kafka-prod", topic="orders-cdc"),
+    updating_instance_id="bridge-pod-1",
+    update_timestamp_ns=1700000000_000000000,
+    lease_epoch=3,
+    range_config_fingerprint=b"sha256:abc123hash",
+)
+
+wire_bytes = serialize_checkpoint(checkpoint)
+restored = deserialize_checkpoint(wire_bytes)
+assert restored == checkpoint
+
+# Example Leader Lease Serialization
+lease = LeaderLease(
+    format_version=1,
+    source_id="fdb-primary",
+    stream_name="orders",
+    owner_instance_id="bridge-pod-1",
+    lease_epoch=3,
+    heartbeat_sequence=42,
+    expiration_timestamp_ns=1700000030_000000000,
+    stream_id=12345,
+)
+
+lease_wire = serialize_leader_lease(lease)
+restored_lease = deserialize_leader_lease(lease_wire)
+assert restored_lease == lease
 ```

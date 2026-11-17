@@ -11,6 +11,7 @@ from fdb_kafka_bridge.serialization.errors import (
     RecordDecodeError,
     RecordTooLargeError,
     SerializationError,
+    StateDecodeError,
 )
 from fdb_kafka_bridge.serialization.model import (
     CDCCheckpoint,
@@ -58,6 +59,7 @@ __all__ = [
     "RecordDecodeError",
     "RecordTooLargeError",
     "SerializationError",
+    "StateDecodeError",
     "VersionEnd",
     "VersionIndex",
     "deduplication_identity",

@@ -53,7 +53,7 @@ class TestCDCCheckpoint(unittest.TestCase):
             updating_instance_id="bridge-worker-pod-42",
             update_timestamp=ts,
             lease_epoch=7,
-            range_config_fingerprint="sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4",
+            range_config_fingerprint=b"sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4",
         )
 
         data = cp.SerializeToString()
@@ -71,8 +71,25 @@ class TestCDCCheckpoint(unittest.TestCase):
         self.assertEqual(parsed.lease_epoch, 7)
         self.assertEqual(
             parsed.range_config_fingerprint,
-            "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4",
+            b"sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4",
         )
+
+    def test_fresh_cursor_negative_version(self) -> None:
+        cp = state_pb2.CDCCheckpoint(
+            format_version=1,
+            source_id="fdb-cluster-primary",
+            stream_name="orders_stream",
+            last_consumed_version=-1,
+            sink=state_pb2.KafkaSinkIdentity(cluster_id="c1", topic="t1"),
+            updating_instance_id="pod1",
+            update_timestamp=Timestamp(seconds=100, nanos=0),
+            lease_epoch=1,
+            range_config_fingerprint=b"",
+        )
+        data = cp.SerializeToString()
+        parsed = state_pb2.CDCCheckpoint.FromString(data)
+        self.assertEqual(parsed.last_consumed_version, -1)
+        self.assertFalse(parsed.HasField("stream_id"))
 
 
 class TestLeaderLease(unittest.TestCase):
@@ -81,16 +98,19 @@ class TestLeaderLease(unittest.TestCase):
     def test_roundtrip(self) -> None:
         ts = Timestamp(seconds=1700000100, nanos=500000000)
         lease = state_pb2.LeaderLease(
+            format_version=1,
             source_id="fdb-cluster-primary",
             stream_name="orders_stream",
             owner_instance_id="bridge-worker-pod-42",
             lease_epoch=12,
             heartbeat_sequence=345,
             expiration_timestamp=ts,
+            stream_id=987654321,
         )
 
         data = lease.SerializeToString()
         parsed = state_pb2.LeaderLease.FromString(data)
+        self.assertEqual(parsed.format_version, 1)
         self.assertEqual(parsed.source_id, "fdb-cluster-primary")
         self.assertEqual(parsed.stream_name, "orders_stream")
         self.assertEqual(parsed.owner_instance_id, "bridge-worker-pod-42")
@@ -98,3 +118,4 @@ class TestLeaderLease(unittest.TestCase):
         self.assertEqual(parsed.heartbeat_sequence, 345)
         self.assertEqual(parsed.expiration_timestamp.seconds, 1700000100)
         self.assertEqual(parsed.expiration_timestamp.nanos, 500000000)
+        self.assertEqual(parsed.stream_id, 987654321)

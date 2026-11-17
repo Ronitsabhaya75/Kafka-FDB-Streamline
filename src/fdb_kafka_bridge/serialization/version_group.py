@@ -6,8 +6,8 @@ from google.protobuf.message import Message
 
 from fdb_kafka_bridge.serialization import _checks, _wire
 from fdb_kafka_bridge.serialization.errors import (
+    InputValueError,
     RecordTooLargeError,
-    SerializationError,
 )
 from fdb_kafka_bridge.serialization.model import (
     FDBDirectoryContext,
@@ -79,8 +79,9 @@ def serialize_version_group(
         source_id: Optional stable operator-configured source identity.
         directory_resolver: Optional callable mapping a native mutation to its
             resolved `FDBDirectoryContext`.
-        strict_directory_clears: When True, raises `SerializationError` if a
-            range clear crosses directory boundaries. When False, ambiguous
+        strict_directory_clears: When True, requires `directory_resolver` to be
+            provided and raises `InputValueError` if a range clear is unresolved
+            or crosses directory boundaries. When False, ambiguous or unresolved
             range clears preserve the native clear unchanged and omit directory
             context on that batch.
 
@@ -90,11 +91,16 @@ def serialize_version_group(
 
     Raises:
         InputTypeError: A keyword or attribute has the wrong Python type.
-        InputValueError: A keyword or a type code is out of range.
-        SerializationError: If an ambiguous clear range is encountered in strict mode.
+        InputValueError: A keyword or a type code is out of range, or an ambiguous
+            clear range is encountered in strict mode.
         RecordTooLargeError: One mutation alone, or the version end, does not fit
             `max_record_bytes`.
     """
+    if strict_directory_clears and directory_resolver is None:
+        raise InputValueError(
+            "strict_directory_clears=True requires a directory_resolver",
+            field="strict_directory_clears",
+        )
     _checks.fdb_version(fdb_version)
     _checks.max_record_bytes(max_record_bytes)
     _checks.envelope(stream_name, bridge_timestamp_ns)
@@ -113,30 +119,51 @@ def serialize_version_group(
         dir_ctx: FDBDirectoryContext | None = None
         if directory_resolver is not None:
             dir_ctx = directory_resolver(mut)
-        elif hasattr(mut, "directory"):
-            dir_ctx = mut.directory
+            if dir_ctx is not None:
+                _checks.directory_context(dir_ctx)
 
         if code == MutationType.CLEAR_RANGE:
-            is_ambiguous = False
             if dir_ctx is not None:
                 if not _is_range_within_subspace(p1, p2, dir_ctx.subspace_prefix):
-                    is_ambiguous = True
+                    if strict_directory_clears:
+                        raise InputValueError(
+                            f"Clear range crosses directory boundaries at "
+                            f"version {fdb_version}, sequence {index}",
+                            field="mutations",
+                            index=index,
+                        )
+                    dir_ctx = None
             else:
-                is_ambiguous = True
-
-            if is_ambiguous:
                 if strict_directory_clears:
-                    raise SerializationError(
-                        f"Ambiguous clear range crosses directory boundaries at "
-                        f"version {fdb_version}, sequence {index}"
+                    raise InputValueError(
+                        f"Unresolved clear range under strict_directory_clears at "
+                        f"version {fdb_version}, sequence {index}",
+                        field="mutations",
+                        index=index,
                     )
-                dir_ctx = None
+        elif dir_ctx is not None:
+            if not p1.startswith(dir_ctx.subspace_prefix):
+                raise InputValueError(
+                    f"Mutation key does not start with resolved directory subspace "
+                    f"prefix at version {fdb_version}, sequence {index}",
+                    field="mutations",
+                    index=index,
+                )
 
-        if dir_ctx is not None:
-            _checks.directory_context(dir_ctx)
         resolved_directories.append(dir_ctx)
 
     messages = _wire.mutation_messages(checked_natives, fdb_version=fdb_version)
+
+    def _envelope_size(directory: FDBDirectoryContext | None) -> int:
+        return len(
+            _wire.record(
+                stream_name,
+                bridge_timestamp_ns,
+                directory=directory,
+                stream_id=stream_id,
+                source_id=source_id,
+            )
+        )
 
     slices: list[tuple[int, int, FDBDirectoryContext | None]] = []
     start = 0
@@ -144,15 +171,7 @@ def serialize_version_group(
     current_dir: FDBDirectoryContext | None = (
         resolved_directories[0] if resolved_directories else None
     )
-    envelope_bytes = len(
-        _wire.record(
-            stream_name,
-            bridge_timestamp_ns,
-            directory=current_dir,
-            stream_id=stream_id,
-            source_id=source_id,
-        )
-    )
+    envelope_bytes = _envelope_size(current_dir)
 
     for i, message in enumerate(messages):
         dir_i = resolved_directories[i]
@@ -163,15 +182,7 @@ def serialize_version_group(
             start = i
             current_dir = dir_i
             batch_bytes = 0
-            envelope_bytes = len(
-                _wire.record(
-                    stream_name,
-                    bridge_timestamp_ns,
-                    directory=current_dir,
-                    stream_id=stream_id,
-                    source_id=source_id,
-                )
-            )
+            envelope_bytes = _envelope_size(current_dir)
 
         mutation_bytes = _framed_bytes(_MUTATIONS_TAG_BYTES, message.ByteSize())
         grown = envelope_bytes + _framed_bytes(
@@ -181,15 +192,6 @@ def serialize_version_group(
             slices.append((start, i, current_dir))
             start = i
             batch_bytes = 0
-            envelope_bytes = len(
-                _wire.record(
-                    stream_name,
-                    bridge_timestamp_ns,
-                    directory=current_dir,
-                    stream_id=stream_id,
-                    source_id=source_id,
-                )
-            )
 
         if not batch_bytes:
             alone = envelope_bytes + _framed_bytes(_BATCH_TAG_BYTES, mutation_bytes)

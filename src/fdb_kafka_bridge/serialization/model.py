@@ -132,52 +132,56 @@ class CDCCheckpoint:
     format_version: int
     source_id: str
     stream_name: str
-    stream_id: int
     last_consumed_version: int
     sink: KafkaSinkIdentity
     updating_instance_id: str
     update_timestamp_ns: int
     lease_epoch: int
-    range_config_fingerprint: str
+    stream_id: int | None = None
+    range_config_fingerprint: bytes = b""
 
 
 @dataclass(frozen=True, slots=True)
 class LeaderLease:
     """Leader lease state recorded in FoundationDB for active leader coordination."""
 
+    format_version: int
     source_id: str
     stream_name: str
     owner_instance_id: str
     lease_epoch: int
     heartbeat_sequence: int
     expiration_timestamp_ns: int
+    stream_id: int | None = None
 
 
-type DedupKey = tuple[str | None, int | None, int, int]
+type DedupKey = tuple[str, int, int, int] | tuple[int, int]
 type LegacyDedupKey = tuple[int, int]
 
 
 def deduplication_identity(
     record: Record,
     mutation: Mutation,
-) -> DedupKey:
-    """Return the production deduplication identity for a mutation in a record.
+) -> tuple[str, int, int, int] | tuple[int, int]:
+    """Return the deduplication identity for a mutation in a record.
 
-    Production identity: (source_id, stream_id, fdb_version, sequence_no)
+    If both source_id and stream_id are present, returns the 4-tuple:
+        (source_id, stream_id, fdb_version, sequence_no)
+    Otherwise, falls back to the legacy 2-tuple:
+        (fdb_version, sequence_no)
 
     Args:
         record: Deserialized record envelope containing the mutation.
         mutation: Deserialized mutation with its version index.
 
     Returns:
-        4-tuple of (source_id, stream_id, fdb_version, sequence_no).
+        4-tuple or 2-tuple deduplication identity.
     """
-    return (
-        record.source_id,
-        record.stream_id,
-        mutation.version_index.fdb_version,
-        mutation.version_index.sequence_no,
-    )
+    v = mutation.version_index.fdb_version
+    s = mutation.version_index.sequence_no
+    if record.source_id is not None and record.stream_id is not None:
+        return (record.source_id, record.stream_id, v, s)
+    return (v, s)
 
 
 def legacy_deduplication_identity(

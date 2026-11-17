@@ -170,10 +170,16 @@ def deserialize_record(data: bytes) -> Record:
         if (message.HasField("source_id") and message.source_id)
         else None
     )
+    body = _body(message)
+    if isinstance(body, VersionEnd) and directory is not None:
+        raise RecordDecodeError(
+            "VersionEnd record must not carry directory context",
+            reason=DecodeFailure.MALFORMED_WIRE,
+        )
     return Record(
         stream_name=message.stream_name,
         bridge_timestamp_ns=_bridge_timestamp_ns(message),
-        body=_body(message),
+        body=body,
         directory=directory,
         stream_id=stream_id,
         source_id=source_id,

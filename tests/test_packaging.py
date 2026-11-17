@@ -92,6 +92,8 @@ def installed(tmp_path_factory: pytest.TempPathFactory) -> InstalledWheel:
         "fdb_kafka_bridge.serialization",
         "fdbkafka.cdc.v1",
         "fdbkafka.cdc.v1.mutations_pb2",
+        "fdbkafka.bridge.state.v1",
+        "fdbkafka.bridge.state.v1.state_pb2",
     ],
 )
 def test_module_imports_from_site_packages(

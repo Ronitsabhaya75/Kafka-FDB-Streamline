@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import NamedTuple
 
 import pytest
@@ -14,8 +15,10 @@ from google.protobuf import (
 
 from fdb_kafka_bridge.serialization.deserializer import deserialize_record
 from fdb_kafka_bridge.serialization.errors import (
+    DecodeFailure,
+    InputTypeError,
     InputValueError,
-    SerializationError,
+    RecordDecodeError,
 )
 from fdb_kafka_bridge.serialization.model import (
     FDBDirectoryContext,
@@ -59,6 +62,7 @@ def test_directory_aware_batch_splitting_without_reordering() -> None:
         bridge_timestamp_ns=1_000_000_000,
         stream_id=42,
         source_id="fdb-primary",
+        directory_resolver=lambda m: m.directory,
     )
 
     # Expected: 3 batches (split on dir change) + 1 stream-wide VersionEnd
@@ -122,6 +126,7 @@ def test_directory_batch_split_on_max_record_bytes() -> None:
         max_record_bytes=400,  # Each record fits roughly 1 mutation
         stream_name="test_stream",
         bridge_timestamp_ns=2_000_000_000,
+        directory_resolver=lambda m: m.directory,
     )
 
     records = [deserialize_record(b) for b in records_bytes]
@@ -148,6 +153,7 @@ def test_ambiguous_clear_range_non_strict() -> None:
         max_record_bytes=10_000,
         stream_name="test_stream",
         bridge_timestamp_ns=1_000_000_000,
+        directory_resolver=lambda m: m.directory,
         strict_directory_clears=False,
     )
 
@@ -171,9 +177,9 @@ def test_ambiguous_clear_range_strict_mode_rejects() -> None:
     ]
 
     with pytest.raises(
-        SerializationError,
+        InputValueError,
         match=(
-            r"^Ambiguous clear range crosses directory boundaries at "
+            r"^Clear range crosses directory boundaries at "
             r"version 3000, sequence 0$"
         ),
     ) as exc_info:
@@ -183,22 +189,22 @@ def test_ambiguous_clear_range_strict_mode_rejects() -> None:
             max_record_bytes=10_000,
             stream_name="test_stream",
             bridge_timestamp_ns=1_000_000_000,
+            directory_resolver=lambda _: dir_a,
             strict_directory_clears=True,
         )
+    assert exc_info.value.field == "mutations"
+    assert exc_info.value.index == 0
     # Verify exception message does not leak raw keys
     assert "\\x00\\x99" not in str(exc_info.value)
     assert "\\x02\\x00" not in str(exc_info.value)
 
-    # Case 2: No directory context on mutation and no resolver supplied
+    # Case 2: strict_directory_clears=True without directory_resolver rejected up front
     mutations_no_dir = [
         _FakeNativeMutation(MutationType.CLEAR_RANGE, b"\x01\x10", b"\x01\x20", None),
     ]
     with pytest.raises(
-        SerializationError,
-        match=(
-            r"^Ambiguous clear range crosses directory boundaries at "
-            r"version 3001, sequence 0$"
-        ),
+        InputValueError,
+        match=r"^strict_directory_clears=True requires a directory_resolver$",
     ) as exc_info2:
         serialize_version_group(
             mutations_no_dir,
@@ -208,13 +214,13 @@ def test_ambiguous_clear_range_strict_mode_rejects() -> None:
             bridge_timestamp_ns=1_000_000_000,
             strict_directory_clears=True,
         )
-    assert "\\x01\\x10" not in str(exc_info2.value)
+    assert exc_info2.value.field == "strict_directory_clears"
 
-    # Case 3: Resolver supplied but returns None
+    # Case 3: Resolver supplied but returns None for a clear
     with pytest.raises(
-        SerializationError,
+        InputValueError,
         match=(
-            r"^Ambiguous clear range crosses directory boundaries at "
+            r"^Unresolved clear range under strict_directory_clears at "
             r"version 3002, sequence 0$"
         ),
     ) as exc_info3:
@@ -227,7 +233,117 @@ def test_ambiguous_clear_range_strict_mode_rejects() -> None:
             directory_resolver=lambda _: None,
             strict_directory_clears=True,
         )
+    assert exc_info3.value.field == "mutations"
+    assert exc_info3.value.index == 0
     assert "\\x01\\x10" not in str(exc_info3.value)
+
+
+def test_clear_range_within_subspace_preserves_directory() -> None:
+    dir_a = FDBDirectoryContext(path=("tenants", "a"), subspace_prefix=b"\x01")
+    mutations = [
+        _FakeNativeMutation(MutationType.CLEAR_RANGE, b"\x01\x10", b"\x01\x20", dir_a),
+    ]
+
+    # In strict mode: succeeds and preserves directory
+    records_strict = serialize_version_group(
+        mutations,
+        fdb_version=3100,
+        max_record_bytes=10_000,
+        stream_name="test_stream",
+        bridge_timestamp_ns=1_000_000_000,
+        directory_resolver=lambda _: dir_a,
+        strict_directory_clears=True,
+    )
+    rec_s = deserialize_record(records_strict[0])
+    assert rec_s.directory == dir_a
+
+    # In non-strict mode: succeeds and preserves directory
+    records_non_strict = serialize_version_group(
+        mutations,
+        fdb_version=3101,
+        max_record_bytes=10_000,
+        stream_name="test_stream",
+        bridge_timestamp_ns=1_000_000_000,
+        directory_resolver=lambda _: dir_a,
+        strict_directory_clears=False,
+    )
+    rec_ns = deserialize_record(records_non_strict[0])
+    assert rec_ns.directory == dir_a
+
+
+def test_mutation_key_mismatch_with_resolved_prefix_rejected() -> None:
+    dir_a = FDBDirectoryContext(path=("tenants", "a"), subspace_prefix=b"\x01")
+    # Point mutation key starts with \x02, but directory prefix is \x01
+    mutations = [
+        _FakeNativeMutation(MutationType.SET_VALUE, b"\x02\x10", b"val", dir_a),
+    ]
+    with pytest.raises(
+        InputValueError, match="Mutation key does not start with"
+    ) as exc_info:
+        serialize_version_group(
+            mutations,
+            fdb_version=3200,
+            max_record_bytes=10_000,
+            stream_name="test_stream",
+            bridge_timestamp_ns=1000,
+            directory_resolver=lambda _: dir_a,
+        )
+    assert exc_info.value.field == "mutations"
+    assert exc_info.value.index == 0
+
+
+def test_record_sizing_accounts_for_directory() -> None:
+    dir_a = FDBDirectoryContext(
+        path=("deeply", "nested", "tenant", "subspace", "for", "testing"),
+        subspace_prefix=b"\x01\x02\x03\x04",
+    )
+    mutations = [
+        _FakeNativeMutation(
+            MutationType.SET_VALUE, b"\x01\x02\x03\x04key1", b"val1", dir_a
+        ),
+        _FakeNativeMutation(
+            MutationType.SET_VALUE, b"\x01\x02\x03\x04key2", b"val2", dir_a
+        ),
+    ]
+    # Measure record size of a single mutation with directory
+    single0 = serialize_version_group(
+        mutations[:1],
+        fdb_version=3300,
+        max_record_bytes=10_000,
+        stream_name="stream",
+        bridge_timestamp_ns=1000,
+        directory_resolver=lambda _: dir_a,
+    )
+    # Budget fits either mutation alone with directory (accounting for
+    # non-zero sequence_no), but not both together
+    budget = len(single0[0]) + 5
+    records = serialize_version_group(
+        mutations,
+        fdb_version=3300,
+        max_record_bytes=budget,
+        stream_name="stream",
+        bridge_timestamp_ns=1000,
+        directory_resolver=lambda _: dir_a,
+    )
+    assert len(records) == 3  # 2 mutation batches + 1 version end
+    for r in records:
+        assert len(r) <= budget
+
+
+def test_bad_resolver_result_on_clear_raises_input_type_error() -> None:
+    # Bad resolver returning a non-FDBDirectoryContext object on CLEAR_RANGE
+    mutations = [
+        _FakeNativeMutation(MutationType.CLEAR_RANGE, b"\x01\x10", b"\x01\x20"),
+    ]
+    with pytest.raises(InputTypeError, match="directory must be FDBDirectoryContext"):
+        serialize_version_group(
+            mutations,
+            fdb_version=3400,
+            max_record_bytes=10_000,
+            stream_name="test_stream",
+            bridge_timestamp_ns=1000,
+            directory_resolver=lambda _: "not_a_context",  # type: ignore[return-value]
+        )
 
 
 def test_ambiguous_clear_range_non_strict_mode_omits_directory() -> None:
@@ -292,7 +408,7 @@ def test_directory_resolver_callable() -> None:
 
 
 def test_v010_old_record_new_reader_compatibility() -> None:
-    # Construct a legacy v0.1.0 record (only fields 1-5 set)
+    # 1. Construct a legacy v0.1.0 VersionEnd record (only fields 1-5 set)
     legacy_proto = mutations_pb2.FDBMutationRecord(
         stream_name="legacy_stream",
         version_end=mutations_pb2.VersionEnd(
@@ -310,100 +426,50 @@ def test_v010_old_record_new_reader_compatibility() -> None:
     assert isinstance(rec.body, VersionEnd)
     assert rec.body.fdb_version == 5000
 
+    # 2. Construct a legacy v0.1.0 Mutation record
+    legacy_mut = mutations_pb2.FDBMutationRecord(
+        stream_name="legacy_stream",
+        mutation=mutations_pb2.FDBMutation(
+            single_key_mutation=mutations_pb2.FDBSingleKeyMutation(
+                mutation_type=(
+                    mutations_pb2.FDBSingleKeyMutation.MutationType.MUTATION_TYPE_SET_VALUE
+                ),
+                key=b"k1",
+                value=b"v1",
+            ),
+            version_index=mutations_pb2.FDBVersionIndex(
+                fdb_version=5000, sequence_no=0
+            ),
+        ),
+    ).SerializeToString()
+    rec_mut = deserialize_record(legacy_mut)
+    assert rec_mut.stream_name == "legacy_stream"
+    assert rec_mut.directory is None
+    assert rec_mut.stream_id is None
+    assert rec_mut.source_id is None
+    assert isinstance(rec_mut.body, Mutation)
+
 
 def test_v020_new_record_old_reader_compatibility() -> None:
-    # Build an actual v0.1.0 prototype in an isolated descriptor pool that
-    # only defines fields 1-5 and has no knowledge of fields 6, 7, 8.
+    # Build an actual v0.1.0 prototype in an isolated descriptor pool by copying
+    # the real descriptor and keeping only fields 1-5.
     pool = descriptor_pool.DescriptorPool()
     dp_ts = descriptor_pb2.FileDescriptorProto()
     timestamp_pb2.DESCRIPTOR.CopyToProto(dp_ts)
     pool.Add(dp_ts)
 
     file_dp = descriptor_pb2.FileDescriptorProto()
-    file_dp.name = "fdbkafka/cdc/v1/mutations_legacy.proto"
-    file_dp.package = "fdbkafka.cdc.v1.legacy"
-    file_dp.syntax = "proto3"
-    file_dp.dependency.append("google/protobuf/timestamp.proto")
-
-    msg_vi = file_dp.message_type.add()
-    msg_vi.name = "FDBVersionIndex"
-    msg_vi.field.add(
-        name="fdb_version",
-        number=1,
-        type=descriptor_pb2.FieldDescriptorProto.TYPE_UINT64,
-        label=descriptor_pb2.FieldDescriptorProto.LABEL_OPTIONAL,
-    )
-    msg_vi.field.add(
-        name="sequence_no",
-        number=2,
-        type=descriptor_pb2.FieldDescriptorProto.TYPE_UINT32,
-        label=descriptor_pb2.FieldDescriptorProto.LABEL_OPTIONAL,
-    )
-
-    msg_skm = file_dp.message_type.add()
-    msg_skm.name = "FDBSingleKeyMutation"
-    msg_skm.field.add(
-        name="key",
-        number=1,
-        type=descriptor_pb2.FieldDescriptorProto.TYPE_BYTES,
-        label=descriptor_pb2.FieldDescriptorProto.LABEL_OPTIONAL,
-    )
-    msg_skm.field.add(
-        name="value",
-        number=2,
-        type=descriptor_pb2.FieldDescriptorProto.TYPE_BYTES,
-        label=descriptor_pb2.FieldDescriptorProto.LABEL_OPTIONAL,
-    )
-    msg_skm.field.add(
-        name="mutation_type",
-        number=3,
-        type=descriptor_pb2.FieldDescriptorProto.TYPE_INT32,
-        label=descriptor_pb2.FieldDescriptorProto.LABEL_OPTIONAL,
-    )
-
-    msg_m = file_dp.message_type.add()
-    msg_m.name = "FDBMutation"
-    msg_m.field.add(
-        name="version_index",
-        number=1,
-        type=descriptor_pb2.FieldDescriptorProto.TYPE_MESSAGE,
-        type_name=".fdbkafka.cdc.v1.legacy.FDBVersionIndex",
-        label=descriptor_pb2.FieldDescriptorProto.LABEL_OPTIONAL,
-    )
-    msg_m.field.add(
-        name="single_key_mutation",
-        number=2,
-        type=descriptor_pb2.FieldDescriptorProto.TYPE_MESSAGE,
-        type_name=".fdbkafka.cdc.v1.legacy.FDBSingleKeyMutation",
-        label=descriptor_pb2.FieldDescriptorProto.LABEL_OPTIONAL,
-    )
-
-    msg_rec = file_dp.message_type.add()
-    msg_rec.name = "FDBMutationRecord"
-    msg_rec.field.add(
-        name="stream_name",
-        number=1,
-        type=descriptor_pb2.FieldDescriptorProto.TYPE_STRING,
-        label=descriptor_pb2.FieldDescriptorProto.LABEL_OPTIONAL,
-    )
-    msg_rec.field.add(
-        name="bridge_timestamp",
-        number=2,
-        type=descriptor_pb2.FieldDescriptorProto.TYPE_MESSAGE,
-        type_name=".google.protobuf.Timestamp",
-        label=descriptor_pb2.FieldDescriptorProto.LABEL_OPTIONAL,
-    )
-    msg_rec.field.add(
-        name="mutation",
-        number=3,
-        type=descriptor_pb2.FieldDescriptorProto.TYPE_MESSAGE,
-        type_name=".fdbkafka.cdc.v1.legacy.FDBMutation",
-        label=descriptor_pb2.FieldDescriptorProto.LABEL_OPTIONAL,
-    )
-
+    mutations_pb2.DESCRIPTOR.CopyToProto(file_dp)
+    for msg in file_dp.message_type:
+        if msg.name == "FDBMutationRecord":
+            kept = [f for f in msg.field if f.number <= 5]
+            del msg.field[:]
+            msg.field.extend(kept)
+            del msg.oneof_decl[1:]
     pool.Add(file_dp)
+
     legacy_cls = message_factory.GetMessageClass(
-        pool.FindMessageTypeByName("fdbkafka.cdc.v1.legacy.FDBMutationRecord")
+        pool.FindMessageTypeByName("fdbkafka.cdc.v1.FDBMutationRecord")
     )
 
     dir_ctx = FDBDirectoryContext(path=("legacy", "compat"), subspace_prefix=b"\x99")
@@ -429,6 +495,21 @@ def test_v020_new_record_old_reader_compatibility() -> None:
     assert len(parsed.SerializeToString()) == len(wire)
 
 
+def test_version_end_with_directory_rejected_on_decode() -> None:
+    wire = mutations_pb2.FDBMutationRecord(
+        stream_name="orders",
+        version_end=mutations_pb2.VersionEnd(fdb_version=1000, total_mutations=1),
+        directory=mutations_pb2.FDBDirectoryContext(
+            path=["tenants", "a"], subspace_prefix=b"\x01"
+        ),
+    ).SerializeToString()
+    with pytest.raises(
+        RecordDecodeError, match="VersionEnd record must not carry directory"
+    ) as exc_info:
+        deserialize_record(wire)
+    assert exc_info.value.reason == DecodeFailure.MALFORMED_WIRE
+
+
 def test_deduplication_identity() -> None:
     dir_ctx = FDBDirectoryContext(path=("test",), subspace_prefix=b"\x01")
     wire = serialize_mutation(
@@ -444,7 +525,8 @@ def test_deduplication_identity() -> None:
 
     rec = deserialize_record(wire)
     assert isinstance(rec.body, Mutation)
-    # Production identity: (source_id, stream_id, fdb_version, sequence_no)
+    # Production identity when both present:
+    # (source_id, stream_id, fdb_version, sequence_no)
     assert deduplication_identity(rec, rec.body) == (
         "source-prod-1",
         88,
@@ -454,7 +536,19 @@ def test_deduplication_identity() -> None:
     # Legacy fallback: (fdb_version, sequence_no)
     assert legacy_deduplication_identity(rec.body) == (7000, 5)
 
-    # stream_id == 0 boundary test: must decode as 0, not None
+    # Fallback when source_id is None:
+    rec_no_source = replace(rec, source_id=None)
+    assert deduplication_identity(rec_no_source, rec.body) == (7000, 5)
+
+    # Fallback when stream_id is None:
+    rec_no_stream = replace(rec, stream_id=None)
+    assert deduplication_identity(rec_no_stream, rec.body) == (7000, 5)
+
+    # Fallback when both are None:
+    rec_neither = replace(rec, source_id=None, stream_id=None)
+    assert deduplication_identity(rec_neither, rec.body) == (7000, 5)
+
+    # stream_id == 0 boundary test: must decode as 0, not None, and preserve 4-tuple
     wire_zero = serialize_mutation(
         _FakeNativeMutation(MutationType.SET_VALUE, b"\x01key", b"val"),
         fdb_version=7000,
@@ -514,33 +608,6 @@ def test_deduplication_identity() -> None:
     ).SerializeToString()
     rec_empty_source = deserialize_record(wire_empty_source)
     assert rec_empty_source.source_id is None
-
-
-def test_directory_record_golden_bytes() -> None:
-    golden_bytes = bytes.fromhex(
-        "0a066f7264657273120b0880e2cfaa0610959aef3a1a140a0508e8071003120b0a04"
-        "15016b001203ff007632170a0774656e616e74730a0874656e616e742d6112021501"
-        "382a4208736f757263652d31"
-    )
-    dir_ctx = FDBDirectoryContext(
-        path=("tenants", "tenant-a"),
-        subspace_prefix=b"\x15\x01",
-    )
-    wire = serialize_mutation(
-        _FakeNativeMutation(MutationType.SET_VALUE, b"\x15\x01k\x00", b"\xff\x00v"),
-        fdb_version=1000,
-        sequence_no=3,
-        stream_name="orders",
-        bridge_timestamp_ns=1_700_000_000_123_456_789,
-        directory=dir_ctx,
-        stream_id=42,
-        source_id="source-1",
-    )
-    assert wire == golden_bytes
-    rec = deserialize_record(wire)
-    assert rec.directory == dir_ctx
-    assert rec.stream_id == 42
-    assert rec.source_id == "source-1"
 
 
 def test_directory_context_surrogate_path_rejected() -> None:

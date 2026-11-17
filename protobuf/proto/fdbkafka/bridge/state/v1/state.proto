@@ -29,10 +29,10 @@ message CDCCheckpoint {
     string stream_name = 3;
 
     // Native CDC stream identifier
-    uint64 stream_id = 4;
+    optional uint64 stream_id = 4;
 
-    // Highest commit version fully delivered to Kafka and acknowledged
-    uint64 last_consumed_version = 5;
+    // Highest commit version fully delivered to Kafka and acknowledged (-1 represents fresh cursor)
+    int64 last_consumed_version = 5;
 
     // Target Kafka sink identity for sink-mismatch protection
     KafkaSinkIdentity sink = 6;
@@ -47,26 +47,32 @@ message CDCCheckpoint {
     uint64 lease_epoch = 9;
 
     // Directory Layer range-configuration fingerprint for schema/range evolution safety
-    string range_config_fingerprint = 10;
+    bytes range_config_fingerprint = 10;
 }
 
 // Leader lease state recorded in FoundationDB for active leader coordination.
 message LeaderLease {
+    // State schema format version (e.g. 1 for v0.2.0)
+    uint32 format_version = 1;
+
     // Stable operator-configured identity of the FDB source
-    string source_id = 1;
+    string source_id = 2;
 
     // CDC stream name
-    string stream_name = 2;
+    string stream_name = 3;
 
     // Identity of the current leaseholder instance
-    string owner_instance_id = 3;
+    string owner_instance_id = 4;
 
     // Monotonically increasing lease epoch
-    uint64 lease_epoch = 4;
+    uint64 lease_epoch = 5;
 
     // Monotonically increasing heartbeat sequence number within the epoch
-    uint64 heartbeat_sequence = 5;
+    uint64 heartbeat_sequence = 6;
 
     // Wall-clock expiration timestamp of the lease
-    google.protobuf.Timestamp expiration_timestamp = 6;
+    google.protobuf.Timestamp expiration_timestamp = 7;
+
+    // Optional native CDC stream identifier
+    optional uint64 stream_id = 8;
 }

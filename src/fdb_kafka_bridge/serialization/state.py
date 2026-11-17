@@ -2,18 +2,20 @@
 
 from __future__ import annotations
 
-from typing import Any, Final
+from typing import Final
 
 from google.protobuf.message import DecodeError
 from google.protobuf.timestamp_pb2 import Timestamp
 
+from fdb_kafka_bridge.serialization import _checks, _wire
 from fdb_kafka_bridge.serialization.errors import (
     DecodeFailure,
     InputTypeError,
-    InputValueError,
-    RecordDecodeError,
+    StateDecodeError,
 )
 from fdb_kafka_bridge.serialization.model import (
+    _MAX_BRIDGE_TIMESTAMP_NS,
+    _MAX_VERSION,
     CDCCheckpoint,
     KafkaSinkIdentity,
     LeaderLease,
@@ -22,43 +24,11 @@ from fdbkafka.bridge.state.v1 import state_pb2
 
 CURRENT_FORMAT_VERSION: Final[int] = 1
 SUPPORTED_FORMAT_VERSIONS: Final[frozenset[int]] = frozenset({CURRENT_FORMAT_VERSION})
-INT64_MAX: Final[int] = (1 << 63) - 1
+INT64_MAX: Final[int] = _MAX_VERSION
 UINT64_MAX: Final[int] = (1 << 64) - 1
 MAX_TIMESTAMP_SECONDS: Final[int] = 253_402_300_799
-MAX_TIMESTAMP_NS: Final[int] = 253_402_300_799_999_999_999
+MAX_TIMESTAMP_NS: Final[int] = _MAX_BRIDGE_TIMESTAMP_NS
 NANOS_PER_SECOND: Final[int] = 10**9
-
-
-def _timestamp_from_ns(
-    timestamp_ns: int,
-    *,
-    field: str = "timestamp",
-) -> Timestamp:
-    """Convert integer Unix nanoseconds to google.protobuf.Timestamp.
-
-    Args:
-        timestamp_ns: Integer Unix nanoseconds since epoch.
-        field: Name of the field for error reporting.
-
-    Returns:
-        google.protobuf.Timestamp.
-
-    Raises:
-        InputTypeError: If timestamp_ns is not int.
-        InputValueError: If timestamp_ns is negative or exceeds MAX_TIMESTAMP_NS.
-    """
-    if type(timestamp_ns) is not int:
-        raise InputTypeError(
-            f"{field} must be int, got {type(timestamp_ns).__name__}",
-            field=field,
-        )
-    if not (0 <= timestamp_ns <= MAX_TIMESTAMP_NS):
-        raise InputValueError(
-            f"{field} must be in 0..{MAX_TIMESTAMP_NS}, got {timestamp_ns}",
-            field=field,
-        )
-    seconds, nanos = divmod(timestamp_ns, NANOS_PER_SECOND)
-    return Timestamp(seconds=seconds, nanos=nanos)
 
 
 def _ns_from_timestamp(msg: Timestamp) -> int:
@@ -71,56 +41,19 @@ def _ns_from_timestamp(msg: Timestamp) -> int:
         Integer nanoseconds since Unix epoch.
 
     Raises:
-        RecordDecodeError: If timestamp is malformed or out of range.
+        StateDecodeError: If timestamp is malformed or out of range.
     """
     if not (0 <= msg.nanos < NANOS_PER_SECOND):
-        raise RecordDecodeError(
+        raise StateDecodeError(
             f"Invalid timestamp nanos: {msg.nanos}",
             reason=DecodeFailure.MALFORMED_WIRE,
         )
     if not (0 <= msg.seconds <= MAX_TIMESTAMP_SECONDS):
-        raise RecordDecodeError(
+        raise StateDecodeError(
             f"Invalid timestamp seconds: {msg.seconds}",
             reason=DecodeFailure.MALFORMED_WIRE,
         )
     return msg.seconds * NANOS_PER_SECOND + msg.nanos
-
-
-def _check_utf8_str(
-    value: Any,
-    field: str,
-    *,
-    allow_empty: bool = False,
-) -> None:
-    """Validate that a value is a UTF-8 encodable string.
-
-    Args:
-        value: The value to validate.
-        field: Name of the field for error reporting.
-        allow_empty: Whether an empty string is permissible.
-
-    Raises:
-        InputTypeError: If value is not a str.
-        InputValueError: If value is empty (when not allow_empty) or not
-            UTF-8 encodable.
-    """
-    if not isinstance(value, str):
-        raise InputTypeError(
-            f"{field} must be str, got {type(value).__name__}",
-            field=field,
-        )
-    if not allow_empty and not value:
-        raise InputValueError(
-            f"{field} must be non-empty str",
-            field=field,
-        )
-    try:
-        value.encode("utf-8")
-    except UnicodeEncodeError:
-        raise InputValueError(
-            f"{field} (str of length {len(value)}) is not UTF-8-encodable",
-            field=field,
-        ) from None
 
 
 def validate_checkpoint_model(checkpoint: CDCCheckpoint) -> None:
@@ -138,74 +71,59 @@ def validate_checkpoint_model(checkpoint: CDCCheckpoint) -> None:
             f"checkpoint must be CDCCheckpoint, got {type(checkpoint).__name__}",
             field="checkpoint",
         )
-    if type(checkpoint.format_version) is not int:
-        raise InputTypeError(
-            f"format_version must be int, got "
-            f"{type(checkpoint.format_version).__name__}",
-            field="format_version",
-        )
-    if checkpoint.format_version not in SUPPORTED_FORMAT_VERSIONS:
-        supported = sorted(SUPPORTED_FORMAT_VERSIONS)
-        raise InputValueError(
-            f"format_version must be in {supported}, got {checkpoint.format_version!r}",
-            field="format_version",
-        )
-    _check_utf8_str(checkpoint.source_id, "source_id")
-    _check_utf8_str(checkpoint.stream_name, "stream_name")
+    _checks._integer(
+        checkpoint.format_version,
+        field="format_version",
+        minimum=1,
+        maximum=1,
+    )
+    _checks._text(checkpoint.source_id, "source_id")
+    _checks._text(checkpoint.stream_name, "stream_name")
 
-    if type(checkpoint.stream_id) is not int:
-        raise InputTypeError("stream_id must be int", field="stream_id")
-    if not (0 <= checkpoint.stream_id <= UINT64_MAX):
-        raise InputValueError(
-            f"stream_id must be in 0..{UINT64_MAX}, got {checkpoint.stream_id}",
+    if checkpoint.stream_id is not None:
+        _checks._integer(
+            checkpoint.stream_id,
             field="stream_id",
+            minimum=0,
+            maximum=UINT64_MAX,
         )
 
-    if type(checkpoint.last_consumed_version) is not int:
-        raise InputTypeError(
-            "last_consumed_version must be int", field="last_consumed_version"
-        )
-    if not (0 <= checkpoint.last_consumed_version <= INT64_MAX):
-        raise InputValueError(
-            f"last_consumed_version must be in 0..{INT64_MAX}, "
-            f"got {checkpoint.last_consumed_version}",
-            field="last_consumed_version",
-        )
+    # -1 represents a fresh CDC cursor; commit versions run up to INT64_MAX
+    _checks._integer(
+        checkpoint.last_consumed_version,
+        field="last_consumed_version",
+        minimum=-1,
+        maximum=INT64_MAX,
+    )
 
     if not isinstance(checkpoint.sink, KafkaSinkIdentity):
         raise InputTypeError(
             f"sink must be KafkaSinkIdentity, got {type(checkpoint.sink).__name__}",
             field="sink",
         )
-    _check_utf8_str(checkpoint.sink.cluster_id, "sink.cluster_id")
-    _check_utf8_str(checkpoint.sink.topic, "sink.topic")
-    _check_utf8_str(checkpoint.updating_instance_id, "updating_instance_id")
+    _checks._text(checkpoint.sink.cluster_id, "sink.cluster_id")
+    _checks._text(checkpoint.sink.topic, "sink.topic")
+    _checks._text(checkpoint.updating_instance_id, "updating_instance_id")
 
-    if type(checkpoint.update_timestamp_ns) is not int:
-        raise InputTypeError(
-            "update_timestamp_ns must be int",
-            field="update_timestamp_ns",
-        )
-    if not (0 <= checkpoint.update_timestamp_ns <= MAX_TIMESTAMP_NS):
-        raise InputValueError(
-            f"update_timestamp_ns must be in 0..{MAX_TIMESTAMP_NS}, "
-            f"got {checkpoint.update_timestamp_ns}",
-            field="update_timestamp_ns",
-        )
-
-    if type(checkpoint.lease_epoch) is not int:
-        raise InputTypeError("lease_epoch must be int", field="lease_epoch")
-    if not (0 <= checkpoint.lease_epoch <= UINT64_MAX):
-        raise InputValueError(
-            f"lease_epoch must be in 0..{UINT64_MAX}, got {checkpoint.lease_epoch}",
-            field="lease_epoch",
-        )
-
-    _check_utf8_str(
-        checkpoint.range_config_fingerprint,
-        "range_config_fingerprint",
-        allow_empty=True,
+    _checks._integer(
+        checkpoint.update_timestamp_ns,
+        field="update_timestamp_ns",
+        minimum=0,
+        maximum=MAX_TIMESTAMP_NS,
     )
+    _checks._integer(
+        checkpoint.lease_epoch,
+        field="lease_epoch",
+        minimum=0,
+        maximum=UINT64_MAX,
+    )
+
+    if not isinstance(checkpoint.range_config_fingerprint, bytes):
+        raise InputTypeError(
+            f"range_config_fingerprint must be bytes, got "
+            f"{type(checkpoint.range_config_fingerprint).__name__}",
+            field="range_config_fingerprint",
+        )
 
 
 def validate_lease_model(lease: LeaderLease) -> None:
@@ -223,39 +141,41 @@ def validate_lease_model(lease: LeaderLease) -> None:
             f"lease must be LeaderLease, got {type(lease).__name__}",
             field="lease",
         )
-    _check_utf8_str(lease.source_id, "source_id")
-    _check_utf8_str(lease.stream_name, "stream_name")
-    _check_utf8_str(lease.owner_instance_id, "owner_instance_id")
+    _checks._integer(
+        lease.format_version,
+        field="format_version",
+        minimum=1,
+        maximum=1,
+    )
+    _checks._text(lease.source_id, "source_id")
+    _checks._text(lease.stream_name, "stream_name")
+    _checks._text(lease.owner_instance_id, "owner_instance_id")
 
-    if type(lease.lease_epoch) is not int:
-        raise InputTypeError("lease_epoch must be int", field="lease_epoch")
-    if not (0 <= lease.lease_epoch <= UINT64_MAX):
-        raise InputValueError(
-            f"lease_epoch must be in 0..{UINT64_MAX}, got {lease.lease_epoch}",
-            field="lease_epoch",
-        )
+    _checks._integer(
+        lease.lease_epoch,
+        field="lease_epoch",
+        minimum=0,
+        maximum=UINT64_MAX,
+    )
+    _checks._integer(
+        lease.heartbeat_sequence,
+        field="heartbeat_sequence",
+        minimum=0,
+        maximum=UINT64_MAX,
+    )
+    _checks._integer(
+        lease.expiration_timestamp_ns,
+        field="expiration_timestamp_ns",
+        minimum=0,
+        maximum=MAX_TIMESTAMP_NS,
+    )
 
-    if type(lease.heartbeat_sequence) is not int:
-        raise InputTypeError(
-            "heartbeat_sequence must be int", field="heartbeat_sequence"
-        )
-    if not (0 <= lease.heartbeat_sequence <= UINT64_MAX):
-        raise InputValueError(
-            f"heartbeat_sequence must be in 0..{UINT64_MAX}, "
-            f"got {lease.heartbeat_sequence}",
-            field="heartbeat_sequence",
-        )
-
-    if type(lease.expiration_timestamp_ns) is not int:
-        raise InputTypeError(
-            "expiration_timestamp_ns must be int",
-            field="expiration_timestamp_ns",
-        )
-    if not (0 <= lease.expiration_timestamp_ns <= MAX_TIMESTAMP_NS):
-        raise InputValueError(
-            f"expiration_timestamp_ns must be in 0..{MAX_TIMESTAMP_NS}, "
-            f"got {lease.expiration_timestamp_ns}",
-            field="expiration_timestamp_ns",
+    if lease.stream_id is not None:
+        _checks._integer(
+            lease.stream_id,
+            field="stream_id",
+            minimum=0,
+            maximum=UINT64_MAX,
         )
 
 
@@ -278,9 +198,7 @@ def serialize_checkpoint(checkpoint: CDCCheckpoint) -> bytes:
         cluster_id=checkpoint.sink.cluster_id,
         topic=checkpoint.sink.topic,
     )
-    ts_msg = _timestamp_from_ns(
-        checkpoint.update_timestamp_ns, field="update_timestamp_ns"
-    )
+    ts_msg = _wire.timestamp(checkpoint.update_timestamp_ns)
 
     msg = state_pb2.CDCCheckpoint(
         format_version=checkpoint.format_version,
@@ -308,7 +226,7 @@ def deserialize_checkpoint(data: bytes) -> CDCCheckpoint:
 
     Raises:
         InputTypeError: If data is not bytes.
-        RecordDecodeError: If bytes are malformed, unsupported, or incomplete.
+        StateDecodeError: If bytes are malformed, unsupported, or incomplete.
     """
     if not isinstance(data, bytes):
         raise InputTypeError(
@@ -318,61 +236,62 @@ def deserialize_checkpoint(data: bytes) -> CDCCheckpoint:
     try:
         msg.ParseFromString(data)
     except (DecodeError, ValueError) as exc:
-        raise RecordDecodeError(
+        raise StateDecodeError(
             f"{len(data)} bytes are not a parseable CDCCheckpoint",
             reason=DecodeFailure.MALFORMED_WIRE,
         ) from exc
 
     if msg.format_version not in SUPPORTED_FORMAT_VERSIONS:
-        raise RecordDecodeError(
+        raise StateDecodeError(
             f"Checkpoint format_version {msg.format_version} is unsupported",
-            reason=DecodeFailure.MALFORMED_WIRE,
+            reason=DecodeFailure.UNSUPPORTED_FORMAT_VERSION,
         )
     if not msg.source_id:
-        raise RecordDecodeError(
+        raise StateDecodeError(
             "Checkpoint missing or empty source_id",
             reason=DecodeFailure.MALFORMED_WIRE,
         )
     if not msg.stream_name:
-        raise RecordDecodeError(
+        raise StateDecodeError(
             "Checkpoint missing or empty stream_name",
             reason=DecodeFailure.MALFORMED_WIRE,
         )
-    if not (0 <= msg.last_consumed_version <= INT64_MAX):
-        raise RecordDecodeError(
+    if not (-1 <= msg.last_consumed_version <= INT64_MAX):
+        raise StateDecodeError(
             f"Checkpoint last_consumed_version {msg.last_consumed_version} "
-            f"exceeds INT64_MAX",
-            reason=DecodeFailure.MALFORMED_WIRE,
+            f"is out of range",
+            reason=DecodeFailure.VERSION_OUT_OF_RANGE,
         )
     if not msg.updating_instance_id:
-        raise RecordDecodeError(
+        raise StateDecodeError(
             "Checkpoint missing or empty updating_instance_id",
             reason=DecodeFailure.MALFORMED_WIRE,
         )
     if not msg.HasField("sink"):
-        raise RecordDecodeError(
+        raise StateDecodeError(
             "Checkpoint missing Kafka sink identity",
             reason=DecodeFailure.MALFORMED_WIRE,
         )
     if not msg.sink.cluster_id or not msg.sink.topic:
-        raise RecordDecodeError(
+        raise StateDecodeError(
             "Checkpoint sink has empty cluster_id or topic",
             reason=DecodeFailure.MALFORMED_WIRE,
         )
     if not msg.HasField("update_timestamp"):
-        raise RecordDecodeError(
+        raise StateDecodeError(
             "Checkpoint missing required update_timestamp",
             reason=DecodeFailure.MALFORMED_WIRE,
         )
 
     sink = KafkaSinkIdentity(cluster_id=msg.sink.cluster_id, topic=msg.sink.topic)
     update_ts = _ns_from_timestamp(msg.update_timestamp)
+    stream_id = msg.stream_id if msg.HasField("stream_id") else None
 
     return CDCCheckpoint(
         format_version=msg.format_version,
         source_id=msg.source_id,
         stream_name=msg.stream_name,
-        stream_id=msg.stream_id,
+        stream_id=stream_id,
         last_consumed_version=msg.last_consumed_version,
         sink=sink,
         updating_instance_id=msg.updating_instance_id,
@@ -397,16 +316,16 @@ def serialize_leader_lease(lease: LeaderLease) -> bytes:
     """
     validate_lease_model(lease)
 
-    ts_msg = _timestamp_from_ns(
-        lease.expiration_timestamp_ns, field="expiration_timestamp_ns"
-    )
+    ts_msg = _wire.timestamp(lease.expiration_timestamp_ns)
     msg = state_pb2.LeaderLease(
+        format_version=lease.format_version,
         source_id=lease.source_id,
         stream_name=lease.stream_name,
         owner_instance_id=lease.owner_instance_id,
         lease_epoch=lease.lease_epoch,
         heartbeat_sequence=lease.heartbeat_sequence,
         expiration_timestamp=ts_msg,
+        stream_id=lease.stream_id,
     )
     return msg.SerializeToString()
 
@@ -422,7 +341,7 @@ def deserialize_leader_lease(data: bytes) -> LeaderLease:
 
     Raises:
         InputTypeError: If data is not bytes.
-        RecordDecodeError: If bytes are malformed, unsupported, or incomplete.
+        StateDecodeError: If bytes are malformed, unsupported, or incomplete.
     """
     if not isinstance(data, bytes):
         raise InputTypeError(
@@ -432,39 +351,47 @@ def deserialize_leader_lease(data: bytes) -> LeaderLease:
     try:
         msg.ParseFromString(data)
     except (DecodeError, ValueError) as exc:
-        raise RecordDecodeError(
+        raise StateDecodeError(
             f"{len(data)} bytes are not a parseable LeaderLease",
             reason=DecodeFailure.MALFORMED_WIRE,
         ) from exc
 
+    if msg.format_version not in SUPPORTED_FORMAT_VERSIONS:
+        raise StateDecodeError(
+            f"LeaderLease format_version {msg.format_version} is unsupported",
+            reason=DecodeFailure.UNSUPPORTED_FORMAT_VERSION,
+        )
     if not msg.source_id:
-        raise RecordDecodeError(
+        raise StateDecodeError(
             "LeaderLease missing or empty source_id",
             reason=DecodeFailure.MALFORMED_WIRE,
         )
     if not msg.stream_name:
-        raise RecordDecodeError(
+        raise StateDecodeError(
             "LeaderLease missing or empty stream_name",
             reason=DecodeFailure.MALFORMED_WIRE,
         )
     if not msg.owner_instance_id:
-        raise RecordDecodeError(
+        raise StateDecodeError(
             "LeaderLease missing or empty owner_instance_id",
             reason=DecodeFailure.MALFORMED_WIRE,
         )
     if not msg.HasField("expiration_timestamp"):
-        raise RecordDecodeError(
+        raise StateDecodeError(
             "LeaderLease missing required expiration_timestamp",
             reason=DecodeFailure.MALFORMED_WIRE,
         )
 
     exp_ts = _ns_from_timestamp(msg.expiration_timestamp)
+    stream_id = msg.stream_id if msg.HasField("stream_id") else None
 
     return LeaderLease(
+        format_version=msg.format_version,
         source_id=msg.source_id,
         stream_name=msg.stream_name,
         owner_instance_id=msg.owner_instance_id,
         lease_epoch=msg.lease_epoch,
         heartbeat_sequence=msg.heartbeat_sequence,
         expiration_timestamp_ns=exp_ts,
+        stream_id=stream_id,
     )

@@ -15,6 +15,7 @@ from fdb_kafka_bridge.serialization.model import (
     _MAX_TOTAL_MUTATIONS,
     _MAX_TYPE_CODE,
     _MAX_VERSION,
+    FDBDirectoryContext,
     NativeMutation,
 )
 
@@ -81,22 +82,51 @@ def max_record_bytes(value: int) -> None:
     _integer(value, field="max_record_bytes", maximum=None, minimum=1)
 
 
-def stream_name(value: str) -> None:
-    """Require a non-empty `str` that encodes as UTF-8."""
+def _text(
+    value: Any,
+    field: str,
+    *,
+    allow_empty: bool = False,
+    index: int | None = None,
+) -> None:
+    """Require a str that encodes as UTF-8.
+
+    Args:
+        value: The value to check.
+        field: Parameter or attribute name to report.
+        allow_empty: Whether an empty string is permissible.
+        index: Position in mutations, or None outside a batch.
+
+    Raises:
+        InputTypeError: If value is not a str.
+        InputValueError: If value is empty (when not allow_empty) or not
+            UTF-8 encodable.
+    """
     if not isinstance(value, str):
         raise InputTypeError(
-            f"stream_name must be str, got {type(value).__name__}", field="stream_name"
+            f"{field}{at(index)} must be str, got {type(value).__name__}",
+            field=field,
+            index=index,
         )
-    if not value:
-        raise InputValueError("stream_name must not be empty", field="stream_name")
+    if not allow_empty and not value:
+        raise InputValueError(
+            f"{field}{at(index)} must not be empty",
+            field=field,
+            index=index,
+        )
     try:
         value.encode("utf-8")
     except UnicodeEncodeError:
-        # `from None` because the codec error carries the whole name.
         raise InputValueError(
-            f"stream_name (str of length {len(value)}) is not UTF-8-encodable",
-            field="stream_name",
+            f"{field}{at(index)} (str of length {len(value)}) is not UTF-8-encodable",
+            field=field,
+            index=index,
         ) from None
+
+
+def stream_name(value: str) -> None:
+    """Require a non-empty `str` that encodes as UTF-8."""
+    _text(value, "stream_name")
 
 
 def bridge_timestamp_ns(value: int) -> None:
@@ -202,26 +232,13 @@ def stream_id(value: int | None) -> None:
 def source_id(value: str | None) -> None:
     """Require None or non-empty UTF-8 str."""
     if value is not None:
-        if not isinstance(value, str):
-            raise InputTypeError(
-                f"source_id must be str, got {type(value).__name__}",
-                field="source_id",
-            )
-        if not value:
-            raise InputValueError("source_id must not be empty", field="source_id")
-        try:
-            value.encode("utf-8")
-        except UnicodeEncodeError:
-            raise InputValueError(
-                "source_id is not UTF-8-encodable",
-                field="source_id",
-            ) from None
+        _text(value, "source_id")
 
 
 def directory_context(value: Any) -> None:
     """Require None or valid FDBDirectoryContext."""
     if value is not None:
-        if not hasattr(value, "path") or not hasattr(value, "subspace_prefix"):
+        if not isinstance(value, FDBDirectoryContext):
             raise InputTypeError(
                 f"directory must be FDBDirectoryContext, got {type(value).__name__}",
                 field="directory",

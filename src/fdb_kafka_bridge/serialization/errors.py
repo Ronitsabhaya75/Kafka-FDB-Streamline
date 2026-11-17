@@ -68,6 +68,7 @@ class DecodeFailure(enum.Enum):
     MISSING_VERSION_INDEX = "missing_version_index"
     TYPE_CODE_OUT_OF_RANGE = "type_code_out_of_range"
     VERSION_OUT_OF_RANGE = "version_out_of_range"
+    UNSUPPORTED_FORMAT_VERSION = "unsupported_format_version"
     EMPTY_BATCH = "empty_batch"
     INCONSISTENT_BATCH = "inconsistent_batch"
 
@@ -87,3 +88,15 @@ class RecordDecodeError(SerializationError, ValueError):
         super().__init__(message)
         self.reason = reason
         self.index = index
+
+
+class StateDecodeError(RecordDecodeError):
+    """The bytes are an undecodable bridge control-plane state message.
+
+    Attributes:
+        reason: The check that failed.
+    """
+
+    def __init__(self, message: str, *, reason: DecodeFailure) -> None:
+        """Store the failed check."""
+        super().__init__(message, reason=reason, index=None)
