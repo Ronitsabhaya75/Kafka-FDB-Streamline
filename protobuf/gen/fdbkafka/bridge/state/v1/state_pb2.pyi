@@ -1,5 +1,3 @@
-import datetime
-
 from google.protobuf import timestamp_pb2 as _timestamp_pb2
 from google.protobuf import descriptor as _descriptor
 from google.protobuf import message as _message
@@ -38,7 +36,7 @@ class CDCCheckpoint(_message.Message):
     update_timestamp: _timestamp_pb2.Timestamp
     lease_epoch: int
     range_config_fingerprint: bytes
-    def __init__(self, format_version: _Optional[int] = ..., source_id: _Optional[str] = ..., stream_name: _Optional[str] = ..., stream_id: _Optional[int] = ..., last_consumed_version: _Optional[int] = ..., sink: _Optional[_Union[KafkaSinkIdentity, _Mapping]] = ..., updating_instance_id: _Optional[str] = ..., update_timestamp: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., lease_epoch: _Optional[int] = ..., range_config_fingerprint: _Optional[bytes] = ...) -> None: ...
+    def __init__(self, format_version: _Optional[int] = ..., source_id: _Optional[str] = ..., stream_name: _Optional[str] = ..., stream_id: _Optional[int] = ..., last_consumed_version: _Optional[int] = ..., sink: _Optional[_Union[KafkaSinkIdentity, _Mapping]] = ..., updating_instance_id: _Optional[str] = ..., update_timestamp: _Optional[_Union[_timestamp_pb2.Timestamp, _Mapping]] = ..., lease_epoch: _Optional[int] = ..., range_config_fingerprint: _Optional[bytes] = ...) -> None: ...
 
 class LeaderLease(_message.Message):
     __slots__ = ("format_version", "source_id", "stream_name", "owner_instance_id", "lease_epoch", "heartbeat_sequence", "expiration_timestamp", "stream_id")
@@ -58,4 +56,4 @@ class LeaderLease(_message.Message):
     heartbeat_sequence: int
     expiration_timestamp: _timestamp_pb2.Timestamp
     stream_id: int
-    def __init__(self, format_version: _Optional[int] = ..., source_id: _Optional[str] = ..., stream_name: _Optional[str] = ..., owner_instance_id: _Optional[str] = ..., lease_epoch: _Optional[int] = ..., heartbeat_sequence: _Optional[int] = ..., expiration_timestamp: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., stream_id: _Optional[int] = ...) -> None: ...
+    def __init__(self, format_version: _Optional[int] = ..., source_id: _Optional[str] = ..., stream_name: _Optional[str] = ..., owner_instance_id: _Optional[str] = ..., lease_epoch: _Optional[int] = ..., heartbeat_sequence: _Optional[int] = ..., expiration_timestamp: _Optional[_Union[_timestamp_pb2.Timestamp, _Mapping]] = ..., stream_id: _Optional[int] = ...) -> None: ...
