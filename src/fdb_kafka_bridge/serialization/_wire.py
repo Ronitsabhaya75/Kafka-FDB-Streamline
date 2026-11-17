@@ -4,10 +4,12 @@ Nothing here validates. Every argument must already have passed `_checks`:
 protobuf swallows a `None` kwarg instead of raising.
 """
 
+from typing import Any
+
 from google.protobuf.message import Message
 from google.protobuf.timestamp_pb2 import Timestamp
 
-from fdb_kafka_bridge.serialization.model import MutationType
+from fdb_kafka_bridge.serialization.model import FDBDirectoryContext, MutationType
 from fdbkafka.cdc.v1 import mutations_pb2
 
 
@@ -17,14 +19,41 @@ def timestamp(bridge_timestamp_ns: int) -> Timestamp:
     return Timestamp(seconds=seconds, nanos=nanos)
 
 
-def record(stream_name: str, bridge_timestamp_ns: int, **body: Message) -> bytes:
+def directory_message(
+    directory: FDBDirectoryContext | None,
+) -> mutations_pb2.FDBDirectoryContext | None:
+    """Build an FDBDirectoryContext protobuf message if directory context is given."""
+    if directory is None:
+        return None
+    return mutations_pb2.FDBDirectoryContext(
+        path=directory.path,
+        subspace_prefix=directory.subspace_prefix,
+    )
+
+
+def record(
+    stream_name: str,
+    bridge_timestamp_ns: int,
+    *,
+    directory: FDBDirectoryContext | None = None,
+    stream_id: int | None = None,
+    source_id: str | None = None,
+    **body: Message,
+) -> bytes:
     """An `FDBMutationRecord`'s bytes: the envelope plus the `body` oneof, if any."""
     # The constructor kwarg keeps a zero Timestamp present on the wire.
-    return mutations_pb2.FDBMutationRecord(
-        stream_name=stream_name,
-        bridge_timestamp=timestamp(bridge_timestamp_ns),
-        **body,
-    ).SerializeToString()
+    kwargs: dict[str, Any] = {
+        "stream_name": stream_name,
+        "bridge_timestamp": timestamp(bridge_timestamp_ns),
+    }
+    if directory is not None:
+        kwargs["directory"] = directory_message(directory)
+    if stream_id is not None:
+        kwargs["stream_id"] = stream_id
+    if source_id is not None:
+        kwargs["source_id"] = source_id
+    kwargs.update(body)
+    return mutations_pb2.FDBMutationRecord(**kwargs).SerializeToString()
 
 
 def mutation_message(

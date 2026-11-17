@@ -11,6 +11,7 @@ from fdb_kafka_bridge.serialization.errors import (
 from fdb_kafka_bridge.serialization.model import (
     _MAX_TYPE_CODE,
     _MAX_VERSION,
+    FDBDirectoryContext,
     Mutation,
     MutationBatch,
     MutationType,
@@ -157,8 +158,19 @@ def deserialize_record(data: bytes) -> Record:
             f"{len(data)} bytes are not a parseable FDBMutationRecord",
             reason=DecodeFailure.MALFORMED_WIRE,
         ) from exc
+    directory: FDBDirectoryContext | None = None
+    if message.HasField("directory"):
+        directory = FDBDirectoryContext(
+            path=tuple(message.directory.path),
+            subspace_prefix=message.directory.subspace_prefix,
+        )
+    stream_id = message.stream_id if message.stream_id != 0 else None
+    source_id = message.source_id if message.source_id != "" else None
     return Record(
         stream_name=message.stream_name,
         bridge_timestamp_ns=_bridge_timestamp_ns(message),
         body=_body(message),
+        directory=directory,
+        stream_id=stream_id,
+        source_id=source_id,
     )

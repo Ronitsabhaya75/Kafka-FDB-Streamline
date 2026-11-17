@@ -191,3 +191,54 @@ def natives(
         assigned_sequence_no(first_sequence_no + index, index=index)
         checked.append(native(mutation, index=index))
     return checked
+
+
+def stream_id(value: int | None) -> None:
+    """Require None or uint64 in 0..2**64 - 1."""
+    if value is not None:
+        _integer(value, field="stream_id", maximum=2**64 - 1)
+
+
+def source_id(value: str | None) -> None:
+    """Require None or UTF-8 str."""
+    if value is not None:
+        if not isinstance(value, str):
+            raise InputTypeError(
+                f"source_id must be str, got {type(value).__name__}",
+                field="source_id",
+            )
+        try:
+            value.encode("utf-8")
+        except UnicodeEncodeError:
+            raise InputValueError(
+                "source_id is not UTF-8-encodable",
+                field="source_id",
+            ) from None
+
+
+def directory_context(value: Any) -> None:
+    """Require None or valid FDBDirectoryContext."""
+    if value is not None:
+        if not hasattr(value, "path") or not hasattr(value, "subspace_prefix"):
+            raise InputTypeError(
+                f"directory must be FDBDirectoryContext, got {type(value).__name__}",
+                field="directory",
+            )
+        if not isinstance(value.subspace_prefix, bytes):
+            raise InputTypeError(
+                "directory.subspace_prefix must be bytes, got "
+                f"{type(value.subspace_prefix).__name__}",
+                field="directory.subspace_prefix",
+            )
+        if not isinstance(value.path, (tuple, list)):
+            got = type(value.path).__name__
+            raise InputTypeError(
+                f"directory.path must be tuple or list, got {got}",
+                field="directory.path",
+            )
+        for i, elem in enumerate(value.path):
+            if not isinstance(elem, str):
+                raise InputTypeError(
+                    f"directory.path[{i}] must be str, got {type(elem).__name__}",
+                    field="directory.path",
+                )

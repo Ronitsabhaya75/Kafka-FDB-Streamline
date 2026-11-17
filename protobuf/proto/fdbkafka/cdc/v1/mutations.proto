@@ -88,6 +88,15 @@ message FDBMutationBatch {
     repeated FDBMutation mutations = 1;
 }
 
+// Context identifying a FoundationDB Directory Layer directory.
+message FDBDirectoryContext {
+    // Hierarchical directory path components (e.g. ["tenants", "tenant_a", "orders"])
+    repeated string path = 1;
+
+    // Binary subspace prefix allocated by the Directory Layer
+    bytes subspace_prefix = 2;
+}
+
 // Top-level Kafka record envelope.
 message FDBMutationRecord {
     // Directory or CDC stream identifier
@@ -102,4 +111,14 @@ message FDBMutationRecord {
         VersionEnd version_end = 4;
         FDBMutationBatch batch = 5;
     }
+
+    // Optional Directory Layer context when every mutation in the record
+    // maps unambiguously to one resolved directory.
+    FDBDirectoryContext directory = 6;
+
+    // Native CDC stream identifier (distinguishes deleted/recreated streams using the same name)
+    uint64 stream_id = 7;
+
+    // Stable operator-configured identity for the FDB source cluster/deployment
+    string source_id = 8;
 }

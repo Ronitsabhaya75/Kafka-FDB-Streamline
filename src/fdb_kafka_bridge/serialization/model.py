@@ -94,6 +94,14 @@ class VersionEnd:
     bridge_timestamp_ns: int | None
 
 
+@dataclass(frozen=True, slots=True)
+class FDBDirectoryContext:
+    """Resolved FoundationDB Directory Layer context for a record."""
+
+    path: tuple[str, ...]
+    subspace_prefix: bytes
+
+
 type RecordBody = Mutation | MutationBatch | VersionEnd
 
 
@@ -104,3 +112,88 @@ class Record:
     stream_name: str
     bridge_timestamp_ns: int | None
     body: RecordBody
+    directory: FDBDirectoryContext | None = None
+    stream_id: int | None = None
+    source_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class KafkaSinkIdentity:
+    """Target Kafka cluster and topic for sink-mismatch protection."""
+
+    cluster_id: str
+    topic: str
+
+
+@dataclass(frozen=True, slots=True)
+class CDCCheckpoint:
+    """Durable CDC checkpoint state recorded in FoundationDB."""
+
+    format_version: int
+    source_id: str
+    stream_name: str
+    stream_id: int
+    last_consumed_version: int
+    sink: KafkaSinkIdentity
+    updating_instance_id: str
+    update_timestamp_ns: int | None
+    lease_epoch: int
+    range_config_fingerprint: str
+
+
+@dataclass(frozen=True, slots=True)
+class LeaderLease:
+    """Leader lease state recorded in FoundationDB for active leader coordination."""
+
+    source_id: str
+    stream_name: str
+    owner_instance_id: str
+    lease_epoch: int
+    heartbeat_sequence: int
+    expiration_timestamp_ns: int | None
+
+
+type DedupKey = tuple[str | None, int | None, int, int]
+type LegacyDedupKey = tuple[int, int]
+
+
+def deduplication_identity(
+    record: Record,
+    mutation: Mutation,
+) -> DedupKey:
+    """Return the production deduplication identity for a mutation in a record.
+
+    Production identity: (source_id, stream_id, fdb_version, sequence_no)
+
+    Args:
+        record: Deserialized record envelope containing the mutation.
+        mutation: Deserialized mutation with its version index.
+
+    Returns:
+        4-tuple of (source_id, stream_id, fdb_version, sequence_no).
+    """
+    return (
+        record.source_id,
+        record.stream_id,
+        mutation.version_index.fdb_version,
+        mutation.version_index.sequence_no,
+    )
+
+
+def legacy_deduplication_identity(
+    mutation: Mutation,
+) -> LegacyDedupKey:
+    """Return the legacy fallback deduplication identity (fdb_version, sequence_no).
+
+    Used when source_id or stream_id is missing/unconfigured (e.g. v0.1.0 records).
+
+    Args:
+        mutation: Deserialized mutation with its version index.
+
+    Returns:
+        2-tuple of (fdb_version, sequence_no).
+    """
+    return (
+        mutation.version_index.fdb_version,
+        mutation.version_index.sequence_no,
+    )

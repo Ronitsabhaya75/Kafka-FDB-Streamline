@@ -48,13 +48,14 @@ Ranges (inclusive; the limits are not exported):
 ### 2.2 Serialize
 
 All arguments after the first are keyword-only and required, except `first_sequence_no`
-(default `0`). `bridge_timestamp_ns` is integer nanoseconds since the Unix epoch.
+(default `0`) and v0.2.0 envelope fields (`directory`, `stream_id`, `source_id`, which default to `None`).
+`bridge_timestamp_ns` is integer nanoseconds since the Unix epoch.
 
 ```python
-serialize_mutation(mutation, *, fdb_version, sequence_no, stream_name, bridge_timestamp_ns) -> bytes
-serialize_batch(mutations, *, fdb_version, first_sequence_no=0, stream_name, bridge_timestamp_ns) -> bytes
-serialize_version_end(*, fdb_version, total_mutations, stream_name, bridge_timestamp_ns) -> bytes
-serialize_version_group(mutations, *, fdb_version, max_record_bytes, stream_name, bridge_timestamp_ns) -> list[bytes]
+serialize_mutation(mutation, *, fdb_version, sequence_no, stream_name, bridge_timestamp_ns, directory=None, stream_id=None, source_id=None) -> bytes
+serialize_batch(mutations, *, fdb_version, first_sequence_no=0, stream_name, bridge_timestamp_ns, directory=None, stream_id=None, source_id=None) -> bytes
+serialize_version_end(*, fdb_version, total_mutations, stream_name, bridge_timestamp_ns, stream_id=None, source_id=None) -> bytes
+serialize_version_group(mutations, *, fdb_version, max_record_bytes, stream_name, bridge_timestamp_ns, stream_id=None, source_id=None, directory_resolver=None, strict_directory_clears=False) -> list[bytes]
 ```
 
 - **`serialize_mutation`**: one mutation record at version index `(fdb_version, sequence_no)`.
@@ -66,15 +67,19 @@ serialize_version_group(mutations, *, fdb_version, max_record_bytes, stream_name
   Filtering corrupts the dedup identity.
 - **`serialize_version_end`**: one version-end record. `total_mutations` counts native mutations in
   the whole group, however it was sliced; `0` means none at this version (an empty group and an
-  idle watermark are the same record).
+  idle watermark are the same record). VersionEnd remains stream-wide; no directory prefix is accepted.
 - **`serialize_version_group`**: the whole group as batch records covering `(fdb_version, 0) …
   (fdb_version, n-1)` in order, then exactly one version end with `total_mutations == n`. An
   empty group returns only the version end. *Caller precondition:* `mutations` is the whole
   group.
   - `max_record_bytes` bounds `len()` of each returned value only; Kafka key, headers and
     framing are the caller's to subtract ([Record size](KAFKA-PRODUCER-SPEC.md#record-size)).
-  - Slicing is greedy in native order; each batch record is byte-identical to
-    `serialize_batch` of its slice.
+  - Slicing is greedy in native order. When `directory_resolver` is present (or mutations carry
+    `directory`), batches are split whenever the resolved directory changes, ensuring every batch
+    is homogeneous. Native sequence numbers are assigned before splitting and native order is
+    strictly preserved (mutations are never regrouped by directory in a way that reorders them).
+  - An ambiguous clear range crossing directory boundaries preserves the native clear unchanged
+    and omits directory context; under `strict_directory_clears=True`, it raises `SerializationError`.
   - A mutation is never split. If one mutation's one-element batch record, or the version-end
     record, exceeds the budget → `RecordTooLargeError`.
   - Returns a list, so an invalid mutation anywhere raises before any record is produced.
@@ -92,12 +97,32 @@ Output values are frozen, slotted dataclasses (compared field-wise, hashable):
 
 | Type | Fields |
 |---|---|
-| `Record` | `stream_name: str`, `bridge_timestamp_ns: int \| None`, `body: RecordBody` |
+| `Record` | `stream_name: str`, `bridge_timestamp_ns: int \| None`, `body: RecordBody`, `directory: FDBDirectoryContext \| None`, `stream_id: int \| None`, `source_id: str \| None` |
+| `FDBDirectoryContext` | `path: tuple[str, ...]`, `subspace_prefix: bytes` |
 | `RecordBody` | `Mutation \| MutationBatch \| VersionEnd` |
 | `Mutation` | `type: int`, `param1: bytes`, `param2: bytes`, `version_index: VersionIndex` |
 | `MutationBatch` | `mutations: tuple[Mutation, ...]` |
 | `VersionEnd` | `fdb_version: int`, `total_mutations: int`, `bridge_timestamp_ns: int \| None` |
 | `VersionIndex` | `NamedTuple(fdb_version, sequence_no)`; tuple order is stream order |
+
+### 2.4 Control-plane state serialization
+
+Defined in `fdbkafka.bridge.state.v1` (`protobuf/proto/fdbkafka/bridge/state/v1/state.proto`)
+and handled by `serialize_checkpoint`, `deserialize_checkpoint`, `serialize_leader_lease`, and
+`deserialize_leader_lease`:
+
+```python
+serialize_checkpoint(checkpoint: CDCCheckpoint) -> bytes
+deserialize_checkpoint(data: bytes) -> CDCCheckpoint
+serialize_leader_lease(lease: LeaderLease) -> bytes
+deserialize_leader_lease(data: bytes) -> LeaderLease
+```
+
+| State Type | Fields |
+|---|---|
+| `KafkaSinkIdentity` | `cluster_id: str`, `topic: str` |
+| `CDCCheckpoint` | `format_version: int`, `source_id: str`, `stream_name: str`, `stream_id: int`, `last_consumed_version: int`, `sink: KafkaSinkIdentity`, `updating_instance_id: str`, `update_timestamp_ns: int \| None`, `lease_epoch: int`, `range_config_fingerprint: str` |
+| `LeaderLease` | `source_id: str`, `stream_name: str`, `owner_instance_id: str`, `lease_epoch: int`, `heartbeat_sequence: int`, `expiration_timestamp_ns: int \| None` |
 
 Guarantees on every returned `Record`: `type` is a plain `int` in 0..255; versions are in
 0..2**63-1; a batch is non-empty, single-version, with contiguous ascending `sequence_no`.
@@ -200,5 +225,16 @@ across calls, and `deserialize_record` checks one record at a time.
   `(V, 0)` reappearing before the version end means redelivery: discard the partial group
   ([deep-dive §5.1](CDC-DEEP-DIVE.md#51-kafka-record-key-partitioning-and-atomicity-)).
 - Identity is the version index. Never dedup on bytes or on either bridge timestamp; a
-  redelivered group gets new timestamps. The record value names its stream only by
-  `stream_name`, so any stronger stream identity must travel outside it.
+  redelivered group gets new timestamps.
+- **Production deduplication identity**:
+  ```text
+  (source_id, stream_id, fdb_version, sequence_no)
+  ```
+  Helper: `deduplication_identity(record, mutation)`.
+- **Legacy fallback identity** (when `source_id` or `stream_id` is None/missing):
+  ```text
+  (fdb_version, sequence_no)
+  ```
+  Helper: `legacy_deduplication_identity(mutation)`.
+- Bridge timestamps (`bridge_timestamp`, `bridge_timestamp_ns`) are strictly processing timestamps
+  and must **never** be used for ordering or deduplication.
