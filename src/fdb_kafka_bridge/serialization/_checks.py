@@ -244,3 +244,11 @@ def directory_context(value: Any) -> None:
                     f"directory.path[{i}] must be str, got {type(elem).__name__}",
                     field="directory.path",
                 )
+            try:
+                elem.encode("utf-8")
+            except UnicodeEncodeError:
+                raise InputValueError(
+                    f"directory.path[{i}] (str of length {len(elem)}) is not "
+                    "UTF-8-encodable",
+                    field="directory.path",
+                ) from None

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Final
+from typing import Any, Final
 
 from google.protobuf.message import DecodeError
 from google.protobuf.timestamp_pb2 import Timestamp
@@ -86,6 +86,43 @@ def _ns_from_timestamp(msg: Timestamp) -> int:
     return msg.seconds * NANOS_PER_SECOND + msg.nanos
 
 
+def _check_utf8_str(
+    value: Any,
+    field: str,
+    *,
+    allow_empty: bool = False,
+) -> None:
+    """Validate that a value is a UTF-8 encodable string.
+
+    Args:
+        value: The value to validate.
+        field: Name of the field for error reporting.
+        allow_empty: Whether an empty string is permissible.
+
+    Raises:
+        InputTypeError: If value is not a str.
+        InputValueError: If value is empty (when not allow_empty) or not
+            UTF-8 encodable.
+    """
+    if not isinstance(value, str):
+        raise InputTypeError(
+            f"{field} must be str, got {type(value).__name__}",
+            field=field,
+        )
+    if not allow_empty and not value:
+        raise InputValueError(
+            f"{field} must be non-empty str",
+            field=field,
+        )
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        raise InputValueError(
+            f"{field} (str of length {len(value)}) is not UTF-8-encodable",
+            field=field,
+        ) from None
+
+
 def validate_checkpoint_model(checkpoint: CDCCheckpoint) -> None:
     """Validate a CDCCheckpoint model before serialization.
 
@@ -113,15 +150,8 @@ def validate_checkpoint_model(checkpoint: CDCCheckpoint) -> None:
             f"format_version must be in {supported}, got {checkpoint.format_version!r}",
             field="format_version",
         )
-    if not isinstance(checkpoint.source_id, str):
-        raise InputTypeError("source_id must be str", field="source_id")
-    if not checkpoint.source_id:
-        raise InputValueError("source_id must be non-empty str", field="source_id")
-
-    if not isinstance(checkpoint.stream_name, str):
-        raise InputTypeError("stream_name must be str", field="stream_name")
-    if not checkpoint.stream_name:
-        raise InputValueError("stream_name must be non-empty str", field="stream_name")
+    _check_utf8_str(checkpoint.source_id, "source_id")
+    _check_utf8_str(checkpoint.stream_name, "stream_name")
 
     if type(checkpoint.stream_id) is not int:
         raise InputTypeError("stream_id must be int", field="stream_id")
@@ -147,23 +177,9 @@ def validate_checkpoint_model(checkpoint: CDCCheckpoint) -> None:
             f"sink must be KafkaSinkIdentity, got {type(checkpoint.sink).__name__}",
             field="sink",
         )
-    if (
-        not isinstance(checkpoint.sink.cluster_id, str)
-        or not checkpoint.sink.cluster_id
-    ):
-        raise InputValueError("sink.cluster_id must be non-empty str", field="sink")
-    if not isinstance(checkpoint.sink.topic, str) or not checkpoint.sink.topic:
-        raise InputValueError("sink.topic must be non-empty str", field="sink")
-
-    if not isinstance(checkpoint.updating_instance_id, str):
-        raise InputTypeError(
-            "updating_instance_id must be str", field="updating_instance_id"
-        )
-    if not checkpoint.updating_instance_id:
-        raise InputValueError(
-            "updating_instance_id must be non-empty str",
-            field="updating_instance_id",
-        )
+    _check_utf8_str(checkpoint.sink.cluster_id, "sink.cluster_id")
+    _check_utf8_str(checkpoint.sink.topic, "sink.topic")
+    _check_utf8_str(checkpoint.updating_instance_id, "updating_instance_id")
 
     if type(checkpoint.update_timestamp_ns) is not int:
         raise InputTypeError(
@@ -185,11 +201,11 @@ def validate_checkpoint_model(checkpoint: CDCCheckpoint) -> None:
             field="lease_epoch",
         )
 
-    if not isinstance(checkpoint.range_config_fingerprint, str):
-        raise InputTypeError(
-            "range_config_fingerprint must be str",
-            field="range_config_fingerprint",
-        )
+    _check_utf8_str(
+        checkpoint.range_config_fingerprint,
+        "range_config_fingerprint",
+        allow_empty=True,
+    )
 
 
 def validate_lease_model(lease: LeaderLease) -> None:
@@ -207,23 +223,9 @@ def validate_lease_model(lease: LeaderLease) -> None:
             f"lease must be LeaderLease, got {type(lease).__name__}",
             field="lease",
         )
-    if not isinstance(lease.source_id, str):
-        raise InputTypeError("source_id must be str", field="source_id")
-    if not lease.source_id:
-        raise InputValueError("source_id must be non-empty str", field="source_id")
-
-    if not isinstance(lease.stream_name, str):
-        raise InputTypeError("stream_name must be str", field="stream_name")
-    if not lease.stream_name:
-        raise InputValueError("stream_name must be non-empty str", field="stream_name")
-
-    if not isinstance(lease.owner_instance_id, str):
-        raise InputTypeError("owner_instance_id must be str", field="owner_instance_id")
-    if not lease.owner_instance_id:
-        raise InputValueError(
-            "owner_instance_id must be non-empty str",
-            field="owner_instance_id",
-        )
+    _check_utf8_str(lease.source_id, "source_id")
+    _check_utf8_str(lease.stream_name, "stream_name")
+    _check_utf8_str(lease.owner_instance_id, "owner_instance_id")
 
     if type(lease.lease_epoch) is not int:
         raise InputTypeError("lease_epoch must be int", field="lease_epoch")

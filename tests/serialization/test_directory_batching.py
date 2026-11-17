@@ -165,19 +165,100 @@ def test_ambiguous_clear_range_non_strict() -> None:
 def test_ambiguous_clear_range_strict_mode_rejects() -> None:
     dir_a = FDBDirectoryContext(path=("tenants", "a"), subspace_prefix=b"\x01")
 
-    mutations = [
+    # Case 1: Directory context present but clear range crosses directory boundary
+    mutations_cross = [
         _FakeNativeMutation(MutationType.CLEAR_RANGE, b"\x00\x99", b"\x02\x00", dir_a),
     ]
 
-    with pytest.raises(SerializationError, match="Ambiguous clear range"):
+    with pytest.raises(
+        SerializationError,
+        match=(
+            r"^Ambiguous clear range crosses directory boundaries at "
+            r"version 3000, sequence 0$"
+        ),
+    ) as exc_info:
         serialize_version_group(
-            mutations,
+            mutations_cross,
             fdb_version=3000,
             max_record_bytes=10_000,
             stream_name="test_stream",
             bridge_timestamp_ns=1_000_000_000,
             strict_directory_clears=True,
         )
+    # Verify exception message does not leak raw keys
+    assert "\\x00\\x99" not in str(exc_info.value)
+    assert "\\x02\\x00" not in str(exc_info.value)
+
+    # Case 2: No directory context on mutation and no resolver supplied
+    mutations_no_dir = [
+        _FakeNativeMutation(MutationType.CLEAR_RANGE, b"\x01\x10", b"\x01\x20", None),
+    ]
+    with pytest.raises(
+        SerializationError,
+        match=(
+            r"^Ambiguous clear range crosses directory boundaries at "
+            r"version 3001, sequence 0$"
+        ),
+    ) as exc_info2:
+        serialize_version_group(
+            mutations_no_dir,
+            fdb_version=3001,
+            max_record_bytes=10_000,
+            stream_name="test_stream",
+            bridge_timestamp_ns=1_000_000_000,
+            strict_directory_clears=True,
+        )
+    assert "\\x01\\x10" not in str(exc_info2.value)
+
+    # Case 3: Resolver supplied but returns None
+    with pytest.raises(
+        SerializationError,
+        match=(
+            r"^Ambiguous clear range crosses directory boundaries at "
+            r"version 3002, sequence 0$"
+        ),
+    ) as exc_info3:
+        serialize_version_group(
+            mutations_no_dir,
+            fdb_version=3002,
+            max_record_bytes=10_000,
+            stream_name="test_stream",
+            bridge_timestamp_ns=1_000_000_000,
+            directory_resolver=lambda _: None,
+            strict_directory_clears=True,
+        )
+    assert "\\x01\\x10" not in str(exc_info3.value)
+
+
+def test_ambiguous_clear_range_non_strict_mode_omits_directory() -> None:
+    # Verify both unresolved clear range input paths succeed in non-strict mode
+    muts = [
+        _FakeNativeMutation(MutationType.CLEAR_RANGE, b"\x01\x10", b"\x01\x20", None),
+    ]
+    # No resolver
+    records = serialize_version_group(
+        muts,
+        fdb_version=3003,
+        max_record_bytes=10_000,
+        stream_name="test_stream",
+        bridge_timestamp_ns=1_000_000_000,
+        strict_directory_clears=False,
+    )
+    rec = deserialize_record(records[0])
+    assert rec.directory is None
+
+    # Resolver returning None
+    records_resolver = serialize_version_group(
+        muts,
+        fdb_version=3004,
+        max_record_bytes=10_000,
+        stream_name="test_stream",
+        bridge_timestamp_ns=1_000_000_000,
+        directory_resolver=lambda _: None,
+        strict_directory_clears=False,
+    )
+    rec_res = deserialize_record(records_resolver[0])
+    assert rec_res.directory is None
 
 
 def test_directory_resolver_callable() -> None:
@@ -460,3 +541,21 @@ def test_directory_record_golden_bytes() -> None:
     assert rec.directory == dir_ctx
     assert rec.stream_id == 42
     assert rec.source_id == "source-1"
+
+
+def test_directory_context_surrogate_path_rejected() -> None:
+    # An unpaired surrogate cannot be encoded to UTF-8
+    bad_dir = FDBDirectoryContext(
+        path=("tenants", "\ud800"),
+        subspace_prefix=b"\x01",
+    )
+    with pytest.raises(InputValueError, match="not UTF-8-encodable") as exc_info:
+        serialize_mutation(
+            _FakeNativeMutation(MutationType.SET_VALUE, b"\x01k", b"v"),
+            fdb_version=1000,
+            sequence_no=1,
+            stream_name="test_stream",
+            bridge_timestamp_ns=1000,
+            directory=bad_dir,
+        )
+    assert exc_info.value.field == "directory.path"

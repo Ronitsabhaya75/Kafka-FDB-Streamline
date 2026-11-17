@@ -323,6 +323,40 @@ def test_checkpoint_validation_errors() -> None:
             )
         )
 
+    # UTF-8 encodability errors (unpaired surrogates)
+    surrogate = "\ud800"
+    surrogate_cases: list[tuple[dict[str, object], str]] = [
+        ({"source_id": surrogate}, "source_id"),
+        ({"stream_name": surrogate}, "stream_name"),
+        (
+            {"sink": KafkaSinkIdentity(cluster_id=surrogate, topic="t1")},
+            "sink.cluster_id",
+        ),
+        (
+            {"sink": KafkaSinkIdentity(cluster_id="c1", topic=surrogate)},
+            "sink.topic",
+        ),
+        ({"updating_instance_id": surrogate}, "updating_instance_id"),
+        ({"range_config_fingerprint": surrogate}, "range_config_fingerprint"),
+    ]
+    for field_kwargs, expected_field in surrogate_cases:
+        base_kwargs: dict[str, object] = {
+            "format_version": 1,
+            "source_id": "s1",
+            "stream_name": "str1",
+            "stream_id": 1,
+            "last_consumed_version": 1,
+            "sink": sink,
+            "updating_instance_id": "i1",
+            "update_timestamp_ns": 1000,
+            "lease_epoch": 1,
+            "range_config_fingerprint": "fp",
+        }
+        base_kwargs.update(field_kwargs)
+        with pytest.raises(InputValueError, match="not UTF-8-encodable") as exc_info:
+            serialize_checkpoint(CDCCheckpoint(**base_kwargs))  # type: ignore[arg-type]
+        assert exc_info.value.field == expected_field
+
 
 def test_checkpoint_decode_errors() -> None:
     with pytest.raises(InputTypeError, match="data must be bytes"):
@@ -580,6 +614,27 @@ def test_leader_lease_validation_errors() -> None:
                 expiration_timestamp_ns=MAX_TIMESTAMP_NS + 1,
             )
         )
+
+    # UTF-8 encodability errors (unpaired surrogates)
+    surrogate = "\ud800"
+    lease_surrogate_cases: list[tuple[dict[str, object], str]] = [
+        ({"source_id": surrogate}, "source_id"),
+        ({"stream_name": surrogate}, "stream_name"),
+        ({"owner_instance_id": surrogate}, "owner_instance_id"),
+    ]
+    for field_kwargs, expected_field in lease_surrogate_cases:
+        lease_base: dict[str, object] = {
+            "source_id": "s1",
+            "stream_name": "str1",
+            "owner_instance_id": "pod1",
+            "lease_epoch": 1,
+            "heartbeat_sequence": 1,
+            "expiration_timestamp_ns": 1000,
+        }
+        lease_base.update(field_kwargs)
+        with pytest.raises(InputValueError, match="not UTF-8-encodable") as exc_info:
+            serialize_leader_lease(LeaderLease(**lease_base))  # type: ignore[arg-type]
+        assert exc_info.value.field == expected_field
 
 
 def test_leader_lease_decode_errors() -> None:

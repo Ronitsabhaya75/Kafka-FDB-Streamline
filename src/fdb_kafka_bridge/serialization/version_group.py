@@ -121,14 +121,14 @@ def serialize_version_group(
             if dir_ctx is not None:
                 if not _is_range_within_subspace(p1, p2, dir_ctx.subspace_prefix):
                     is_ambiguous = True
-            elif directory_resolver is not None:
+            else:
                 is_ambiguous = True
 
             if is_ambiguous:
                 if strict_directory_clears:
                     raise SerializationError(
-                        f"Ambiguous clear range [{p1!r}, {p2!r}) crosses directory "
-                        f"boundaries at version {fdb_version}, sequence {index}"
+                        f"Ambiguous clear range crosses directory boundaries at "
+                        f"version {fdb_version}, sequence {index}"
                     )
                 dir_ctx = None
 
