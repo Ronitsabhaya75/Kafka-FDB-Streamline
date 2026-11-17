@@ -17,6 +17,9 @@ from fdb_kafka_bridge.serialization.model import (
     LeaderLease,
 )
 from fdb_kafka_bridge.serialization.state import (
+    INT64_MAX,
+    MAX_TIMESTAMP_NS,
+    MAX_TIMESTAMP_SECONDS,
     UINT64_MAX,
     deserialize_checkpoint,
     deserialize_leader_lease,
@@ -84,7 +87,7 @@ def test_checkpoint_golden_bytes() -> None:
 def test_checkpoint_uint64_and_epoch_boundaries() -> None:
     sink = KafkaSinkIdentity(cluster_id="c1", topic="t1")
 
-    # Boundary 1: uint64 minimum (0) and epoch zero timestamp (0 ns)
+    # Boundary 1: minimums (0) and epoch zero timestamp (0 ns)
     cp_zero = CDCCheckpoint(
         format_version=1,
         source_id="s1",
@@ -105,16 +108,17 @@ def test_checkpoint_uint64_and_epoch_boundaries() -> None:
     assert decoded_zero.lease_epoch == 0
     assert decoded_zero.update_timestamp_ns == 0
 
-    # Boundary 2: uint64 maximum (2**64 - 1) and None timestamp
+    # Boundary 2: maximums (last_consumed_version=INT64_MAX, stream_id=UINT64_MAX,
+    # lease_epoch=UINT64_MAX, update_timestamp_ns=MAX_TIMESTAMP_NS)
     cp_max = CDCCheckpoint(
         format_version=1,
         source_id="s1",
         stream_name="str1",
         stream_id=UINT64_MAX,
-        last_consumed_version=UINT64_MAX,
+        last_consumed_version=INT64_MAX,
         sink=sink,
         updating_instance_id="i1",
-        update_timestamp_ns=None,
+        update_timestamp_ns=MAX_TIMESTAMP_NS,
         lease_epoch=UINT64_MAX,
         range_config_fingerprint="fp_max",
     )
@@ -122,9 +126,9 @@ def test_checkpoint_uint64_and_epoch_boundaries() -> None:
     decoded_max = deserialize_checkpoint(wire_max)
     assert decoded_max == cp_max
     assert decoded_max.stream_id == UINT64_MAX
-    assert decoded_max.last_consumed_version == UINT64_MAX
+    assert decoded_max.last_consumed_version == INT64_MAX
     assert decoded_max.lease_epoch == UINT64_MAX
-    assert decoded_max.update_timestamp_ns is None
+    assert decoded_max.update_timestamp_ns == MAX_TIMESTAMP_NS
 
 
 def test_checkpoint_validation_errors() -> None:
@@ -145,7 +149,7 @@ def test_checkpoint_validation_errors() -> None:
                     last_consumed_version=1,
                     sink=sink,
                     updating_instance_id="i1",
-                    update_timestamp_ns=None,
+                    update_timestamp_ns=1000,
                     lease_epoch=1,
                     range_config_fingerprint="fp",
                 )
@@ -162,7 +166,7 @@ def test_checkpoint_validation_errors() -> None:
                 last_consumed_version=1,
                 sink=sink,
                 updating_instance_id="i1",
-                update_timestamp_ns=None,
+                update_timestamp_ns=1000,
                 lease_epoch=1,
                 range_config_fingerprint="fp",
             )
@@ -178,7 +182,7 @@ def test_checkpoint_validation_errors() -> None:
                 last_consumed_version=1,
                 sink=sink,
                 updating_instance_id="i1",
-                update_timestamp_ns=None,
+                update_timestamp_ns=1000,
                 lease_epoch=1,
                 range_config_fingerprint="fp",
             )
@@ -194,7 +198,7 @@ def test_checkpoint_validation_errors() -> None:
                 last_consumed_version=1,
                 sink=sink,
                 updating_instance_id="",
-                update_timestamp_ns=None,
+                update_timestamp_ns=1000,
                 lease_epoch=1,
                 range_config_fingerprint="fp",
             )
@@ -211,7 +215,7 @@ def test_checkpoint_validation_errors() -> None:
                 last_consumed_version=1,
                 sink=KafkaSinkIdentity(cluster_id="", topic="t1"),
                 updating_instance_id="i1",
-                update_timestamp_ns=None,
+                update_timestamp_ns=1000,
                 lease_epoch=1,
                 range_config_fingerprint="fp",
             )
@@ -227,13 +231,13 @@ def test_checkpoint_validation_errors() -> None:
                 last_consumed_version=1,
                 sink=KafkaSinkIdentity(cluster_id="c1", topic=""),
                 updating_instance_id="i1",
-                update_timestamp_ns=None,
+                update_timestamp_ns=1000,
                 lease_epoch=1,
                 range_config_fingerprint="fp",
             )
         )
 
-    # uint64 domain errors
+    # stream_id uint64 domain errors
     for bad_id in (-1, UINT64_MAX + 1):
         with pytest.raises(InputValueError, match="stream_id"):
             serialize_checkpoint(
@@ -245,13 +249,31 @@ def test_checkpoint_validation_errors() -> None:
                     last_consumed_version=1,
                     sink=sink,
                     updating_instance_id="i1",
-                    update_timestamp_ns=None,
+                    update_timestamp_ns=1000,
                     lease_epoch=1,
                     range_config_fingerprint="fp",
                 )
             )
 
-    # Negative timestamp
+    # last_consumed_version must be in 0..INT64_MAX (resumable CDC cursor range)
+    for bad_version in (-1, INT64_MAX + 1, UINT64_MAX):
+        with pytest.raises(InputValueError, match="last_consumed_version"):
+            serialize_checkpoint(
+                CDCCheckpoint(
+                    format_version=1,
+                    source_id="s1",
+                    stream_name="str1",
+                    stream_id=1,
+                    last_consumed_version=bad_version,
+                    sink=sink,
+                    updating_instance_id="i1",
+                    update_timestamp_ns=1000,
+                    lease_epoch=1,
+                    range_config_fingerprint="fp",
+                )
+            )
+
+    # Negative or out-of-range timestamp
     with pytest.raises(InputValueError, match="update_timestamp_ns"):
         serialize_checkpoint(
             CDCCheckpoint(
@@ -263,6 +285,39 @@ def test_checkpoint_validation_errors() -> None:
                 sink=sink,
                 updating_instance_id="i1",
                 update_timestamp_ns=-100,
+                lease_epoch=1,
+                range_config_fingerprint="fp",
+            )
+        )
+
+    with pytest.raises(InputValueError, match="update_timestamp_ns"):
+        serialize_checkpoint(
+            CDCCheckpoint(
+                format_version=1,
+                source_id="s1",
+                stream_name="str1",
+                stream_id=1,
+                last_consumed_version=1,
+                sink=sink,
+                updating_instance_id="i1",
+                update_timestamp_ns=MAX_TIMESTAMP_NS + 1,
+                lease_epoch=1,
+                range_config_fingerprint="fp",
+            )
+        )
+
+    # None update_timestamp_ns is rejected
+    with pytest.raises(InputTypeError, match="update_timestamp_ns"):
+        serialize_checkpoint(
+            CDCCheckpoint(
+                format_version=1,
+                source_id="s1",
+                stream_name="str1",
+                stream_id=1,
+                last_consumed_version=1,
+                sink=sink,
+                updating_instance_id="i1",
+                update_timestamp_ns=None,  # type: ignore[arg-type]
                 lease_epoch=1,
                 range_config_fingerprint="fp",
             )
@@ -285,6 +340,7 @@ def test_checkpoint_decode_errors() -> None:
             stream_name="st1",
             updating_instance_id="i1",
             sink=state_pb2.KafkaSinkIdentity(cluster_id="c1", topic="t1"),
+            update_timestamp=Timestamp(seconds=100, nanos=0),
         ).SerializeToString()
         with pytest.raises(RecordDecodeError, match="format_version"):
             deserialize_checkpoint(wire_bad_ver)
@@ -296,6 +352,7 @@ def test_checkpoint_decode_errors() -> None:
         stream_name="st1",
         updating_instance_id="i1",
         sink=state_pb2.KafkaSinkIdentity(cluster_id="c1", topic="t1"),
+        update_timestamp=Timestamp(seconds=100, nanos=0),
     ).SerializeToString()
     with pytest.raises(RecordDecodeError, match="source_id"):
         deserialize_checkpoint(wire_empty_source)
@@ -306,6 +363,7 @@ def test_checkpoint_decode_errors() -> None:
         stream_name="",
         updating_instance_id="i1",
         sink=state_pb2.KafkaSinkIdentity(cluster_id="c1", topic="t1"),
+        update_timestamp=Timestamp(seconds=100, nanos=0),
     ).SerializeToString()
     with pytest.raises(RecordDecodeError, match="stream_name"):
         deserialize_checkpoint(wire_empty_stream)
@@ -316,9 +374,23 @@ def test_checkpoint_decode_errors() -> None:
         stream_name="st1",
         updating_instance_id="",
         sink=state_pb2.KafkaSinkIdentity(cluster_id="c1", topic="t1"),
+        update_timestamp=Timestamp(seconds=100, nanos=0),
     ).SerializeToString()
     with pytest.raises(RecordDecodeError, match="updating_instance_id"):
         deserialize_checkpoint(wire_empty_updater)
+
+    # last_consumed_version exceeding INT64_MAX on wire
+    wire_bad_version = state_pb2.CDCCheckpoint(
+        format_version=1,
+        source_id="s1",
+        stream_name="st1",
+        last_consumed_version=INT64_MAX + 1,
+        updating_instance_id="i1",
+        sink=state_pb2.KafkaSinkIdentity(cluster_id="c1", topic="t1"),
+        update_timestamp=Timestamp(seconds=100, nanos=0),
+    ).SerializeToString()
+    with pytest.raises(RecordDecodeError, match="last_consumed_version"):
+        deserialize_checkpoint(wire_bad_version)
 
     # Missing sink
     wire_no_sink = state_pb2.CDCCheckpoint(
@@ -326,6 +398,7 @@ def test_checkpoint_decode_errors() -> None:
         source_id="s1",
         stream_name="st1",
         updating_instance_id="i1",
+        update_timestamp=Timestamp(seconds=100, nanos=0),
     ).SerializeToString()
     with pytest.raises(RecordDecodeError, match="missing Kafka sink identity"):
         deserialize_checkpoint(wire_no_sink)
@@ -337,9 +410,21 @@ def test_checkpoint_decode_errors() -> None:
         stream_name="st1",
         updating_instance_id="i1",
         sink=state_pb2.KafkaSinkIdentity(cluster_id="c1", topic=""),
+        update_timestamp=Timestamp(seconds=100, nanos=0),
     ).SerializeToString()
     with pytest.raises(RecordDecodeError, match="empty cluster_id or topic"):
         deserialize_checkpoint(wire_empty_topic)
+
+    # Missing update_timestamp on wire
+    wire_no_ts = state_pb2.CDCCheckpoint(
+        format_version=1,
+        source_id="s1",
+        stream_name="st1",
+        updating_instance_id="i1",
+        sink=state_pb2.KafkaSinkIdentity(cluster_id="c1", topic="t1"),
+    ).SerializeToString()
+    with pytest.raises(RecordDecodeError, match="missing required update_timestamp"):
+        deserialize_checkpoint(wire_no_ts)
 
     # Malformed timestamp nanos on wire
     wire_bad_nanos = state_pb2.CDCCheckpoint(
@@ -352,6 +437,18 @@ def test_checkpoint_decode_errors() -> None:
     ).SerializeToString()
     with pytest.raises(RecordDecodeError, match="Invalid timestamp nanos"):
         deserialize_checkpoint(wire_bad_nanos)
+
+    # Out of range timestamp seconds (> 253402300799)
+    wire_overflow_seconds = state_pb2.CDCCheckpoint(
+        format_version=1,
+        source_id="s1",
+        stream_name="st1",
+        updating_instance_id="i1",
+        sink=state_pb2.KafkaSinkIdentity(cluster_id="c1", topic="t1"),
+        update_timestamp=Timestamp(seconds=MAX_TIMESTAMP_SECONDS + 1, nanos=0),
+    ).SerializeToString()
+    with pytest.raises(RecordDecodeError, match="Invalid timestamp seconds"):
+        deserialize_checkpoint(wire_overflow_seconds)
 
 
 def test_leader_lease_roundtrip() -> None:
@@ -387,20 +484,21 @@ def test_leader_lease_uint64_and_epoch_boundaries() -> None:
     assert decoded_zero.lease_epoch == 0
     assert decoded_zero.heartbeat_sequence == 0
 
-    # Boundary 2: uint64 maximum
+    # Boundary 2: maximum uint64 and MAX_TIMESTAMP_NS expiration
     lease_max = LeaderLease(
         source_id="s1",
         stream_name="str1",
         owner_instance_id="pod1",
         lease_epoch=UINT64_MAX,
         heartbeat_sequence=UINT64_MAX,
-        expiration_timestamp_ns=2000000000_000000000,
+        expiration_timestamp_ns=MAX_TIMESTAMP_NS,
     )
     wire_max = serialize_leader_lease(lease_max)
     decoded_max = deserialize_leader_lease(wire_max)
     assert decoded_max == lease_max
     assert decoded_max.lease_epoch == UINT64_MAX
     assert decoded_max.heartbeat_sequence == UINT64_MAX
+    assert decoded_max.expiration_timestamp_ns == MAX_TIMESTAMP_NS
 
 
 def test_leader_lease_validation_errors() -> None:
@@ -470,6 +568,19 @@ def test_leader_lease_validation_errors() -> None:
             )
         )
 
+    # Expiration exceeding MAX_TIMESTAMP_NS
+    with pytest.raises(InputValueError, match="expiration_timestamp_ns"):
+        serialize_leader_lease(
+            LeaderLease(
+                source_id="s1",
+                stream_name="str1",
+                owner_instance_id="pod1",
+                lease_epoch=1,
+                heartbeat_sequence=1,
+                expiration_timestamp_ns=MAX_TIMESTAMP_NS + 1,
+            )
+        )
+
 
 def test_leader_lease_decode_errors() -> None:
     with pytest.raises(InputTypeError, match="data must be bytes"):
@@ -526,3 +637,13 @@ def test_leader_lease_decode_errors() -> None:
     ).SerializeToString()
     with pytest.raises(RecordDecodeError, match="Invalid timestamp nanos"):
         deserialize_leader_lease(wire_bad_nanos)
+
+    # Out of range timestamp seconds (> 253402300799)
+    wire_overflow_seconds = state_pb2.LeaderLease(
+        source_id="s1",
+        stream_name="st1",
+        owner_instance_id="pod1",
+        expiration_timestamp=Timestamp(seconds=MAX_TIMESTAMP_SECONDS + 1, nanos=0),
+    ).SerializeToString()
+    with pytest.raises(RecordDecodeError, match="Invalid timestamp seconds"):
+        deserialize_leader_lease(wire_overflow_seconds)

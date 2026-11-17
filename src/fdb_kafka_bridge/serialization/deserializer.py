@@ -165,7 +165,11 @@ def deserialize_record(data: bytes) -> Record:
             subspace_prefix=message.directory.subspace_prefix,
         )
     stream_id = message.stream_id if message.HasField("stream_id") else None
-    source_id = message.source_id if message.HasField("source_id") else None
+    source_id = (
+        message.source_id
+        if (message.HasField("source_id") and message.source_id)
+        else None
+    )
     return Record(
         stream_name=message.stream_name,
         bridge_timestamp_ns=_bridge_timestamp_ns(message),

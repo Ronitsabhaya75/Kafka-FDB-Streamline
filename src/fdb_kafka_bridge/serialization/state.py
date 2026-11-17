@@ -22,38 +22,39 @@ from fdbkafka.bridge.state.v1 import state_pb2
 
 CURRENT_FORMAT_VERSION: Final[int] = 1
 SUPPORTED_FORMAT_VERSIONS: Final[frozenset[int]] = frozenset({CURRENT_FORMAT_VERSION})
+INT64_MAX: Final[int] = (1 << 63) - 1
 UINT64_MAX: Final[int] = (1 << 64) - 1
+MAX_TIMESTAMP_SECONDS: Final[int] = 253_402_300_799
+MAX_TIMESTAMP_NS: Final[int] = 253_402_300_799_999_999_999
 NANOS_PER_SECOND: Final[int] = 10**9
 
 
 def _timestamp_from_ns(
-    timestamp_ns: int | None,
+    timestamp_ns: int,
     *,
     field: str = "timestamp",
-) -> Timestamp | None:
+) -> Timestamp:
     """Convert integer Unix nanoseconds to google.protobuf.Timestamp.
 
     Args:
-        timestamp_ns: Integer Unix nanoseconds since epoch, or None.
+        timestamp_ns: Integer Unix nanoseconds since epoch.
         field: Name of the field for error reporting.
 
     Returns:
-        google.protobuf.Timestamp or None.
+        google.protobuf.Timestamp.
 
     Raises:
-        InputTypeError: If timestamp_ns is not int or None.
-        InputValueError: If timestamp_ns is negative.
+        InputTypeError: If timestamp_ns is not int.
+        InputValueError: If timestamp_ns is negative or exceeds MAX_TIMESTAMP_NS.
     """
-    if timestamp_ns is None:
-        return None
     if type(timestamp_ns) is not int:
         raise InputTypeError(
             f"{field} must be int, got {type(timestamp_ns).__name__}",
             field=field,
         )
-    if timestamp_ns < 0:
+    if not (0 <= timestamp_ns <= MAX_TIMESTAMP_NS):
         raise InputValueError(
-            f"{field} must be non-negative int, got {timestamp_ns}",
+            f"{field} must be in 0..{MAX_TIMESTAMP_NS}, got {timestamp_ns}",
             field=field,
         )
     seconds, nanos = divmod(timestamp_ns, NANOS_PER_SECOND)
@@ -77,7 +78,7 @@ def _ns_from_timestamp(msg: Timestamp) -> int:
             f"Invalid timestamp nanos: {msg.nanos}",
             reason=DecodeFailure.MALFORMED_WIRE,
         )
-    if msg.seconds < 0:
+    if not (0 <= msg.seconds <= MAX_TIMESTAMP_SECONDS):
         raise RecordDecodeError(
             f"Invalid timestamp seconds: {msg.seconds}",
             reason=DecodeFailure.MALFORMED_WIRE,
@@ -134,9 +135,9 @@ def validate_checkpoint_model(checkpoint: CDCCheckpoint) -> None:
         raise InputTypeError(
             "last_consumed_version must be int", field="last_consumed_version"
         )
-    if not (0 <= checkpoint.last_consumed_version <= UINT64_MAX):
+    if not (0 <= checkpoint.last_consumed_version <= INT64_MAX):
         raise InputValueError(
-            f"last_consumed_version must be in 0..{UINT64_MAX}, "
+            f"last_consumed_version must be in 0..{INT64_MAX}, "
             f"got {checkpoint.last_consumed_version}",
             field="last_consumed_version",
         )
@@ -164,17 +165,17 @@ def validate_checkpoint_model(checkpoint: CDCCheckpoint) -> None:
             field="updating_instance_id",
         )
 
-    if checkpoint.update_timestamp_ns is not None:
-        if type(checkpoint.update_timestamp_ns) is not int:
-            raise InputTypeError(
-                "update_timestamp_ns must be int or None",
-                field="update_timestamp_ns",
-            )
-        if checkpoint.update_timestamp_ns < 0:
-            raise InputValueError(
-                "update_timestamp_ns must be non-negative int",
-                field="update_timestamp_ns",
-            )
+    if type(checkpoint.update_timestamp_ns) is not int:
+        raise InputTypeError(
+            "update_timestamp_ns must be int",
+            field="update_timestamp_ns",
+        )
+    if not (0 <= checkpoint.update_timestamp_ns <= MAX_TIMESTAMP_NS):
+        raise InputValueError(
+            f"update_timestamp_ns must be in 0..{MAX_TIMESTAMP_NS}, "
+            f"got {checkpoint.update_timestamp_ns}",
+            field="update_timestamp_ns",
+        )
 
     if type(checkpoint.lease_epoch) is not int:
         raise InputTypeError("lease_epoch must be int", field="lease_epoch")
@@ -248,9 +249,10 @@ def validate_lease_model(lease: LeaderLease) -> None:
             "expiration_timestamp_ns must be int",
             field="expiration_timestamp_ns",
         )
-    if lease.expiration_timestamp_ns < 0:
+    if not (0 <= lease.expiration_timestamp_ns <= MAX_TIMESTAMP_NS):
         raise InputValueError(
-            "expiration_timestamp_ns must be non-negative int",
+            f"expiration_timestamp_ns must be in 0..{MAX_TIMESTAMP_NS}, "
+            f"got {lease.expiration_timestamp_ns}",
             field="expiration_timestamp_ns",
         )
 
@@ -334,6 +336,12 @@ def deserialize_checkpoint(data: bytes) -> CDCCheckpoint:
             "Checkpoint missing or empty stream_name",
             reason=DecodeFailure.MALFORMED_WIRE,
         )
+    if not (0 <= msg.last_consumed_version <= INT64_MAX):
+        raise RecordDecodeError(
+            f"Checkpoint last_consumed_version {msg.last_consumed_version} "
+            f"exceeds INT64_MAX",
+            reason=DecodeFailure.MALFORMED_WIRE,
+        )
     if not msg.updating_instance_id:
         raise RecordDecodeError(
             "Checkpoint missing or empty updating_instance_id",
@@ -349,13 +357,14 @@ def deserialize_checkpoint(data: bytes) -> CDCCheckpoint:
             "Checkpoint sink has empty cluster_id or topic",
             reason=DecodeFailure.MALFORMED_WIRE,
         )
+    if not msg.HasField("update_timestamp"):
+        raise RecordDecodeError(
+            "Checkpoint missing required update_timestamp",
+            reason=DecodeFailure.MALFORMED_WIRE,
+        )
 
     sink = KafkaSinkIdentity(cluster_id=msg.sink.cluster_id, topic=msg.sink.topic)
-    update_ts = (
-        _ns_from_timestamp(msg.update_timestamp)
-        if msg.HasField("update_timestamp")
-        else None
-    )
+    update_ts = _ns_from_timestamp(msg.update_timestamp)
 
     return CDCCheckpoint(
         format_version=msg.format_version,

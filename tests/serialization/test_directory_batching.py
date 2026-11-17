@@ -13,7 +13,10 @@ from google.protobuf import (
 )
 
 from fdb_kafka_bridge.serialization.deserializer import deserialize_record
-from fdb_kafka_bridge.serialization.errors import SerializationError
+from fdb_kafka_bridge.serialization.errors import (
+    InputValueError,
+    SerializationError,
+)
 from fdb_kafka_bridge.serialization.model import (
     FDBDirectoryContext,
     Mutation,
@@ -410,3 +413,23 @@ def test_deduplication_identity() -> None:
         7000,
         5,
     )
+
+    # Empty source_id is rejected on serialization
+    with pytest.raises(InputValueError, match="source_id must not be empty"):
+        serialize_mutation(
+            _FakeNativeMutation(MutationType.SET_VALUE, b"\x01key", b"val"),
+            fdb_version=7000,
+            sequence_no=5,
+            stream_name="stream_dedup",
+            bridge_timestamp_ns=1000,
+            source_id="",
+        )
+
+    # Wire containing empty source_id string normalizes to None on decode
+    wire_empty_source = mutations_pb2.FDBMutationRecord(
+        stream_name="stream_dedup",
+        source_id="",
+        version_end=mutations_pb2.VersionEnd(fdb_version=7000),
+    ).SerializeToString()
+    rec_empty_source = deserialize_record(wire_empty_source)
+    assert rec_empty_source.source_id is None

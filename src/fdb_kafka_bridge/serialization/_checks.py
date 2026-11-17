@@ -200,13 +200,15 @@ def stream_id(value: int | None) -> None:
 
 
 def source_id(value: str | None) -> None:
-    """Require None or UTF-8 str."""
+    """Require None or non-empty UTF-8 str."""
     if value is not None:
         if not isinstance(value, str):
             raise InputTypeError(
                 f"source_id must be str, got {type(value).__name__}",
                 field="source_id",
             )
+        if not value:
+            raise InputValueError("source_id must not be empty", field="source_id")
         try:
             value.encode("utf-8")
         except UnicodeEncodeError:

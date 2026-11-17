@@ -121,7 +121,7 @@ deserialize_leader_lease(data: bytes) -> LeaderLease
 | State Type | Fields |
 |---|---|
 | `KafkaSinkIdentity` | `cluster_id: str`, `topic: str` |
-| `CDCCheckpoint` | `format_version: int`, `source_id: str`, `stream_name: str`, `stream_id: int`, `last_consumed_version: int`, `sink: KafkaSinkIdentity`, `updating_instance_id: str`, `update_timestamp_ns: int \| None`, `lease_epoch: int`, `range_config_fingerprint: str` |
+| `CDCCheckpoint` | `format_version: int`, `source_id: str`, `stream_name: str`, `stream_id: int`, `last_consumed_version: int`, `sink: KafkaSinkIdentity`, `updating_instance_id: str`, `update_timestamp_ns: int`, `lease_epoch: int`, `range_config_fingerprint: str` |
 | `LeaderLease` | `source_id: str`, `stream_name: str`, `owner_instance_id: str`, `lease_epoch: int`, `heartbeat_sequence: int`, `expiration_timestamp_ns: int` |
 
 Guarantees on every returned `Record`: `type` is a plain `int` in 0..255; versions are in

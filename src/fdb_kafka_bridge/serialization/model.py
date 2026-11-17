@@ -136,7 +136,7 @@ class CDCCheckpoint:
     last_consumed_version: int
     sink: KafkaSinkIdentity
     updating_instance_id: str
-    update_timestamp_ns: int | None
+    update_timestamp_ns: int
     lease_epoch: int
     range_config_fingerprint: str
 
