@@ -433,3 +433,30 @@ def test_deduplication_identity() -> None:
     ).SerializeToString()
     rec_empty_source = deserialize_record(wire_empty_source)
     assert rec_empty_source.source_id is None
+
+
+def test_directory_record_golden_bytes() -> None:
+    golden_bytes = bytes.fromhex(
+        "0a066f7264657273120b0880e2cfaa0610959aef3a1a140a0508e8071003120b0a04"
+        "15016b001203ff007632170a0774656e616e74730a0874656e616e742d6112021501"
+        "382a4208736f757263652d31"
+    )
+    dir_ctx = FDBDirectoryContext(
+        path=("tenants", "tenant-a"),
+        subspace_prefix=b"\x15\x01",
+    )
+    wire = serialize_mutation(
+        _FakeNativeMutation(MutationType.SET_VALUE, b"\x15\x01k\x00", b"\xff\x00v"),
+        fdb_version=1000,
+        sequence_no=3,
+        stream_name="orders",
+        bridge_timestamp_ns=1_700_000_000_123_456_789,
+        directory=dir_ctx,
+        stream_id=42,
+        source_id="source-1",
+    )
+    assert wire == golden_bytes
+    rec = deserialize_record(wire)
+    assert rec.directory == dir_ctx
+    assert rec.stream_id == 42
+    assert rec.source_id == "source-1"
