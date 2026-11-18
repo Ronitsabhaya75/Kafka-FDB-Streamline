@@ -1,5 +1,7 @@
 """FoundationDB client wrapper for API initialization and CDC stream operations."""
 
+import inspect
+from collections.abc import Iterable
 from typing import Any, Final, NoReturn, Self
 
 try:
@@ -13,7 +15,13 @@ from fdb_kafka_bridge.cdc.errors import (
     CDCInvalidRangeError,
     CDCNotSupportedError,
     CDCRetryableError,
+    CDCStreamMismatchError,
     CDCTerminalError,
+)
+from fdb_kafka_bridge.cdc.ranges import (
+    KeyRange,
+    canonicalize_key_ranges,
+    validate_key_ranges,
 )
 
 DEFAULT_CDC_API_VERSION: Final[int] = 800
@@ -111,6 +119,51 @@ def _translate_cdc_runtime_error(exc: RuntimeError) -> NoReturn:
     ):
         raise CDCNotSupportedError(str(exc)) from exc
     raise exc
+
+
+def multi_range_cdc_unsupported_reason() -> str | None:
+    """Explain why the loaded binding cannot register multi-range streams.
+
+    Evidence-based, with no native call: the ``foundationdb`` 8.0.0 binding
+    adds the keyword-only ``ranges`` parameter to
+    ``Database.register_cdc_stream`` and the ``CdcKeyRange`` type together
+    with the five-argument ``fdb_database_register_cdc_stream(db, name,
+    name_length, ranges, range_count)`` it calls. A binding without them
+    predates multi-range CDC, and probing its native symbol would risk the
+    signature mismatch described in CDC-DEEP-DIVE §2.6.
+
+    The binding only loads ``fdb.Database`` once an API version is selected,
+    so call this after :func:`init_fdb` (``FDBClient.open``).
+
+    Returns:
+        ``None`` if supported, otherwise the missing capability.
+    """
+    if fdb is None:
+        return "FoundationDB python bindings ('fdb') are not installed"
+    if not fdb.is_api_version_selected():
+        return "no FDB API version is selected yet; open the client first"
+    database_type = getattr(fdb, "Database", None)
+    register = getattr(database_type, "register_cdc_stream", None)
+    if register is None:
+        return "the loaded fdb binding has no Database.register_cdc_stream"
+    try:
+        parameters = inspect.signature(register).parameters
+    except (TypeError, ValueError):
+        return "Database.register_cdc_stream has no inspectable signature"
+    ranges = parameters.get("ranges")
+    if ranges is None or ranges.kind is not inspect.Parameter.KEYWORD_ONLY:
+        return "Database.register_cdc_stream has no keyword-only 'ranges' parameter"
+    if not hasattr(fdb, "CdcKeyRange"):
+        return "the loaded fdb binding does not export CdcKeyRange"
+    return None
+
+
+def _stream_ranges(info: Any) -> tuple[KeyRange, ...]:
+    """Return a listed stream's canonical ranges as ``(begin, end)`` pairs."""
+    ranges = getattr(info, "ranges", None)
+    if ranges is None:
+        return ((bytes(info.begin_key), bytes(info.end_key)),)
+    return tuple((bytes(r.begin_key), bytes(r.end_key)) for r in ranges)
 
 
 def init_fdb(api_version: int = DEFAULT_CDC_API_VERSION) -> None:
@@ -218,23 +271,45 @@ class FDBClient:
     def register_cdc_stream(
         self,
         name: bytes | str,
-        begin_key: bytes,
-        end_key: bytes,
+        begin_key: bytes | None = None,
+        end_key: bytes | None = None,
+        *,
+        ranges: Iterable[KeyRange] | None = None,
     ) -> int:
-        """Register a CDC stream over a specified key range [begin_key, end_key).
+        """Register a CDC stream over one range, or over a union of ranges.
+
+        Pass ``begin_key`` and ``end_key`` for one ``[begin_key, end_key)``
+        range, or ``ranges`` for a multi-range stream. The whole ``ranges``
+        collection is validated (``validate_key_ranges``) and the binding's
+        multi-range capability checked before the single native registration
+        call.
+
+        Native registration is idempotent for the same name and canonical union
+        and fails for a different union. Prefer :meth:`ensure_cdc_stream` for
+        multi-range streams; it reports a mismatch before registering.
 
         Args:
             name: Unique stream identifier name.
-            begin_key: Inclusive start key of the monitored range.
-            end_key: Exclusive end key of the monitored range.
+            begin_key: Inclusive start key of a single monitored range.
+            end_key: Exclusive end key of a single monitored range.
+            ranges: ``(begin_key, end_key)`` pairs for a multi-range stream.
 
         Returns:
             64-bit integer stream ID assigned by FoundationDB.
 
         Raises:
-            CDCInvalidRangeError: If the range is empty, reversed, or not bytes.
-            CDCNotSupportedError: If the loaded binding lacks native CDC support.
+            TypeError: If ``ranges`` is combined with ``begin_key`` or
+                ``end_key``.
+            CDCInvalidRangeError: If a range is empty, reversed, not bytes, or
+                (for ``ranges``) duplicated, overlapping, outside user key
+                space, or more than the native limit.
+            CDCNotSupportedError: If the loaded binding lacks native CDC
+                support, or multi-range support when ``ranges`` is given.
         """
+        if ranges is not None:
+            if begin_key is not None or end_key is not None:
+                raise TypeError("ranges cannot be combined with begin_key or end_key")
+            return self._register_ranges(name, validate_key_ranges(ranges))
         if not isinstance(begin_key, bytes) or not isinstance(end_key, bytes):
             raise CDCInvalidRangeError("CDC range boundaries must be bytes")
         if begin_key >= end_key:
@@ -245,6 +320,94 @@ class FDBClient:
             )
         except RuntimeError as exc:
             _translate_cdc_runtime_error(exc)
+
+    def _register_ranges(self, name: bytes | str, ranges: tuple[KeyRange, ...]) -> int:
+        """Register already validated ranges with one native call.
+
+        Raises:
+            CDCNotSupportedError: If the binding cannot register multi-range
+                streams.
+        """
+        self.open()
+        reason = multi_range_cdc_unsupported_reason()
+        if reason is not None:
+            raise CDCNotSupportedError(
+                f"Multi-range CDC registration is unavailable: {reason}. It needs "
+                "the foundationdb>=8.0.0 Python binding with a matching 8.0 "
+                "libfdb_c (see the Dockerfile's FDB_VERSION)."
+            )
+        try:
+            return int(
+                self.db.register_cdc_stream(_to_bytes(name), ranges=list(ranges)).wait()
+            )
+        except RuntimeError as exc:
+            _translate_cdc_runtime_error(exc)
+
+    def get_cdc_stream(self, name: bytes | str) -> Any | None:
+        """Return the listed stream registered under ``name``, if any.
+
+        Args:
+            name: Stream name.
+
+        Returns:
+            The ``CdcStreamInfo`` for ``name``, or ``None`` if not registered.
+
+        Raises:
+            CDCNotSupportedError: If the loaded binding lacks native CDC support.
+        """
+        raw = _to_bytes(name)
+        for info in self.list_cdc_streams():
+            if bytes(info.name) == raw:
+                return info
+        return None
+
+    def ensure_cdc_stream(self, name: bytes | str, ranges: Iterable[KeyRange]) -> int:
+        """Register a multi-range stream, or verify an existing one matches.
+
+        Every check runs before the single native registration call: the
+        ranges are validated, multi-range support is confirmed, and an existing
+        stream's listed canonical union must equal the requested one. A
+        mismatched stream is refused, never removed or re-registered.
+
+        Args:
+            name: Stream name.
+            ranges: ``(begin_key, end_key)`` pairs, in any order.
+
+        Returns:
+            The stream ID; for an existing matching stream, its existing ID.
+
+        Raises:
+            CDCInvalidRangeError: If the ranges are invalid.
+            CDCNotSupportedError: If multi-range CDC is unavailable.
+            CDCStreamMismatchError: If ``name`` is registered over a different
+                union, or its ID changed during registration.
+        """
+        validated = validate_key_ranges(ranges)
+        self.open()
+        reason = multi_range_cdc_unsupported_reason()
+        if reason is not None:
+            raise CDCNotSupportedError(
+                f"Multi-range CDC registration is unavailable: {reason}."
+            )
+        existing = self.get_cdc_stream(name)
+        if existing is not None:
+            expected = canonicalize_key_ranges(validated)
+            actual = _stream_ranges(existing)
+            if actual != expected:
+                raise CDCStreamMismatchError(
+                    f"CDC stream {_to_bytes(name)!r} (id {existing.stream_id}) is "
+                    f"registered over {len(actual)} canonical range(s) that differ "
+                    f"from the {len(expected)} requested; stream ranges are "
+                    "immutable, so use a new stream name or remove the stream "
+                    "deliberately"
+                )
+        stream_id = self._register_ranges(name, validated)
+        if existing is not None and stream_id != existing.stream_id:
+            raise CDCStreamMismatchError(
+                f"CDC stream {_to_bytes(name)!r} changed id from "
+                f"{existing.stream_id} to {stream_id} during registration"
+            )
+        return stream_id
 
     def create_cdc_consumer(self, name: bytes | str) -> Any:
         """Create a new CDC consumer for a registered stream.

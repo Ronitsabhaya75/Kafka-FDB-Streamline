@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import json
 import math
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass, field, fields
 from typing import Any
 
+from fdb_kafka_bridge.cdc.directory import validate_directory_path
 from fdb_kafka_bridge.record_size import (
     DEFAULT_MESSAGE_MAX_BYTES,
     KAFKA_MESSAGE_OVERHEAD_BYTES,
@@ -31,6 +33,11 @@ class CDCConfig:
     ``max_record_bytes`` of ``None`` lets the listener derive the largest
     record that fits Kafka's default ``message.max.bytes`` with the stream
     name as the message key.
+
+    ``directory_path`` selects directory mode: the bridge resolves that
+    existing Directory Layer path at startup (with every descendant when
+    ``directory_recursive``) and registers one multi-range stream. It excludes
+    ``begin_key``/``end_key``.
     """
 
     stream_name: str = ""
@@ -40,6 +47,8 @@ class CDCConfig:
     cursor_file: str | None = None
     idle_ack_max_replies: int | None = None
     idle_ack_max_seconds: float | None = None
+    directory_path: tuple[str, ...] | None = None
+    directory_recursive: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,6 +108,58 @@ def _parse_key(key: Any, name: str) -> bytes:
     raise TypeError(
         f"cdc.{name} must be a hex string or bytes, got {type(key).__name__}"
     )
+
+
+def parse_directory_path_json(text: str, source: str) -> list[Any]:
+    """Decode a directory path given as a JSON array, e.g. ``["app", "users"]``.
+
+    JSON keeps every component intact, including ones containing ``/``, ``,``
+    or whitespace, so no splitting convention is needed. Component types are
+    checked later by :func:`from_dict`.
+
+    Args:
+        text: The JSON text.
+        source: Where the text came from, for error messages.
+
+    Returns:
+        The decoded array.
+
+    Raises:
+        ValueError: If ``text`` is not valid JSON or not a JSON array.
+    """
+    try:
+        value = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"{source} must be a JSON array of strings, e.g. "
+            f"'[\"my_application\"]': {exc}"
+        ) from exc
+    if not isinstance(value, list):
+        raise ValueError(f"{source} must be a JSON array of strings")
+    return value
+
+
+def _parse_directory_path(value: Any) -> tuple[str, ...] | None:
+    """Validate ``cdc.directory_path`` from a list or tuple of strings."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        raise TypeError(
+            "cdc.directory_path must be a list of path components, not a string"
+        )
+    if not isinstance(value, (list, tuple)):
+        raise TypeError("cdc.directory_path must be a list of path components")
+    return validate_directory_path(tuple(value), name="cdc.directory_path")
+
+
+def _parse_env_bool(text: str, name: str) -> bool:
+    """Parse ``true``/``false``/``1``/``0`` (case-insensitive)."""
+    lowered = text.strip().lower()
+    if lowered in ("true", "1"):
+        return True
+    if lowered in ("false", "0"):
+        return False
+    raise ValueError(f"{name} must be one of true, false, 1, 0; got {text!r}")
 
 
 def _check_message_fits(
@@ -167,8 +228,10 @@ def from_dict(data: dict[str, Any]) -> BridgeConfig:
             one-sided or has begin_key >= end_key, a hex string is invalid,
             numeric intervals are not positive, an explicit max_record_bytes
             plus the UTF-8 stream_name key and Kafka per-message overhead
-            exceeds the producer's message.max.bytes, or the effective
-            max_record_bytes cannot hold the stream's largest VersionEnd.
+            exceeds the producer's message.max.bytes, the effective
+            max_record_bytes cannot hold the stream's largest VersionEnd,
+            directory_path is empty or combined with begin_key/end_key, or
+            directory_recursive is set without directory_path.
     """
     if not isinstance(data, dict):
         raise TypeError(
@@ -216,6 +279,17 @@ def from_dict(data: dict[str, Any]) -> BridgeConfig:
         )
     if begin_key and begin_key >= end_key:
         raise ValueError("cdc.begin_key must be less than cdc.end_key")
+
+    directory_path = _parse_directory_path(cdc_dict.get("directory_path"))
+    directory_recursive = cdc_dict.get("directory_recursive", False)
+    if type(directory_recursive) is not bool:
+        raise TypeError("cdc.directory_recursive must be a boolean")
+    if directory_path is not None and begin_key:
+        raise ValueError(
+            "cdc.directory_path cannot be combined with cdc.begin_key/cdc.end_key"
+        )
+    if directory_recursive and directory_path is None:
+        raise ValueError("cdc.directory_recursive requires cdc.directory_path")
 
     max_record_bytes = cdc_dict.get("max_record_bytes")
     if max_record_bytes is not None:
@@ -313,6 +387,8 @@ def from_dict(data: dict[str, Any]) -> BridgeConfig:
             cursor_file=cursor_file,
             idle_ack_max_replies=idle_ack_max_replies,
             idle_ack_max_seconds=idle_ack_max_seconds,
+            directory_path=directory_path,
+            directory_recursive=directory_recursive,
         ),
         kafka=KafkaConfig(
             bootstrap_servers=bootstrap_servers,
@@ -343,6 +419,10 @@ def env_to_dict(env: Mapping[str, str] | None = None) -> dict[str, Any]:
           cdc.idle_ack_max_replies (int)
         - FDB_CDC_IDLE_ACK_MAX_SECONDS or CDC_IDLE_ACK_MAX_SECONDS ->
           cdc.idle_ack_max_seconds (float)
+        - FDB_CDC_DIRECTORY_PATH or CDC_DIRECTORY_PATH -> cdc.directory_path
+          (JSON array of strings, e.g. ``["my_application"]``)
+        - FDB_CDC_DIRECTORY_RECURSIVE or CDC_DIRECTORY_RECURSIVE ->
+          cdc.directory_recursive (``true``/``false``/``1``/``0``)
         - KAFKA_BOOTSTRAP_SERVERS -> kafka.bootstrap_servers (str)
         - KAFKA_TOPIC -> kafka.topic (str)
         - KAFKA_TRANSACTIONAL_ID -> kafka.transactional_id (str)
@@ -411,6 +491,18 @@ def env_to_dict(env: Mapping[str, str] | None = None) -> dict[str, Any]:
             cdc_dict["idle_ack_max_seconds"] = float(idle_secs)
         except ValueError as exc:
             raise TypeError("cdc.idle_ack_max_seconds must be numeric") from exc
+    directory = env.get("FDB_CDC_DIRECTORY_PATH") or env.get("CDC_DIRECTORY_PATH")
+    if directory is not None:
+        cdc_dict["directory_path"] = parse_directory_path_json(
+            directory, "FDB_CDC_DIRECTORY_PATH"
+        )
+    recursive = env.get("FDB_CDC_DIRECTORY_RECURSIVE") or env.get(
+        "CDC_DIRECTORY_RECURSIVE"
+    )
+    if recursive is not None:
+        cdc_dict["directory_recursive"] = _parse_env_bool(
+            recursive, "FDB_CDC_DIRECTORY_RECURSIVE"
+        )
 
     if "KAFKA_BOOTSTRAP_SERVERS" in env:
         kafka_dict["bootstrap_servers"] = env["KAFKA_BOOTSTRAP_SERVERS"]

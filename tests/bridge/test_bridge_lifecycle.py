@@ -83,7 +83,7 @@ def test_start_passes_stream_name_to_cursor_load(
 ) -> None:
     Bridge(_config()).start()
     wiring["load_cursor"].assert_called_once_with(
-        "/nonexistent/c.json", stream_name="s"
+        "/nonexistent/c.json", stream_name="s", directory_fingerprint=None
     )
 
 
@@ -100,7 +100,9 @@ def test_rebuild_keeps_transactional_mode_from_config(
     assert bridge._producer is not injected
     assert bridge._producer.transactional
     bridge._producer.init_transactions.assert_called_once()
-    wiring["load_cursor"].assert_called_with("/nonexistent/c.json", stream_name="s")
+    wiring["load_cursor"].assert_called_with(
+        "/nonexistent/c.json", stream_name="s", directory_fingerprint=None
+    )
 
 
 def test_rebuild_uses_producer_factory(wiring: dict[str, MagicMock]) -> None:

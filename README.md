@@ -14,6 +14,21 @@ Requires Python 3.12. Commits must be signed — see [Signed commits](docs/conve
 Kafka producer behavior and local verification are documented in the
 [`Kafka producer specification`](docs/KAFKA-PRODUCER-SPEC.md).
 
+## Watching a Directory Layer tree
+
+The bridge can resolve an existing Directory Layer path, optionally with every descendant, into one multi-range CDC stream on FoundationDB 8.0:
+
+```python
+from fdb_kafka_bridge.cdc import DirectoryCDCResolver, FDBClient, FDBMutationListener
+
+client = FDBClient()
+resolved = DirectoryCDCResolver(client.open(), ("my_application",), recursive=True).resolve()
+listener = FDBMutationListener(client, "my-application-cdc", key_ranges=resolved.key_ranges)
+resolved.path_for_key(raw_key)  # logical directory owning a mutation key, or None
+```
+
+As a daemon: `python -m fdb_kafka_bridge.bridge.cli --cdc-stream-name my-application-cdc --cdc-directory-path '["my_application"]' --cdc-directory-recursive --cdc-cursor-file cursor.json`. The tree is read once at startup. The daemon requires a cursor file (or a supplied `CheckpointStore`), and every checkpoint carries a fingerprint that refuses to resume after the tree changes. Details: [CDC spec §2.5](docs/CDC-CONSUMER-SPEC.md) and [Bridge spec, Directory mode](docs/BRIDGE-PIPELINE-SPEC.md#directory-mode).
+
 ## Install
 
 ```bash

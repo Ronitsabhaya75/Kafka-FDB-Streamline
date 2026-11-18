@@ -20,6 +20,8 @@ from fdb_kafka_bridge.bridge.pipeline import (
     BridgeMetrics,
     BridgePipeline,
     Checkpoint,
+    CheckpointStore,
+    FileCheckpointStore,
 )
 
 __all__ = [
@@ -29,7 +31,9 @@ __all__ = [
     "BridgePipeline",
     "CDCConfig",
     "Checkpoint",
+    "CheckpointStore",
     "FDBConfig",
+    "FileCheckpointStore",
     "KafkaConfig",
     "PipelineConfig",
     "build_parser",

@@ -82,13 +82,56 @@ If the checkpoint or the acknowledgement budget fails after delivery, the next `
 
 Parsed via `from_dict(data)`, `from_env(env)`, or via the CLI daemon entrypoint (`fdb_kafka_bridge.bridge.cli`):
 - `fdb`: `api_version` (default 800), `cluster_file` (optional path).
-- `cdc`: `stream_name` (required; empty or whitespace-only is rejected), `begin_key` / `end_key` (paired hex strings or bytes, `begin_key < end_key`), `max_record_bytes` (optional; `None` derives it from the stream name, see [CDC spec](CDC-CONSUMER-SPEC.md)), `cursor_file` (optional path), `idle_ack_max_replies` (optional positive integer >= 1), `idle_ack_max_seconds` (optional finite float > 0).
+- `cdc`: `stream_name` (required; empty or whitespace-only is rejected), `begin_key` / `end_key` (paired hex strings or bytes, `begin_key < end_key`), `max_record_bytes` (optional; `None` derives it from the stream name, see [CDC spec](CDC-CONSUMER-SPEC.md)), `cursor_file` (optional path), `idle_ack_max_replies` (optional positive integer >= 1), `idle_ack_max_seconds` (optional finite float > 0), `directory_path` (optional; see [Directory mode](#directory-mode)), `directory_recursive` (bool, default `false`; requires `directory_path`).
 - `kafka`: `bootstrap_servers`, `topic`, `transactional_id` (optional non-empty string; setting it enables transactional mode).
 - `pipeline`: `flush_timeout_seconds`, `backoff_base_seconds`, `backoff_max_seconds`, `shutdown_timeout_seconds`.
 
 Unknown keys at any level raise `ValueError`, so a typo fails instead of silently falling back to a default.
 
 Every record is keyed by the stream name, so the record budget depends on its length. With `max_record_bytes` unset, the listener derives the largest budget that fits (`max_record_bytes_for_key`), and `from_dict` rejects the configuration if the derived or explicit budget cannot hold the stream's largest `VersionEnd` (`min_record_cap(stream_name)`: the name plus about 50 bytes, since the name is also in every record's envelope). An explicit `max_record_bytes` is rejected with `ValueError` when `max_record_bytes + len(stream_name.encode("utf-8")) + 36 > 1,000,000` (librdkafka's default `message.max.bytes`; the bridge passes no `extra_config`), since librdkafka would reject a max-size record at `produce()` ([Record size](KAFKA-PRODUCER-SPEC.md#record-size)).
+
+### Directory mode
+
+Setting `cdc.directory_path` makes the bridge watch an existing Directory Layer tree
+instead of an explicit key range.
+
+| Source | `directory_path` | `directory_recursive` |
+|--------|------------------|-----------------------|
+| JSON config | `["my_application", "users"]` | `true` / `false` |
+| Environment | `FDB_CDC_DIRECTORY_PATH` (or `CDC_DIRECTORY_PATH`) = `'["my_application"]'` | `FDB_CDC_DIRECTORY_RECURSIVE` (or `CDC_DIRECTORY_RECURSIVE`) = `true`/`false`/`1`/`0` |
+| CLI | `--cdc-directory-path '["my_application"]'` | `--cdc-directory-recursive` / `--no-cdc-directory-recursive` |
+
+Paths are always a JSON array of strings, so any component (including ones containing
+`/`, `,` or spaces) round-trips; there is no splitting convention. Precedence is
+unchanged: defaults < JSON file < environment < CLI. `directory_path` combined with
+`begin_key`/`end_key` raises `ValueError`, as does `directory_recursive` without
+`directory_path`. Path rules are those of the resolver ([CDC spec §2.5](CDC-CONSUMER-SPEC.md#25-directory-layer-resolver-srcfdb_kafka_bridgecdcdirectorypy)).
+Stream name, Kafka and cursor settings are configured as in range mode.
+
+```bash
+python -m fdb_kafka_bridge.bridge.cli \
+  --cdc-stream-name my-application-cdc \
+  --cdc-directory-path '["my_application"]' --cdc-directory-recursive \
+  --cdc-cursor-file /var/lib/bridge/my-application.cursor.json \
+  --kafka-bootstrap-servers kafka:9092 --kafka-topic my-application-cdc
+```
+
+Behaviour:
+
+1. **Resolve once, freeze.** The first `Bridge.start()` resolves the tree
+   (`DirectoryCDCResolver`) before registering or consuming. The resulting
+   `ResolvedDirectoryTree` is kept for the life of the `Bridge`. Every rebuild
+   registers the same ranges and checkpoints the same fingerprint; it never rediscovers,
+   so a transient failure cannot change the stream's scope. A new process does
+   rediscover, and the checkpoint fingerprint then decides whether resuming is safe.
+2. **One stream, one topic, one key.** The tree is one multi-range stream (validated
+   with `ensure_cdc_stream`; a stream registered over different ranges is refused with
+   `CDCStreamMismatchError`, never removed). All directories publish to the one
+   `kafka.topic`, every record and `VersionEnd` keyed by the stream name. Records are
+   unchanged; consumers map keys to directories with `ResolvedDirectoryTree.lookup`.
+3. **Injection.** `Bridge(..., directory_tree=..., checkpoint_store=...)` supplies a pre-resolved tree and/or a durable store (below). A supplied
+   tree's root and recursive mode must match the config. An injected listener must use
+   `key_ranges=directory_tree.key_ranges`.
 
 ### Idle Reply Coalescing
 
@@ -109,7 +152,7 @@ When `cdc.idle_ack_max_replies` or `cdc.idle_ack_max_seconds` is configured:
 ### Cursor File Persistence
 
 When `config.cdc.cursor_file` is specified, `Bridge` persists the cursor atomically and durably:
-1. Writes JSON containing `{"stream_id": <int>, "last_consumed_version": <int>, "stream_name": <str>}` to a `.tmp` file.
+1. Writes JSON containing `{"stream_id": <int>, "last_consumed_version": <int>, "stream_name": <str>}`, plus `"directory_fingerprint": <str>` in directory mode, to a `.tmp` file.
 2. Calls `f.flush()` and `os.fsync(f.fileno())` to sync data blocks to disk.
 3. Performs atomic rename via `os.replace(tmp_path, cursor_file)`.
 4. Fsyncs the parent directory to guarantee the directory entry update is durable. Only `EINVAL`/`ENOTSUP`/`EOPNOTSUPP` (filesystems that cannot fsync a directory) are tolerated.
@@ -117,11 +160,50 @@ When `config.cdc.cursor_file` is specified, `Bridge` persists the cursor atomica
 
 On start and on every rebuild, if `cursor_file` exists it is parsed strictly. Invalid JSON, missing or non-integer coordinates, or a `stream_name` other than `cdc.stream_name` (including a file with no `stream_name`) raise `ValueError` rather than silently resuming from a fresh or foreign cursor.
 
+**Directory fingerprint.** Every checkpoint in directory mode records the frozen tree's
+fingerprint (format in [CDC spec §2.5](CDC-CONSUMER-SPEC.md#25-directory-layer-resolver-srcfdb_kafka_bridgecdcdirectorypy)).
+This covers data replies, coalesced idle flushes and the graceful-shutdown flush, because
+they share one checkpoint callback. The write sequence is unchanged: temp file, fsync,
+atomic replace, directory fsync. On load the recorded value must equal the startup
+fingerprint exactly; the check runs before the listener exists, so a refusal never
+reaches native resume or its re-acknowledgement:
+
+| Mode | File has fingerprint | Result |
+|------|----------------------|--------|
+| directory | equal | resume |
+| directory | different | `ValueError`: tree or configuration changed |
+| directory | absent (legacy or range-mode file) | `ValueError`: never blessed with the current fingerprint |
+| directory | not a string | `ValueError`: corrupt |
+| range | absent | resume (unchanged behaviour for existing checkpoints) |
+| range | present | `ValueError`: a directory-mode cursor is not resumed without `directory_path` |
+
+An incompatible file is never deleted or rewritten. The operator moves it aside
+deliberately, which starts a fresh consumer at the stream's initial position. Separately,
+the listener refuses a cursor whose `stream_id` differs from the registered stream's (the
+stream was removed and re-registered).
+
+**Durable checkpoints are required in directory mode.** The fingerprint is what
+refuses an unsafe resume, so the directory-mode daemon must persist it. `Bridge(...)`
+raises `ValueError` at construction, before any FDB or Kafka call, unless exactly one of
+these is configured:
+
+- `cdc.cursor_file` (`--cdc-cursor-file`, `FDB_CDC_CURSOR_FILE`), the default
+  `FileCheckpointStore`; or
+- `checkpoint_store=`, a caller-supplied `CheckpointStore`. Its `save(position, *,
+  stream_name, directory_fingerprint)` must be durable before it returns and must
+  store the fingerprint; its `load(*, stream_name, directory_fingerprint)` must
+  enforce the refusal rules in the table above.
+
+Giving both is also a `ValueError`. The CLI reports the missing destination as a
+configuration error and exits 1. Range mode keeps its old behaviour: with no cursor
+file, nothing is persisted and each start creates a fresh consumer. The standalone
+`DirectoryCDCResolver` has no checkpoint dependency; only the daemon requires one.
+
 ### Error Classification and Recovery Loop
 
 In `Bridge.run()`:
 - **Terminal errors** (`CDCTerminalError`, fatal Kafka errors via `is_fatal_kafka_error`): sets shutdown, logs with `exc_info=True`, and re-raises.
-- **Permanent errors** (a `ValueError` that is not a `SerializationError`, e.g. invalid checkpoint coordinates or a corrupt or foreign cursor file on rebuild): sets shutdown and re-raises rather than retrying forever.
+- **Permanent errors** (a `ValueError` that is not a `SerializationError`, e.g. invalid checkpoint coordinates, a corrupt, foreign or fingerprint-mismatched cursor file on rebuild, `CDCStreamMismatchError` or `DirectoryResolutionError`): sets shutdown and re-raises rather than retrying forever.
 - **Oversized record** (`KafkaException` with `MSG_SIZE_TOO_LARGE`): permanent, since a restart replays the same version and the same records. Logs, sets shutdown and re-raises; the version is not acknowledged. The remedy depends on where it was raised:
   - From `produce()`: librdkafka rejected one record client-side (`len(value) + len(key) + 36 > message.max.bytes`). The derived default and the config check prevent this for listener-sized records. Lower `cdc.max_record_bytes`.
   - From a delivery report (re-raised by `flush()` in idempotent mode) or from `commit_transaction()` (transactional mode: the rejection makes the transaction abortable and the commit raises the same code): the broker rejected a record batch larger than the topic `max.message.bytes`. With producer defaults librdkafka batches a reply's records up to about 1,000,000 bytes, so lowering `cdc.max_record_bytes` does not help; raise the topic `max.message.bytes` to at least 1,000,061 ([Record size](KAFKA-PRODUCER-SPEC.md#record-size)).
@@ -155,6 +237,8 @@ A `RecordTooLargeError` caused by the data itself recurs after every rebuild, so
 | At-least-once (both modes) | Yes |
 | No ack before Kafka delivery and a successful checkpoint | Yes |
 | One partition per step | Yes, via a non-empty stable key |
+| Directory mode ordering | One topic, one stream-name key for every directory; native commit-version order across the whole tree |
+| Directory scope | Fixed at startup; changes are refused at resume, not followed |
 | Kafka-side atomicity (txn mode) | Yes, for `read_committed` consumers |
 | Cross-system exactly-once | No. The CDC cursor is not inside the Kafka transaction. |
 | Duplicate suppression | No. Consumers dedup on `(stream, version, sequence)`. |

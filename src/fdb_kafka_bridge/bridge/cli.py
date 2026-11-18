@@ -15,6 +15,7 @@ from fdb_kafka_bridge.bridge.config import (
     BridgeConfig,
     env_to_dict,
     from_dict,
+    parse_directory_path_json,
 )
 from fdb_kafka_bridge.bridge.pipeline import Bridge
 
@@ -71,6 +72,19 @@ def build_parser() -> argparse.ArgumentParser:
             "Maximum Protobuf record size in bytes (default: derived from the "
             "stream name so a record fits Kafka's message.max.bytes)."
         ),
+    )
+    cdc_group.add_argument(
+        "--cdc-directory-path",
+        help=(
+            "Existing Directory Layer path to watch, as a JSON array of strings, "
+            "e.g. '[\"my_application\"]'. Excludes --cdc-begin-key/--cdc-end-key."
+        ),
+    )
+    cdc_group.add_argument(
+        "--cdc-directory-recursive",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Also watch every existing descendant of --cdc-directory-path.",
     )
     cdc_group.add_argument(
         "--cdc-cursor-file",
@@ -178,6 +192,13 @@ def parse_config(
     _set("cdc", "end_key", args.cdc_end_key)
     _set("cdc", "max_record_bytes", args.cdc_max_record_bytes)
     _set("cdc", "cursor_file", args.cdc_cursor_file)
+    if args.cdc_directory_path is not None:
+        _set(
+            "cdc",
+            "directory_path",
+            parse_directory_path_json(args.cdc_directory_path, "--cdc-directory-path"),
+        )
+    _set("cdc", "directory_recursive", args.cdc_directory_recursive)
     _set("cdc", "idle_ack_max_replies", args.cdc_idle_ack_max_replies)
     _set("cdc", "idle_ack_max_seconds", args.cdc_idle_ack_max_seconds)
     _set("kafka", "bootstrap_servers", args.kafka_bootstrap_servers)
@@ -210,7 +231,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         logger.error("Configuration error: %s", exc)
         return 1
 
-    bridge = Bridge(config)
+    try:
+        bridge = Bridge(config)
+    except ValueError as exc:
+        logger.error("Configuration error: %s", exc)
+        return 1
 
     def _signal_handler(signum: int, _frame: Any) -> None:
         logger.info("Signal %d received, requesting graceful shutdown...", signum)

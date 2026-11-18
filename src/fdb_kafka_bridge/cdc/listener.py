@@ -2,6 +2,7 @@
 
 import math
 import time
+from collections.abc import Iterable
 from typing import Any, Final, Self
 
 from fdb_kafka_bridge.cdc.client import FDBClient, _raise_consume_failure, _to_bytes
@@ -9,7 +10,9 @@ from fdb_kafka_bridge.cdc.errors import (
     CDCConsumerClosedError,
     CDCError,
     CDCInvalidCursorError,
+    CDCStreamMismatchError,
 )
+from fdb_kafka_bridge.cdc.ranges import KeyRange, validate_key_ranges
 from fdb_kafka_bridge.record_size import max_record_bytes_for_key, min_record_cap
 from fdb_kafka_bridge.serialization import (
     serialize_version_end,
@@ -85,6 +88,7 @@ class FDBMutationListener:
         stream_name: str | bytes,
         *,
         key_range: tuple[bytes, bytes] | None = None,
+        key_ranges: Iterable[KeyRange] | None = None,
         subspace: Any | None = None,
         cursor: Any | None = None,
         max_record_bytes: int | None = None,
@@ -95,13 +99,23 @@ class FDBMutationListener:
     ) -> None:
         """Initialize a CDC listener.
 
-        Supplying a key range or subspace registers the stream during ``start``.
-        Omitting both consumes an already registered stream.
+        Supplying ``key_range``, ``key_ranges`` or ``subspace`` (at most one)
+        registers the stream during ``start``. Omitting all three consumes an
+        already registered stream.
+
+        ``key_ranges`` registers one multi-range stream through
+        :meth:`FDBClient.ensure_cdc_stream`: an existing stream must already
+        cover the same canonical union, and a resumed ``cursor`` must name the
+        registered stream id. Both checks run before the consumer is resumed or
+        re-acknowledged.
 
         Args:
             client: FoundationDB client used for stream operations.
             stream_name: Registered CDC stream name.
             key_range: Optional explicit ``(begin_key, end_key)`` registration range.
+            key_ranges: Optional ``(begin_key, end_key)`` pairs for one
+                multi-range stream, validated in full here, before any native
+                call.
             subspace: Optional FDB subspace or bytes prefix to register.
             cursor: Optional persisted cursor from which to resume.
             max_record_bytes: Maximum serialized size of every returned record.
@@ -121,13 +135,22 @@ class FDBMutationListener:
 
         Raises:
             TypeError: If a numeric configuration value has an invalid type.
-            ValueError: If both range forms are supplied, a value is not positive,
+            CDCInvalidRangeError: If ``key_ranges`` is invalid.
+            ValueError: If more than one range form is supplied, a value is not
+                positive,
                 ``idle_ack_max_seconds`` is not finite, the stream name is
                 empty, or the effective ``max_record_bytes`` cannot hold the
                 stream's largest ``VersionEnd``.
         """
         if key_range is not None and subspace is not None:
             raise ValueError("Specify either key_range or subspace, not both")
+        if key_ranges is not None and (key_range is not None or subspace is not None):
+            raise ValueError(
+                "Specify only one of key_range, key_ranges or subspace, not several"
+            )
+        validated_ranges = (
+            None if key_ranges is None else validate_key_ranges(key_ranges)
+        )
         raw_stream_name = _to_bytes(stream_name)
         decoded_stream_name = raw_stream_name.decode("utf-8", errors="replace")
         derived = max_record_bytes is None
@@ -183,6 +206,8 @@ class FDBMutationListener:
         self.key_range = (
             subspace_to_key_range(subspace) if subspace is not None else key_range
         )
+        self.key_ranges: tuple[KeyRange, ...] | None = validated_ranges
+        self._stream_id: int | None = None
         self.initial_cursor = cursor
         self.max_record_bytes = max_record_bytes
         self.resume_timeout_seconds = float(resume_timeout_seconds)
@@ -205,7 +230,11 @@ class FDBMutationListener:
             raise CDCConsumerClosedError("Cannot start a closed FDBMutationListener.")
 
         self.client.open()
-        if self.key_range is not None:
+        if self.key_ranges is not None:
+            self._stream_id = self.client.ensure_cdc_stream(
+                self.raw_stream_name, self.key_ranges
+            )
+        elif self.key_range is not None:
             begin_key, end_key = self.key_range
             self.client.register_cdc_stream(self.raw_stream_name, begin_key, end_key)
 
@@ -214,6 +243,14 @@ class FDBMutationListener:
             self._reset_idle_window()
             return
 
+        if self._stream_id is not None:
+            cursor_stream_id = getattr(self.initial_cursor, "stream_id", None)
+            if cursor_stream_id != self._stream_id:
+                raise CDCStreamMismatchError(
+                    f"cursor names stream id {cursor_stream_id!r} but "
+                    f"{self.raw_stream_name!r} is registered as {self._stream_id}; "
+                    "the stream was removed and re-registered since the checkpoint"
+                )
         consumer = self.client.resume_cdc_consumer(self.initial_cursor)
         self._consumer = consumer
         try:
@@ -240,6 +277,11 @@ class FDBMutationListener:
             self.consumer.acknowledge().wait()
         except Exception as exc:
             _raise_consume_failure(exc, "restore resumed CDC position")
+
+    @property
+    def stream_id(self) -> int | None:
+        """Stream id from ``key_ranges`` registration in ``start``, else ``None``."""
+        return self._stream_id
 
     @property
     def delivery_failed(self) -> bool:

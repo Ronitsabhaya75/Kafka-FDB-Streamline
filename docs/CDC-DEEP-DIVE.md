@@ -1,5 +1,7 @@
 # FoundationDB native CDC, deep dive
 
+> **Historical research (status 2026-11-17).** This document predates the FoundationDB 8.0.0 release. The released 8.0.0 binding and `libfdb_c` ship the multi-range API: `register_cdc_stream(name, begin_key=None, end_key=None, *, ranges=None, split_points=None)` over `fdb_database_register_cdc_stream(db, name, name_length, ranges, range_count)`, and `CdcStreamInfo.ranges`. That resolves the #13925/#13971 signature split (§2.6, L2) for the pinned version. The executable contract is [`CDC-CONSUMER-SPEC.md`](CDC-CONSUMER-SPEC.md) §2.6; read the "prospective" sections below as background.
+
 Trello: [Research FoundationDB CDC Architecture & API](https://trello.com/c/DLfs4a8S)
 (`DLfs4a8S`).
 

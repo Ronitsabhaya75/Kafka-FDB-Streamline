@@ -26,7 +26,7 @@ import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, NoReturn
+from typing import Any, NoReturn, Protocol
 
 try:
     import fdb
@@ -37,6 +37,7 @@ from confluent_kafka import KafkaException
 
 from fdb_kafka_bridge.bridge.config import BridgeConfig
 from fdb_kafka_bridge.cdc.client import FDBClient
+from fdb_kafka_bridge.cdc.directory import DirectoryCDCResolver, ResolvedDirectoryTree
 from fdb_kafka_bridge.cdc.errors import CDCRetryableError, CDCTerminalError
 from fdb_kafka_bridge.cdc.listener import FDBMutationListener
 from fdb_kafka_bridge.kafka import (
@@ -454,7 +455,11 @@ _DIR_FSYNC_UNSUPPORTED = frozenset(
 
 
 def _save_cursor_to_file(
-    path: str | None, position: Any, *, stream_name: str | None = None
+    path: str | None,
+    position: Any,
+    *,
+    stream_name: str | None = None,
+    directory_fingerprint: str | None = None,
 ) -> None:
     """Persist current consumer position coordinates to a file durably and atomically.
 
@@ -467,6 +472,10 @@ def _save_cursor_to_file(
         position: Native CDC cursor object exposing coordinates.
         stream_name: CDC stream name to record alongside the coordinates, so a
             later load can reject a file written for a different stream.
+        directory_fingerprint: Fingerprint of the resolved directory tree the
+            stream covers, recorded so a later load can refuse to resume after
+            the tree or its configuration changed. ``None`` writes no
+            fingerprint (non-directory mode).
 
     Raises:
         ValueError: If position is None or lacks stream_id or
@@ -502,6 +511,8 @@ def _save_cursor_to_file(
     payload: dict[str, Any] = {"stream_id": stream_id, "last_consumed_version": version}
     if stream_name is not None:
         payload["stream_name"] = stream_name
+    if directory_fingerprint is not None:
+        payload["directory_fingerprint"] = directory_fingerprint
 
     tmp_path = f"{path}.tmp"
     with open(tmp_path, "w", encoding="utf-8") as f:
@@ -528,7 +539,10 @@ def _save_cursor_to_file(
 
 
 def _load_cursor_from_file(
-    path: str | None, *, stream_name: str | None = None
+    path: str | None,
+    *,
+    stream_name: str | None = None,
+    directory_fingerprint: str | None = None,
 ) -> Any | None:
     """Load persisted cursor coordinates from a file if present.
 
@@ -536,13 +550,20 @@ def _load_cursor_from_file(
         path: Path to the cursor file, or None.
         stream_name: Expected CDC stream name. When given, the file must record
             the same ``stream_name``; when None, the check is skipped.
+        directory_fingerprint: Expected directory fingerprint. The file's
+            ``directory_fingerprint`` must equal it exactly: a directory-mode
+            load refuses a file without one (a legacy or non-directory
+            cursor), and a non-directory load (``None``) refuses a file that
+            has one. The file is never modified.
 
     Returns:
         A reconstructed cursor instance, or None if path is None or file does not exist.
 
     Raises:
         ValueError: If the file exists but contains invalid cursor coordinates,
-            or ``stream_name`` is given and the file does not record that stream.
+            ``stream_name`` is given and the file does not record that stream,
+            or the recorded directory fingerprint is malformed or differs from
+            ``directory_fingerprint``.
         OSError: If reading the cursor file fails.
     """
     if not path or not os.path.exists(path):
@@ -580,9 +601,116 @@ def _load_cursor_from_file(
             f"{data.get('stream_name')!r}, expected {stream_name!r}"
         )
 
+    _check_directory_fingerprint(path, data, directory_fingerprint)
+
     if fdb is not None and hasattr(fdb, "CdcCursor"):
         return fdb.CdcCursor(raw_stream_id, raw_version)
     return _PersistedCursor(stream_id=raw_stream_id, last_consumed_version=raw_version)
+
+
+def _check_directory_fingerprint(
+    path: str, data: dict[str, Any], expected: str | None
+) -> None:
+    """Refuse a cursor whose recorded directory fingerprint is not ``expected``.
+
+    Raises:
+        ValueError: If the recorded fingerprint is malformed, missing in
+            directory mode, present in non-directory mode, or different.
+    """
+    recorded = data.get("directory_fingerprint")
+    if recorded is not None and not isinstance(recorded, str):
+        raise ValueError(
+            f"Corrupt cursor file at {path}: directory_fingerprint must be a string"
+        )
+    if recorded == expected:
+        return
+    if expected is None:
+        raise ValueError(
+            f"Cursor file at {path} was written in directory mode "
+            f"({recorded}); refusing to resume it without cdc.directory_path"
+        )
+    if recorded is None:
+        # Never bless a legacy cursor: nothing proves it covered this tree.
+        raise ValueError(
+            f"Cursor file at {path} has no directory_fingerprint (a legacy or "
+            f"non-directory checkpoint); refusing to resume directory stream "
+            f"{expected}. Move the file aside deliberately to start a fresh "
+            "consumer"
+        )
+    raise ValueError(
+        f"Cursor file at {path} was written for directory configuration "
+        f"{recorded}, but this startup resolved {expected}; the root path, "
+        "recursive mode, or directory tree changed. Refusing to resume; the "
+        "file is left untouched"
+    )
+
+
+class CheckpointStore(Protocol):
+    """Durable cursor storage used by :class:`Bridge`.
+
+    ``save`` must make the position durable before it returns, because the
+    bridge acknowledges FDB right after; it raises on any failure. It must
+    persist ``directory_fingerprint`` with the position when one is given.
+    ``load`` must return ``None`` only when nothing was ever saved, and must
+    refuse (raise ``ValueError``) a stored cursor whose stream name or
+    directory fingerprint differs from the arguments, including a stored
+    cursor with no fingerprint when one is expected. :class:`FileCheckpointStore`
+    is the reference implementation.
+    """
+
+    def load(self, *, stream_name: str, directory_fingerprint: str | None) -> Any:
+        """Return the stored cursor, or ``None`` if none was ever saved."""
+        ...
+
+    def save(
+        self, position: Any, *, stream_name: str, directory_fingerprint: str | None
+    ) -> None:
+        """Durably store ``position``; raise on any failure."""
+        ...
+
+
+@dataclass(frozen=True, slots=True)
+class FileCheckpointStore:
+    """Cursor file with an atomic, fsynced write sequence.
+
+    Attributes:
+        path: Cursor file path. ``None`` persists nothing (range mode only).
+    """
+
+    path: str | None
+
+    def load(self, *, stream_name: str, directory_fingerprint: str | None) -> Any:
+        """Load and validate the cursor file; see :func:`_load_cursor_from_file`.
+
+        Args:
+            stream_name: Expected stream name.
+            directory_fingerprint: Expected directory fingerprint, or ``None``.
+
+        Returns:
+            The cursor, or ``None`` if the file is absent or ``path`` is None.
+        """
+        return _load_cursor_from_file(
+            self.path,
+            stream_name=stream_name,
+            directory_fingerprint=directory_fingerprint,
+        )
+
+    def save(
+        self, position: Any, *, stream_name: str, directory_fingerprint: str | None
+    ) -> None:
+        """Durably write the cursor; see :func:`_save_cursor_to_file`.
+
+        Args:
+            position: Cursor exposing ``stream_id`` and ``last_consumed_version``.
+            stream_name: Stream name recorded with the cursor.
+            directory_fingerprint: Fingerprint recorded with the cursor, or None.
+        """
+        _save_cursor_to_file(
+            self.path,
+            position,
+            stream_name=stream_name,
+            directory_fingerprint=directory_fingerprint,
+        )
 
 
 class _RecordCountingListener:
@@ -657,6 +785,14 @@ class Bridge:
         listener: Optional pre-configured :class:`FDBMutationListener`.
         producer: Optional pre-configured :class:`MutationProducer`.
         producer_factory: Optional builder for replacement producers.
+        directory_tree: Optional pre-resolved tree for directory mode.
+
+    In directory mode (``config.cdc.directory_path``) the tree is resolved once,
+    on the first :meth:`start`, and frozen for the life of this object: every
+    rebuild registers and checkpoints the same ranges and fingerprint, so a
+    transient failure never widens or narrows the stream. Only a new process
+    rediscovers the tree, and the checkpoint fingerprint then refuses an unsafe
+    resume.
     """
 
     def __init__(
@@ -667,6 +803,8 @@ class Bridge:
         listener: FDBMutationListener | None = None,
         producer: MutationProducer | None = None,
         producer_factory: Callable[[], MutationProducer] | None = None,
+        directory_tree: ResolvedDirectoryTree | None = None,
+        checkpoint_store: CheckpointStore | None = None,
     ) -> None:
         """Initialize the Bridge with declarative configuration.
 
@@ -685,11 +823,21 @@ class Bridge:
                 rebuild. Defaults to ``MutationProducer`` from
                 ``config.kafka``, transactional when ``transactional_id`` is
                 set.
+            directory_tree: A tree already resolved for this configuration,
+                used instead of resolving at :meth:`start`. Its root path and
+                recursive mode must match ``config.cdc``.
+            checkpoint_store: Durable cursor storage replacing
+                ``cdc.cursor_file``. Defaults to a :class:`FileCheckpointStore`
+                on ``cdc.cursor_file``.
 
         Raises:
             ValueError: If ``producer`` is transactional but neither
                 ``producer_factory`` nor ``config.kafka.transactional_id`` is
-                given, so a rebuild would downgrade it to idempotent.
+                given, so a rebuild would downgrade it to idempotent; or if
+                ``directory_tree`` is given outside directory mode or does not
+                match its root path and recursive mode; or if directory mode has
+                neither ``cdc.cursor_file`` nor ``checkpoint_store``, or both are
+                given.
         """
         if (
             producer is not None
@@ -701,7 +849,36 @@ class Bridge:
                 "An injected transactional producer needs producer_factory or "
                 "kafka.transactional_id so rebuilds stay transactional"
             )
+        if directory_tree is not None:
+            if config.cdc.directory_path is None:
+                raise ValueError("directory_tree requires cdc.directory_path")
+            if (
+                directory_tree.root_path != config.cdc.directory_path
+                or directory_tree.recursive != config.cdc.directory_recursive
+            ):
+                raise ValueError(
+                    "directory_tree root path or recursive mode does not match "
+                    "cdc.directory_path / cdc.directory_recursive"
+                )
+        if checkpoint_store is not None and config.cdc.cursor_file:
+            raise ValueError("Pass checkpoint_store or cdc.cursor_file, not both")
+        if (
+            config.cdc.directory_path is not None
+            and checkpoint_store is None
+            and not config.cdc.cursor_file
+        ):
+            # The fingerprint is what refuses an unsafe resume; without durable
+            # storage it would never be persisted.
+            raise ValueError(
+                "Directory mode needs durable checkpoints so the directory "
+                "fingerprint is stored with every cursor: set cdc.cursor_file "
+                "(--cdc-cursor-file) or pass checkpoint_store"
+            )
         self.config = config
+        self._checkpoint_store: CheckpointStore = checkpoint_store or (
+            FileCheckpointStore(config.cdc.cursor_file)
+        )
+        self._directory_tree: ResolvedDirectoryTree | None = directory_tree
         self._shutdown_requested = threading.Event()
         self._step_lock = threading.Lock()
         self.metrics = BridgeMetrics()
@@ -713,6 +890,15 @@ class Bridge:
         )
         self._pipeline: BridgePipeline | None = None
         self._counting_listener: _RecordCountingListener | None = None
+
+    @property
+    def directory_tree(self) -> ResolvedDirectoryTree | None:
+        """The frozen startup tree in directory mode, else ``None``."""
+        return self._directory_tree
+
+    def _directory_fingerprint(self) -> str | None:
+        tree = self._directory_tree
+        return None if tree is None else tree.fingerprint
 
     @property
     def mutations_published(self) -> int:
@@ -728,8 +914,12 @@ class Bridge:
         """Initialize FDB client, register CDC stream, and start listener.
 
         Raises:
-            ValueError: If stream_name is empty or cursor file is corrupt or
-                belongs to another stream.
+            ValueError: If stream_name is empty or cursor file is corrupt,
+                belongs to another stream, or (in directory mode) does not
+                carry this startup's directory fingerprint.
+            DirectoryResolutionError: If the directory tree cannot be resolved.
+            CDCStreamMismatchError: If the named stream is registered over
+                different ranges, or the cursor names another stream id.
         """
         if self._pipeline is not None:
             return
@@ -765,26 +955,40 @@ class Bridge:
                 client.open()
                 self._client = client
 
+            cdc = self.config.cdc
+            if cdc.directory_path is not None and self._directory_tree is None:
+                self._directory_tree = DirectoryCDCResolver(
+                    self._client.db,
+                    cdc.directory_path,
+                    recursive=cdc.directory_recursive,
+                ).resolve()
+            tree = self._directory_tree
+
             if self._listener is None:
                 key_range = (
-                    (self.config.cdc.begin_key, self.config.cdc.end_key)
-                    if self.config.cdc.begin_key or self.config.cdc.end_key
+                    (cdc.begin_key, cdc.end_key)
+                    if tree is None and (cdc.begin_key or cdc.end_key)
                     else None
                 )
-                cursor = _load_cursor_from_file(
-                    self.config.cdc.cursor_file,
-                    stream_name=self.config.cdc.stream_name,
+                # Loaded and fingerprint-checked before the listener exists, so a
+                # mismatch never reaches native resume or its re-acknowledgement.
+                cursor = self._checkpoint_store.load(
+                    stream_name=cdc.stream_name,
+                    directory_fingerprint=self._directory_fingerprint(),
                 )
                 self._listener = FDBMutationListener(
                     self._client,
-                    stream_name=self.config.cdc.stream_name,
+                    stream_name=cdc.stream_name,
                     key_range=key_range,
+                    key_ranges=None if tree is None else tree.key_ranges,
                     cursor=cursor,
                     max_record_bytes=self.config.cdc.max_record_bytes,
                     idle_ack_max_replies=self.config.cdc.idle_ack_max_replies,
                     idle_ack_max_seconds=self.config.cdc.idle_ack_max_seconds,
                 )
                 self._listener.start()
+            elif tree is not None:
+                self._check_injected_directory_listener(tree)
 
             if self._producer is None:
                 self._producer = self._producer_factory()
@@ -804,10 +1008,10 @@ class Bridge:
         partition_key = stream_bytes if stream_bytes else None
 
         def _checkpoint_callback(position: Any) -> None:
-            _save_cursor_to_file(
-                self.config.cdc.cursor_file,
+            self._checkpoint_store.save(
                 position,
                 stream_name=self.config.cdc.stream_name,
+                directory_fingerprint=self._directory_fingerprint(),
             )
 
         self._pipeline = BridgePipeline(
@@ -817,6 +1021,23 @@ class Bridge:
             checkpoint=_checkpoint_callback,
             partition_key=partition_key,
             flush_timeout_seconds=self.config.pipeline.flush_timeout_seconds,
+        )
+
+    def _check_injected_directory_listener(self, tree: ResolvedDirectoryTree) -> None:
+        """Hold an injected listener to the frozen tree's ranges and checkpoint.
+
+        Raises:
+            ValueError: If the listener does not register exactly the tree's
+                ranges, or the stored checkpoint's fingerprint does not match.
+        """
+        if getattr(self._listener, "key_ranges", None) != tree.key_ranges:
+            raise ValueError(
+                "In directory mode an injected listener must use "
+                "key_ranges=directory_tree.key_ranges"
+            )
+        self._checkpoint_store.load(
+            stream_name=self.config.cdc.stream_name,
+            directory_fingerprint=tree.fingerprint,
         )
 
     def _discard_listener_and_producer(self) -> None:
@@ -1103,4 +1324,6 @@ __all__ = [
     "BridgeMetrics",
     "BridgePipeline",
     "Checkpoint",
+    "CheckpointStore",
+    "FileCheckpointStore",
 ]

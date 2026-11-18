@@ -25,6 +25,29 @@ class CDCInvalidRangeError(CDCError):
     """Raised when an invalid key range is specified for CDC stream registration."""
 
 
+class CDCStreamMismatchError(CDCError, ValueError):
+    """An existing stream or cursor does not match the requested configuration.
+
+    Raised when a named stream is registered over a different range union, or a
+    persisted cursor names a different stream id than the registered stream.
+    Ranges are immutable natively, so this is never repaired automatically; an
+    operator must decide whether to remove the stream. It is a ``ValueError`` so
+    a retry loop treats it as permanent.
+    """
+
+
+class DirectoryResolutionError(CDCError, ValueError):
+    """A Directory Layer tree could not be resolved into CDC key ranges."""
+
+
+class DirectoryNotFoundError(DirectoryResolutionError):
+    """The requested Directory Layer path does not exist."""
+
+
+class DirectoryPartitionError(DirectoryResolutionError):
+    """The resolved tree contains a Directory Layer partition (unsupported)."""
+
+
 class CDCConsumeError(CDCError):
     """A native consume or acknowledge call failed.
 
