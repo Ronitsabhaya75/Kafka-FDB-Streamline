@@ -223,6 +223,17 @@ def natives(
     return checked
 
 
+def is_range_within_subspace(begin_key: bytes, end_key: bytes, prefix: bytes) -> bool:
+    """Check whether [begin_key, end_key) is contained within subspace prefix."""
+    if begin_key < prefix:
+        return False
+    stripped = prefix.rstrip(b"\xff")
+    if not stripped:
+        return True
+    prefix_bound = stripped[:-1] + bytes([stripped[-1] + 1])
+    return end_key <= prefix_bound
+
+
 def stream_id(value: int | None) -> None:
     """Require None or uint64 in 0..2**64 - 1."""
     if value is not None:
@@ -249,10 +260,20 @@ def directory_context(value: Any) -> None:
                 f"{type(value.subspace_prefix).__name__}",
                 field="directory.subspace_prefix",
             )
-        if not isinstance(value.path, (tuple, list)):
+        if not value.subspace_prefix:
+            raise InputValueError(
+                "directory.subspace_prefix must not be empty",
+                field="directory.subspace_prefix",
+            )
+        if not isinstance(value.path, tuple):
             got = type(value.path).__name__
             raise InputTypeError(
-                f"directory.path must be tuple or list, got {got}",
+                f"directory.path must be tuple, got {got}",
+                field="directory.path",
+            )
+        if not value.path:
+            raise InputValueError(
+                "directory.path must not be empty",
                 field="directory.path",
             )
         for i, elem in enumerate(value.path):

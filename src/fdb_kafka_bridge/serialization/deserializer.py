@@ -122,6 +122,43 @@ def _bridge_timestamp_ns(
     return timestamp.seconds * 10**9 + timestamp.nanos
 
 
+def _verify_mutation_in_directory(
+    mutation: Mutation,
+    prefix: bytes,
+    index: int | None,
+) -> None:
+    if mutation.type == MutationType.CLEAR_RANGE.value:
+        if not _checks.is_range_within_subspace(
+            mutation.param1, mutation.param2, prefix
+        ):
+            raise RecordDecodeError(
+                f"clear range{_checks.at(index, label='batch position')} "
+                "falls outside directory subspace prefix",
+                reason=DecodeFailure.MALFORMED_WIRE,
+                index=index,
+            )
+    else:
+        if not mutation.param1.startswith(prefix):
+            raise RecordDecodeError(
+                f"mutation key{_checks.at(index, label='batch position')} "
+                "does not start with directory subspace prefix",
+                reason=DecodeFailure.MALFORMED_WIRE,
+                index=index,
+            )
+
+
+def _verify_directory_bounds(
+    body: RecordBody,
+    directory: FDBDirectoryContext,
+) -> None:
+    prefix = directory.subspace_prefix
+    if isinstance(body, Mutation):
+        _verify_mutation_in_directory(body, prefix, None)
+    elif isinstance(body, MutationBatch):
+        for i, mutation in enumerate(body.mutations):
+            _verify_mutation_in_directory(mutation, prefix, i)
+
+
 def deserialize_record(data: bytes) -> Record:
     """Parse one Kafka record value.
 
@@ -160,6 +197,11 @@ def deserialize_record(data: bytes) -> Record:
         ) from exc
     directory: FDBDirectoryContext | None = None
     if message.HasField("directory"):
+        if not message.directory.subspace_prefix or not message.directory.path:
+            raise RecordDecodeError(
+                "directory context on wire has empty path or subspace prefix",
+                reason=DecodeFailure.MALFORMED_WIRE,
+            )
         directory = FDBDirectoryContext(
             path=tuple(message.directory.path),
             subspace_prefix=message.directory.subspace_prefix,
@@ -171,11 +213,13 @@ def deserialize_record(data: bytes) -> Record:
         else None
     )
     body = _body(message)
-    if isinstance(body, VersionEnd) and directory is not None:
-        raise RecordDecodeError(
-            "VersionEnd record must not carry directory context",
-            reason=DecodeFailure.MALFORMED_WIRE,
-        )
+    if directory is not None:
+        if isinstance(body, VersionEnd):
+            raise RecordDecodeError(
+                "VersionEnd record must not carry directory context",
+                reason=DecodeFailure.MALFORMED_WIRE,
+            )
+        _verify_directory_bounds(body, directory)
     return Record(
         stream_name=message.stream_name,
         bridge_timestamp_ns=_bridge_timestamp_ns(message),

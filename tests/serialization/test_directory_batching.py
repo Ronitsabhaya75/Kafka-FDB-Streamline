@@ -536,13 +536,20 @@ def test_deduplication_identity() -> None:
     # Legacy fallback: (fdb_version, sequence_no)
     assert legacy_deduplication_identity(rec.body) == (7000, 5)
 
-    # Fallback when source_id is None:
+    # Mismatched presence raises InputValueError:
     rec_no_source = replace(rec, source_id=None)
-    assert deduplication_identity(rec_no_source, rec.body) == (7000, 5)
+    with pytest.raises(
+        InputValueError,
+        match="source_id and stream_id must both be present or both be None",
+    ):
+        deduplication_identity(rec_no_source, rec.body)
 
-    # Fallback when stream_id is None:
     rec_no_stream = replace(rec, stream_id=None)
-    assert deduplication_identity(rec_no_stream, rec.body) == (7000, 5)
+    with pytest.raises(
+        InputValueError,
+        match="source_id and stream_id must both be present or both be None",
+    ):
+        deduplication_identity(rec_no_stream, rec.body)
 
     # Fallback when both are None:
     rec_neither = replace(rec, source_id=None, stream_id=None)
@@ -626,3 +633,153 @@ def test_directory_context_surrogate_path_rejected() -> None:
             directory=bad_dir,
         )
     assert exc_info.value.field == "directory.path"
+
+
+def test_directory_context_empty_subspace_prefix_rejected() -> None:
+    bad_dir = FDBDirectoryContext(
+        path=("tenants", "a"),
+        subspace_prefix=b"",
+    )
+    with pytest.raises(
+        InputValueError, match="subspace_prefix must not be empty"
+    ) as exc_info:
+        serialize_mutation(
+            _FakeNativeMutation(MutationType.SET_VALUE, b"\x01k", b"v"),
+            fdb_version=1000,
+            sequence_no=1,
+            stream_name="test_stream",
+            bridge_timestamp_ns=1000,
+            directory=bad_dir,
+        )
+    assert exc_info.value.field == "directory.subspace_prefix"
+
+
+def test_directory_context_empty_path_rejected() -> None:
+    bad_dir = FDBDirectoryContext(
+        path=(),
+        subspace_prefix=b"\x01",
+    )
+    with pytest.raises(InputValueError, match="path must not be empty") as exc_info:
+        serialize_mutation(
+            _FakeNativeMutation(MutationType.SET_VALUE, b"\x01k", b"v"),
+            fdb_version=1000,
+            sequence_no=1,
+            stream_name="test_stream",
+            bridge_timestamp_ns=1000,
+            directory=bad_dir,
+        )
+    assert exc_info.value.field == "directory.path"
+
+
+def test_directory_context_list_path_normalised() -> None:
+    dir_list = FDBDirectoryContext(
+        path=["tenants", "a"],  # type: ignore[arg-type]
+        subspace_prefix=b"\x01",
+    )
+    dir_tuple = FDBDirectoryContext(
+        path=("tenants", "a"),
+        subspace_prefix=b"\x01",
+    )
+    assert dir_list.path == ("tenants", "a")
+    assert dir_list == dir_tuple
+
+    # Batching loop sees them as equal and does not split
+    mutations = [
+        _FakeNativeMutation(MutationType.SET_VALUE, b"\x01k1", b"v1"),
+        _FakeNativeMutation(MutationType.SET_VALUE, b"\x01k2", b"v2"),
+    ]
+    dirs = [dir_list, dir_tuple]
+
+    def resolver(mut: _FakeNativeMutation) -> FDBDirectoryContext:
+        idx = mutations.index(mut)
+        return dirs[idx]
+
+    records = serialize_version_group(
+        mutations,
+        fdb_version=2000,
+        max_record_bytes=100_000,
+        stream_name="test_stream",
+        bridge_timestamp_ns=1000,
+        directory_resolver=resolver,
+    )
+    # One batch record + one VersionEnd record
+    assert len(records) == 2
+    rec = deserialize_record(records[0])
+    assert isinstance(rec.body, MutationBatch)
+    assert len(rec.body.mutations) == 2
+
+
+def test_read_side_directory_verification() -> None:
+    # Wire with key not starting with subspace_prefix fails closed
+    wire_bad_key = mutations_pb2.FDBMutationRecord(
+        stream_name="test_stream",
+        directory=mutations_pb2.FDBDirectoryContext(
+            path=["tenants", "a"], subspace_prefix=b"\x01"
+        ),
+        mutation=mutations_pb2.FDBMutation(
+            version_index=mutations_pb2.FDBVersionIndex(fdb_version=100, sequence_no=0),
+            single_key_mutation=mutations_pb2.FDBSingleKeyMutation(
+                mutation_type=0, key=b"\x02foreign_key", value=b"val"
+            ),
+        ),
+    ).SerializeToString()
+
+    with pytest.raises(RecordDecodeError) as exc_info:
+        deserialize_record(wire_bad_key)
+    assert exc_info.value.reason == DecodeFailure.MALFORMED_WIRE
+    assert "does not start with directory subspace prefix" in str(exc_info.value)
+
+    # Wire with clear range outside subspace fails closed
+    wire_bad_clear = mutations_pb2.FDBMutationRecord(
+        stream_name="test_stream",
+        directory=mutations_pb2.FDBDirectoryContext(
+            path=["tenants", "a"], subspace_prefix=b"\x01"
+        ),
+        mutation=mutations_pb2.FDBMutation(
+            version_index=mutations_pb2.FDBVersionIndex(fdb_version=100, sequence_no=0),
+            clear_range=mutations_pb2.FDBClearRange(
+                begin_key=b"\x01begin", end_key=b"\x02end"
+            ),
+        ),
+    ).SerializeToString()
+
+    with pytest.raises(RecordDecodeError) as exc_info:
+        deserialize_record(wire_bad_clear)
+    assert exc_info.value.reason == DecodeFailure.MALFORMED_WIRE
+    assert "falls outside directory subspace prefix" in str(exc_info.value)
+
+    # Wire with empty subspace_prefix fails closed
+    wire_empty_prefix = mutations_pb2.FDBMutationRecord(
+        stream_name="test_stream",
+        directory=mutations_pb2.FDBDirectoryContext(
+            path=["tenants", "a"], subspace_prefix=b""
+        ),
+        mutation=mutations_pb2.FDBMutation(
+            version_index=mutations_pb2.FDBVersionIndex(fdb_version=100, sequence_no=0),
+            single_key_mutation=mutations_pb2.FDBSingleKeyMutation(
+                mutation_type=0, key=b"key", value=b"val"
+            ),
+        ),
+    ).SerializeToString()
+
+    with pytest.raises(RecordDecodeError) as exc_info:
+        deserialize_record(wire_empty_prefix)
+    assert exc_info.value.reason == DecodeFailure.MALFORMED_WIRE
+    assert "empty path or subspace prefix" in str(exc_info.value)
+
+    # Wire with empty path fails closed
+    wire_empty_path = mutations_pb2.FDBMutationRecord(
+        stream_name="test_stream",
+        directory=mutations_pb2.FDBDirectoryContext(path=[], subspace_prefix=b"\x01"),
+        mutation=mutations_pb2.FDBMutation(
+            version_index=mutations_pb2.FDBVersionIndex(fdb_version=100, sequence_no=0),
+            single_key_mutation=mutations_pb2.FDBSingleKeyMutation(
+                mutation_type=0, key=b"\x01key", value=b"val"
+            ),
+        ),
+    ).SerializeToString()
+
+    with pytest.raises(RecordDecodeError) as exc_info:
+        deserialize_record(wire_empty_path)
+    assert exc_info.value.reason == DecodeFailure.MALFORMED_WIRE
+    assert "empty path or subspace prefix" in str(exc_info.value)

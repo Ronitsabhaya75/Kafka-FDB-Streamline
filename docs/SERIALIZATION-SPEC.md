@@ -46,7 +46,7 @@ Ranges (inclusive; the limits are not exported):
 | `bridge_timestamp_ns` | 0..9999-12-31T23:59:59.999999999Z |
 | `stream_id` | 0..2**64-1 |
 | `source_id` | non-empty UTF-8 `str` |
-| `directory` | `FDBDirectoryContext(path=tuple[str, ...], subspace_prefix=bytes)` with UTF-8 path elements |
+| `directory` | `FDBDirectoryContext(path=tuple[str, ...], subspace_prefix=bytes)` with non-empty UTF-8 path elements and non-empty prefix |
 
 ### 2.2 Serialize
 
@@ -176,7 +176,7 @@ surfaces as `VersionEnd.bridge_timestamp_ns`. Unknown fields are ignored. An abs
 | `stream_name` | not `str` | `""`, or not UTF-8-encodable |
 | `source_id` | not `str` (when not `None`) | `""`, or not UTF-8-encodable |
 | `stream_id` | not `int` (when not `None`) | outside `0..2**64 - 1` |
-| `directory` | not `FDBDirectoryContext`, `subspace_prefix` not `bytes`, or `path` not tuple/list of `str` | `path` element not UTF-8-encodable |
+| `directory` | not `FDBDirectoryContext`, `subspace_prefix` not `bytes`, or `path` not tuple of `str` | empty `subspace_prefix`, empty `path`, or `path` element not UTF-8-encodable |
 | other integer keywords | `type(x) is not int` (rejects `bool`, `IntEnum`, `float`) | outside its range in §2.1; `max_record_bytes < 1`; an assigned `sequence_no` past 2**32-1 |
 | strict clear range | — | ambiguous clear range crossing boundaries or unresolved under `strict_directory_clears=True`; `strict_directory_clears=True` without `directory_resolver` |
 
@@ -213,7 +213,7 @@ SerializationError(Exception)
 
 | `DecodeFailure` | Condition |
 |---|---|
-| `MALFORMED_WIRE` | protobuf cannot parse (corrupt, truncated, invalid UTF-8 `stream_name`, or `VersionEnd` carrying a directory); cause chained |
+| `MALFORMED_WIRE` | protobuf cannot parse (corrupt, truncated, invalid UTF-8 `stream_name`, `VersionEnd` carrying a directory, empty directory path/prefix, or mutation key/range outside directory subspace prefix); cause chained |
 | `NO_RECORD_ARM` | no `record` arm set: `b""`, foreign bytes, or an arm from a newer schema |
 | `NO_MUTATION_ARM` | mutation with no `mutation` arm set |
 | `MISSING_VERSION_INDEX` | mutation without `version_index` |
@@ -253,8 +253,11 @@ across calls, and `deserialize_record` checks one record at a time.
   key = deduplication_identity(record, mutation)
   ```
   Returns `(source_id, stream_id, fdb_version, sequence_no)` when both `source_id` and `stream_id`
-  are present on the record. If either is `None` (such as on legacy v0.1.0 records), it falls back
-  to `(fdb_version, sequence_no)`.
+  are present on the record. If both are `None` (such as on legacy v0.1.0 records), it falls back
+  to `(fdb_version, sequence_no)`. If exactly one of `source_id` or `stream_id` is present, it
+  raises `InputValueError`. Downstream consumers must not mix 2-tuple and 4-tuple key shapes in a
+  single deduplication store across rolling upgrades; state must be partitioned or cleared on schema
+  boundary changes.
 - **Explicit legacy identity helper**:
   ```python
   key = legacy_deduplication_identity(mutation)  # returns (fdb_version, sequence_no)

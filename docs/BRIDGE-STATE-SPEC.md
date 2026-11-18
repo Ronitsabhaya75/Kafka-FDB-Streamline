@@ -60,11 +60,13 @@ Leader lease state committed inside FoundationDB for active leader coordination:
 
 ## 3. Operational Invariants & Semantics
 
+The schemas and codecs in `fdbkafka.bridge.state.v1` define the wire formats, models, and domain validation. The operational invariants described below (inclusive cursor resumption, transactional epoch fencing, heartbeat renewal, and sink-mismatch startup refusal) form the system contract enforced by the bridge runtime and control-plane stores (Checkpoint Store and Leader Lease).
+
 ### 3.1 Inclusive Cursor Semantics
 
 - `last_consumed_version` is **inclusive**: it records the highest FDB commit version whose mutations have been fully persisted in Kafka and acknowledged.
 - A fresh CDC stream with no prior committed versions is initialized with `last_consumed_version = -1`.
-- When resuming replication, the bridge reads mutations starting after `last_consumed_version` (i.e. `begin_version = last_consumed_version` for an inclusive cursor, or `begin_version = last_consumed_version + 1`).
+- When resuming replication, the bridge supplies `last_consumed_version` to `resume_cdc_consumer(cursor)`, and consumption resumes strictly after that version (i.e. the next consumed version is `> last_consumed_version`, beginning at `last_consumed_version + 1`).
 
 ### 3.2 Leader Lease Fencing & Recovery
 

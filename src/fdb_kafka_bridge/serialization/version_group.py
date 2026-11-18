@@ -36,15 +36,7 @@ def _framed_bytes(tag_bytes: int, payload_bytes: int) -> int:
     return tag_bytes + _varint_bytes(payload_bytes) + payload_bytes
 
 
-def _is_range_within_subspace(begin_key: bytes, end_key: bytes, prefix: bytes) -> bool:
-    """Check whether [begin_key, end_key) is contained within subspace prefix."""
-    if begin_key < prefix:
-        return False
-    stripped = prefix.rstrip(b"\xff")
-    if not stripped:
-        return True
-    prefix_bound = stripped[:-1] + bytes([stripped[-1] + 1])
-    return end_key <= prefix_bound
+_is_range_within_subspace = _checks.is_range_within_subspace
 
 
 def serialize_version_group(

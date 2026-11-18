@@ -4,6 +4,8 @@ import enum
 from dataclasses import dataclass
 from typing import Final, NamedTuple, Protocol
 
+from fdb_kafka_bridge.serialization.errors import InputValueError
+
 
 class MutationType(enum.IntEnum):
     """The 16 declared type codes, mirroring upstream `CdcMutationType`.
@@ -101,6 +103,11 @@ class FDBDirectoryContext:
     path: tuple[str, ...]
     subspace_prefix: bytes
 
+    def __post_init__(self) -> None:
+        """Normalise path to tuple when initialized as list."""
+        if isinstance(self.path, list):
+            object.__setattr__(self, "path", tuple(self.path))
+
 
 type RecordBody = Mutation | MutationBatch | VersionEnd
 
@@ -162,21 +169,40 @@ type LegacyDedupKey = tuple[int, int]
 def deduplication_identity(
     record: Record,
     mutation: Mutation,
-) -> tuple[str, int, int, int] | tuple[int, int]:
+) -> DedupKey:
     """Return the deduplication identity for a mutation in a record.
 
     If both source_id and stream_id are present, returns the 4-tuple:
         (source_id, stream_id, fdb_version, sequence_no)
-    Otherwise, falls back to the legacy 2-tuple:
+    If neither is present, returns the legacy 2-tuple:
         (fdb_version, sequence_no)
+
+    Downstream consumers must not mix 2-tuple and 4-tuple key shapes in a single
+    deduplication store across rolling upgrades; state must be partitioned or
+    cleared on schema boundary changes.
 
     Args:
         record: Deserialized record envelope containing the mutation.
         mutation: Deserialized mutation with its version index.
 
     Returns:
-        4-tuple or 2-tuple deduplication identity.
+        DedupKey (4-tuple or legacy 2-tuple).
+
+    Raises:
+        InputValueError: If exactly one of source_id or stream_id is set.
     """
+    if (record.source_id is None) != (record.stream_id is None):
+        src_type = (
+            type(record.source_id).__name__ if record.source_id is not None else "None"
+        )
+        strm_type = (
+            type(record.stream_id).__name__ if record.stream_id is not None else "None"
+        )
+        raise InputValueError(
+            "source_id and stream_id must both be present or both be None, got "
+            f"source_id={src_type}, stream_id={strm_type}",
+            field="source_id",
+        )
     v = mutation.version_index.fdb_version
     s = mutation.version_index.sequence_no
     if record.source_id is not None and record.stream_id is not None:
