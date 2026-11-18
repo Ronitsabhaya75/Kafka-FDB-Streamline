@@ -238,3 +238,31 @@ def test_teardown_error_propagates_when_worker_succeeds() -> None:
     with pytest.raises(TimeoutError) as raised:
         run_daemon(bridge)
     assert raised.value is error
+
+
+@pytest.mark.parametrize("phase", ["start", "run"])
+def test_unexpected_consumer_closure_is_still_a_failure(phase: str) -> None:
+    from fdb_kafka_bridge.cdc.errors import CDCConsumerClosedError
+
+    bridge = MagicMock()
+    bridge.config = from_dict({"cdc": {"stream_name": "s"}})
+    error = CDCConsumerClosedError("unexpected closure")
+    getattr(bridge, phase).side_effect = error
+    with patch("fdb_kafka_bridge.bridge.cli.Bridge", return_value=bridge):
+        assert main(["--stream-name", "s"]) == 1
+    bridge.stop.assert_called_once()
+
+
+@pytest.mark.parametrize("error", [StartupError("unsafe"), RuntimeError("failed")])
+def test_signal_does_not_hide_unrelated_startup_failures(error: Exception) -> None:
+    bridge = MagicMock()
+    bridge.config = from_dict({"cdc": {"stream_name": "s"}})
+
+    def start() -> None:
+        os.kill(os.getpid(), signal.SIGTERM)
+        raise error
+
+    bridge.start.side_effect = start
+    with pytest.raises(type(error)) as raised:
+        run_daemon(bridge)
+    assert raised.value is error

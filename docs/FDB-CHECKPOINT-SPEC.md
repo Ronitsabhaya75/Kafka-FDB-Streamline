@@ -289,7 +289,10 @@ or exhausted checkpoint write retries (including 1031), 2 for invalid configurat
 3 for deterministic startup/checkpoint/CDC refusals and permanent Kafka
 `MSG_SIZE_TOO_LARGE`. Regression, fencing, invalid resume cursors (also on rebuild),
 unsupported multi-range streams and 1007 refusals require operator action rather than
-automatic retries.
+automatic retries. A `CDCConsumerClosedError` during a requested SIGINT/SIGTERM stop
+is treated as clean shutdown, including cancellation before a resumed acknowledgement
+is restored. The same exception without a requested signal remains a runtime failure
+(exit 1); unrelated worker failures and teardown errors retain their normal exit codes.
 
 A worker failure takes precedence over a secondary `stop()` failure: teardown errors are
 logged, but the original worker error and its exit code are preserved. A teardown failure

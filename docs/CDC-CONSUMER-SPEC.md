@@ -189,8 +189,11 @@ and waits for cancellation completion before returning a retryable timeout. Only
 retry, while other native errors keep their original classification. The delivered
 reply remains pending for retry. Waiting for cancellation can exceed the ack timeout;
 the daemon's separate total shutdown deadline still bounds process teardown.
-`cancel_pending()` prevents new operations and cancels a parked consume. `close()` cancels any pending future before
-releasing the handle; closing the native handle alone does not cancel a consume.
+`cancel_pending()` prevents new operations and cancels a parked consume. Restored and
+normal acknowledgement paths preserve `CDCConsumerClosedError` when shutdown prevents
+an operation, rather than wrapping it as a generic `CDCError`. `close()` cancels any
+pending future before releasing the handle; closing the native handle alone does not
+cancel a consume.
 
 Native-client deployment requirements, including the `release-8.0` future-lifetime
 fix required for off-network-thread cancellation/release, are in

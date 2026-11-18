@@ -17,7 +17,11 @@ from fdb_kafka_bridge.cdc.checkpoint import (
     CheckpointError,
     CheckpointWriteError,
 )
-from fdb_kafka_bridge.cdc.errors import CDCInvalidCursorError, CDCTerminalError
+from fdb_kafka_bridge.cdc.errors import (
+    CDCConsumerClosedError,
+    CDCInvalidCursorError,
+    CDCTerminalError,
+)
 from fdb_kafka_bridge.cdc.listener import subspace_to_key_range
 from fdb_kafka_bridge.kafka.producer import is_message_too_large_error
 
@@ -144,6 +148,9 @@ def run_daemon(bridge: Bridge) -> None:
             bridge.start()
             if not stop_requested.is_set():
                 bridge.run()
+        except CDCConsumerClosedError as exc:
+            if not stop_requested.is_set():
+                failures.append(exc)
         except BaseException as exc:
             failures.append(exc)
 

@@ -280,6 +280,8 @@ class FDBMutationListener:
             self._before_ack()
         try:
             self._wait_operation("acknowledge", self.ack_timeout_seconds)
+        except CDCConsumerClosedError:
+            raise
         except TimeoutError as exc:
             raise CDCRetryableError(
                 "Timed out restoring resumed CDC acknowledgement"
@@ -487,6 +489,8 @@ class FDBMutationListener:
             raise CDCError("No delivered CDC reply is awaiting acknowledgement.")
         try:
             self._wait_operation("acknowledge", self.ack_timeout_seconds)
+        except CDCConsumerClosedError:
+            raise
         except TimeoutError as exc:
             raise CDCRetryableError("Timed out acknowledging CDC position") from exc
         except Exception as exc:

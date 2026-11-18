@@ -858,3 +858,18 @@ def test_ack_timeout_preserves_result_racing_with_cancellation(
     future.cancel.assert_called_once()
     future.wait.assert_called_once()
     assert error.value.code == code
+
+
+@pytest.mark.parametrize("resumed", [False, True])
+def test_shutdown_before_ack_preserves_closed_error(resumed: bool) -> None:
+    listener, client, consumer = _listener_with_batch(MockConsumeResult([], 100))
+    if resumed:
+        listener.initial_cursor = MockCursor(1, 100)
+        client.resume_cdc_consumer.return_value = consumer
+        client.get_read_version.return_value = 100
+    else:
+        listener.poll_records()
+    listener.cancel_pending()
+    with pytest.raises(CDCConsumerClosedError):
+        listener.start() if resumed else listener.acknowledge()
+    consumer.acknowledge.assert_not_called()

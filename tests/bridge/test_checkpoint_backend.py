@@ -191,3 +191,33 @@ def test_takeover_prevents_ack_retry_after_successful_checkpoint() -> None:
         listener.acknowledge.assert_called_once()
         deps.producer.produce.assert_called_once()
         deps.bridge.stop()
+
+
+@pytest.mark.parametrize("sig", ["SIGTERM", "SIGINT"])
+def test_signal_during_resumed_start_returns_clean_exit(sig: str) -> None:
+    import os
+    import signal
+
+    from fdb_kafka_bridge.bridge.cli import main
+
+    deps = _wiring()
+    consumer = deps.client.resume_cdc_consumer.return_value
+    previous = signal.getsignal(getattr(signal, sig))
+
+    def read_version() -> int:
+        listener = deps.bridge._listener
+        assert listener is not None
+        os.kill(os.getpid(), getattr(signal, sig))
+        assert listener._stopping.wait(2)
+        return 10
+
+    deps.client.get_read_version.side_effect = read_version
+    with patch("fdb_kafka_bridge.bridge.cli.Bridge", return_value=deps.bridge):
+        assert main(["--stream-name", "s"]) == 0
+    deps.client.resume_cdc_consumer.assert_called_once_with(CheckpointCursor(1, 10))
+    consumer.acknowledge.assert_not_called()
+    consumer.consume.assert_not_called()
+    consumer.close.assert_called_once()
+    deps.producer.close.assert_called_once()
+    deps.client.close.assert_called_once()
+    assert signal.getsignal(getattr(signal, sig)) == previous
