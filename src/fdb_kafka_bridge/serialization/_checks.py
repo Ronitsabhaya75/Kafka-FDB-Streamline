@@ -183,11 +183,34 @@ def native(
 def natives(
     value: Iterable[NativeMutation], *, first_sequence_no: int = 0
 ) -> list[tuple[int, bytes, bytes]]:
-    """Require every mutation, and the position each is assigned, to be valid."""
+    """Require every mutation, and the position each is assigned, to be valid.
+
+    Exact `int` type codes in range and exact `bytes` params take a fast path.
+    Anything else goes through `native()`, which accepts or rejects it exactly as
+    before, re-reading its attributes.
+    """
     checked: list[tuple[int, bytes, bytes]] = []
+    append = checked.append
     for index, mutation in enumerate(mutations(value)):
         # Check before the read. Past 2**32 mutations protobuf would raise its own
         # ValueError, and only once the whole group is in memory.
-        assigned_sequence_no(first_sequence_no + index, index=index)
-        checked.append(native(mutation, index=index))
+        sequence = first_sequence_no + index
+        if type(sequence) is not int or not 0 <= sequence <= _MAX_SEQUENCE_NO:
+            assigned_sequence_no(sequence, index=index)
+        try:
+            code, param1, param2 = mutation.type, mutation.param1, mutation.param2
+        except AttributeError:
+            append(native(mutation, index=index))
+            continue
+        # Exact types only: bool, int/bytes subclasses and bad values fall
+        # through to native().
+        if (
+            type(code) is int
+            and 0 <= code <= _MAX_TYPE_CODE
+            and type(param1) is bytes
+            and type(param2) is bytes
+        ):
+            append((code, param1, param2))
+        else:
+            append(native(mutation, index=index))
     return checked
