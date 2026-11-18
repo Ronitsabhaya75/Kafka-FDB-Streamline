@@ -176,7 +176,7 @@ surfaces as `VersionEnd.bridge_timestamp_ns`. Unknown fields are ignored. An abs
 | `stream_name` | not `str` | `""`, or not UTF-8-encodable |
 | `source_id` | not `str` (when not `None`) | `""`, or not UTF-8-encodable |
 | `stream_id` | not `int` (when not `None`) | outside `0..2**64 - 1` |
-| `directory` | not `FDBDirectoryContext`, `subspace_prefix` not `bytes`, or `path` not tuple of `str` | empty `subspace_prefix`, empty `path`, or `path` element not UTF-8-encodable |
+| `directory` | not `FDBDirectoryContext`, `subspace_prefix` not `bytes`, or `path` not tuple of `str` | empty `subspace_prefix`, all-`\xff` `subspace_prefix`, empty `path`, or `path` element not UTF-8-encodable |
 | other integer keywords | `type(x) is not int` (rejects `bool`, `IntEnum`, `float`) | outside its range in §2.1; `max_record_bytes < 1`; an assigned `sequence_no` past 2**32-1 |
 | strict clear range | — | ambiguous clear range crossing boundaries or unresolved under `strict_directory_clears=True`; `strict_directory_clears=True` without `directory_resolver` |
 
@@ -193,8 +193,8 @@ SerializationError(Exception)
 ├── InputTypeError(SerializationError, TypeError)        .field, .index
 ├── InputValueError(SerializationError, ValueError)      .field, .index
 │   └── RecordTooLargeError                              .record_bytes, .max_record_bytes
-└── RecordDecodeError(SerializationError, ValueError)    .reason: DecodeFailure, .index
-    └── StateDecodeError                                 .reason: DecodeFailure
+├── RecordDecodeError(SerializationError, ValueError)    .reason: DecodeFailure, .index
+└── StateDecodeError(SerializationError, ValueError)     .reason: DecodeFailure
 ```
 
 - `field` is the parameter or attribute name as spelled in the public API (`"data"` for

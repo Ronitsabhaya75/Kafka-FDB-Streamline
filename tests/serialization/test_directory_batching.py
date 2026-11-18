@@ -38,7 +38,6 @@ class _FakeNativeMutation(NamedTuple):
     type: int
     param1: bytes
     param2: bytes
-    directory: FDBDirectoryContext | None = None
 
 
 def test_directory_aware_batch_splitting_without_reordering() -> None:
@@ -49,9 +48,9 @@ def test_directory_aware_batch_splitting_without_reordering() -> None:
     # If someone grouped by directory, they would reorder to A, A, B.
     # Our rule: NEVER regroup in a way that reorders!
     mutations = [
-        _FakeNativeMutation(MutationType.SET_VALUE, b"\x01\x10", b"val_a1", dir_a),
-        _FakeNativeMutation(MutationType.SET_VALUE, b"\x02\x10", b"val_b1", dir_b),
-        _FakeNativeMutation(MutationType.SET_VALUE, b"\x01\x20", b"val_a2", dir_a),
+        _FakeNativeMutation(MutationType.SET_VALUE, b"\x01\x10", b"val_a1"),
+        _FakeNativeMutation(MutationType.SET_VALUE, b"\x02\x10", b"val_b1"),
+        _FakeNativeMutation(MutationType.SET_VALUE, b"\x01\x20", b"val_a2"),
     ]
 
     records_bytes = serialize_version_group(
@@ -62,7 +61,7 @@ def test_directory_aware_batch_splitting_without_reordering() -> None:
         bridge_timestamp_ns=1_000_000_000,
         stream_id=42,
         source_id="fdb-primary",
-        directory_resolver=lambda m: m.directory,
+        directory_resolver=lambda m: dir_a if m.param1.startswith(b"\x01") else dir_b,
     )
 
     # Expected: 3 batches (split on dir change) + 1 stream-wide VersionEnd
@@ -114,10 +113,10 @@ def test_directory_batch_split_on_max_record_bytes() -> None:
 
     # 4 mutations all in dir_a, but max_record_bytes is tight so it must split
     mutations = [
-        _FakeNativeMutation(MutationType.SET_VALUE, b"\x01\x01", b"x" * 200, dir_a),
-        _FakeNativeMutation(MutationType.SET_VALUE, b"\x01\x02", b"x" * 200, dir_a),
-        _FakeNativeMutation(MutationType.SET_VALUE, b"\x01\x03", b"x" * 200, dir_a),
-        _FakeNativeMutation(MutationType.SET_VALUE, b"\x01\x04", b"x" * 200, dir_a),
+        _FakeNativeMutation(MutationType.SET_VALUE, b"\x01\x01", b"x" * 200),
+        _FakeNativeMutation(MutationType.SET_VALUE, b"\x01\x02", b"x" * 200),
+        _FakeNativeMutation(MutationType.SET_VALUE, b"\x01\x03", b"x" * 200),
+        _FakeNativeMutation(MutationType.SET_VALUE, b"\x01\x04", b"x" * 200),
     ]
 
     records_bytes = serialize_version_group(
@@ -126,7 +125,7 @@ def test_directory_batch_split_on_max_record_bytes() -> None:
         max_record_bytes=400,  # Each record fits roughly 1 mutation
         stream_name="test_stream",
         bridge_timestamp_ns=2_000_000_000,
-        directory_resolver=lambda m: m.directory,
+        directory_resolver=lambda _: dir_a,
     )
 
     records = [deserialize_record(b) for b in records_bytes]
@@ -143,8 +142,8 @@ def test_ambiguous_clear_range_non_strict() -> None:
 
     # Clear range crossing beyond prefix b"\x01" into b"\x03"
     mutations = [
-        _FakeNativeMutation(MutationType.SET_VALUE, b"\x01\x05", b"val", dir_a),
-        _FakeNativeMutation(MutationType.CLEAR_RANGE, b"\x00\x99", b"\x02\x00", dir_a),
+        _FakeNativeMutation(MutationType.SET_VALUE, b"\x01\x05", b"val"),
+        _FakeNativeMutation(MutationType.CLEAR_RANGE, b"\x00\x99", b"\x02\x00"),
     ]
 
     records_bytes = serialize_version_group(
@@ -153,7 +152,7 @@ def test_ambiguous_clear_range_non_strict() -> None:
         max_record_bytes=10_000,
         stream_name="test_stream",
         bridge_timestamp_ns=1_000_000_000,
-        directory_resolver=lambda m: m.directory,
+        directory_resolver=lambda _: dir_a,
         strict_directory_clears=False,
     )
 
@@ -173,7 +172,7 @@ def test_ambiguous_clear_range_strict_mode_rejects() -> None:
 
     # Case 1: Directory context present but clear range crosses directory boundary
     mutations_cross = [
-        _FakeNativeMutation(MutationType.CLEAR_RANGE, b"\x00\x99", b"\x02\x00", dir_a),
+        _FakeNativeMutation(MutationType.CLEAR_RANGE, b"\x00\x99", b"\x02\x00"),
     ]
 
     with pytest.raises(
@@ -200,7 +199,7 @@ def test_ambiguous_clear_range_strict_mode_rejects() -> None:
 
     # Case 2: strict_directory_clears=True without directory_resolver rejected up front
     mutations_no_dir = [
-        _FakeNativeMutation(MutationType.CLEAR_RANGE, b"\x01\x10", b"\x01\x20", None),
+        _FakeNativeMutation(MutationType.CLEAR_RANGE, b"\x01\x10", b"\x01\x20"),
     ]
     with pytest.raises(
         InputValueError,
@@ -241,7 +240,7 @@ def test_ambiguous_clear_range_strict_mode_rejects() -> None:
 def test_clear_range_within_subspace_preserves_directory() -> None:
     dir_a = FDBDirectoryContext(path=("tenants", "a"), subspace_prefix=b"\x01")
     mutations = [
-        _FakeNativeMutation(MutationType.CLEAR_RANGE, b"\x01\x10", b"\x01\x20", dir_a),
+        _FakeNativeMutation(MutationType.CLEAR_RANGE, b"\x01\x10", b"\x01\x20"),
     ]
 
     # In strict mode: succeeds and preserves directory
@@ -275,7 +274,7 @@ def test_mutation_key_mismatch_with_resolved_prefix_rejected() -> None:
     dir_a = FDBDirectoryContext(path=("tenants", "a"), subspace_prefix=b"\x01")
     # Point mutation key starts with \x02, but directory prefix is \x01
     mutations = [
-        _FakeNativeMutation(MutationType.SET_VALUE, b"\x02\x10", b"val", dir_a),
+        _FakeNativeMutation(MutationType.SET_VALUE, b"\x02\x10", b"val"),
     ]
     with pytest.raises(
         InputValueError, match="Mutation key does not start with"
@@ -298,12 +297,8 @@ def test_record_sizing_accounts_for_directory() -> None:
         subspace_prefix=b"\x01\x02\x03\x04",
     )
     mutations = [
-        _FakeNativeMutation(
-            MutationType.SET_VALUE, b"\x01\x02\x03\x04key1", b"val1", dir_a
-        ),
-        _FakeNativeMutation(
-            MutationType.SET_VALUE, b"\x01\x02\x03\x04key2", b"val2", dir_a
-        ),
+        _FakeNativeMutation(MutationType.SET_VALUE, b"\x01\x02\x03\x04key1", b"val1"),
+        _FakeNativeMutation(MutationType.SET_VALUE, b"\x01\x02\x03\x04key2", b"val2"),
     ]
     # Measure record size of a single mutation with directory
     single0 = serialize_version_group(
@@ -335,7 +330,9 @@ def test_bad_resolver_result_on_clear_raises_input_type_error() -> None:
     mutations = [
         _FakeNativeMutation(MutationType.CLEAR_RANGE, b"\x01\x10", b"\x01\x20"),
     ]
-    with pytest.raises(InputTypeError, match="directory must be FDBDirectoryContext"):
+    with pytest.raises(
+        InputTypeError, match="directory.*must be FDBDirectoryContext"
+    ) as exc_info:
         serialize_version_group(
             mutations,
             fdb_version=3400,
@@ -344,12 +341,13 @@ def test_bad_resolver_result_on_clear_raises_input_type_error() -> None:
             bridge_timestamp_ns=1000,
             directory_resolver=lambda _: "not_a_context",  # type: ignore[return-value]
         )
+    assert exc_info.value.index == 0
 
 
 def test_ambiguous_clear_range_non_strict_mode_omits_directory() -> None:
     # Verify both unresolved clear range input paths succeed in non-strict mode
     muts = [
-        _FakeNativeMutation(MutationType.CLEAR_RANGE, b"\x01\x10", b"\x01\x20", None),
+        _FakeNativeMutation(MutationType.CLEAR_RANGE, b"\x01\x10", b"\x01\x20"),
     ]
     # No resolver
     records = serialize_version_group(
@@ -783,3 +781,102 @@ def test_read_side_directory_verification() -> None:
         deserialize_record(wire_empty_path)
     assert exc_info.value.reason == DecodeFailure.MALFORMED_WIRE
     assert "empty path or subspace prefix" in str(exc_info.value)
+
+
+def test_directory_context_all_xff_prefix_rejected() -> None:
+    bad_dir = FDBDirectoryContext(
+        path=("tenants", "a"),
+        subspace_prefix=b"\xff\xff",
+    )
+    with pytest.raises(
+        InputValueError, match=r"subspace_prefix must not be all \\xff bytes"
+    ) as exc_info:
+        serialize_mutation(
+            _FakeNativeMutation(MutationType.SET_VALUE, b"\xff\xffk", b"v"),
+            fdb_version=1000,
+            sequence_no=1,
+            stream_name="test_stream",
+            bridge_timestamp_ns=1000,
+            directory=bad_dir,
+        )
+    assert exc_info.value.field == "directory.subspace_prefix"
+
+
+def test_strict_directory_clears_rejects_inverted_range() -> None:
+    dir_ctx = FDBDirectoryContext(path=("tenants", "a"), subspace_prefix=b"\x01")
+    # Inverted range: begin_key > end_key
+    mutations = [_FakeNativeMutation(MutationType.CLEAR_RANGE, b"\x01z", b"\x01a")]
+
+    with pytest.raises(
+        InputValueError, match="Clear range crosses directory boundaries"
+    ) as exc_info:
+        serialize_version_group(
+            mutations,
+            fdb_version=1000,
+            max_record_bytes=100_000,
+            stream_name="test_stream",
+            bridge_timestamp_ns=1000,
+            directory_resolver=lambda _: dir_ctx,
+            strict_directory_clears=True,
+        )
+    assert exc_info.value.field == "mutations"
+    assert exc_info.value.index == 0
+
+
+def test_version_group_keyword_type_checks() -> None:
+    mutations = [_FakeNativeMutation(MutationType.SET_VALUE, b"\x01k", b"v")]
+
+    # strict_directory_clears not bool
+    with pytest.raises(
+        InputTypeError, match="strict_directory_clears must be bool"
+    ) as exc_info:
+        serialize_version_group(
+            mutations,
+            fdb_version=1000,
+            max_record_bytes=100_000,
+            stream_name="test_stream",
+            bridge_timestamp_ns=1000,
+            strict_directory_clears="no",  # type: ignore[arg-type]
+        )
+    assert exc_info.value.field == "strict_directory_clears"
+
+    # directory_resolver not callable
+    with pytest.raises(
+        InputTypeError, match="directory_resolver must be callable"
+    ) as exc_info:
+        serialize_version_group(
+            mutations,
+            fdb_version=1000,
+            max_record_bytes=100_000,
+            stream_name="test_stream",
+            bridge_timestamp_ns=1000,
+            directory_resolver="abc",  # type: ignore[arg-type]
+        )
+    assert exc_info.value.field == "directory_resolver"
+
+
+def test_resolver_validation_error_carries_index() -> None:
+    mutations = [
+        _FakeNativeMutation(MutationType.SET_VALUE, b"\x01k0", b"v0"),
+        _FakeNativeMutation(MutationType.SET_VALUE, b"\x01k1", b"v1"),
+    ]
+    bad_dir = FDBDirectoryContext(path=("test",), subspace_prefix=b"")
+
+    def resolver(mut: _FakeNativeMutation) -> FDBDirectoryContext | None:
+        if mut.param1 == b"\x01k1":
+            return bad_dir
+        return FDBDirectoryContext(path=("test",), subspace_prefix=b"\x01")
+
+    with pytest.raises(
+        InputValueError, match="subspace_prefix at position 1 must not be empty"
+    ) as exc_info:
+        serialize_version_group(
+            mutations,
+            fdb_version=1000,
+            max_record_bytes=100_000,
+            stream_name="test_stream",
+            bridge_timestamp_ns=1000,
+            directory_resolver=resolver,
+        )
+    assert exc_info.value.field == "directory.subspace_prefix"
+    assert exc_info.value.index == 1

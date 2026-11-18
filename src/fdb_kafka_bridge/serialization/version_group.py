@@ -6,6 +6,7 @@ from google.protobuf.message import Message
 
 from fdb_kafka_bridge.serialization import _checks, _wire
 from fdb_kafka_bridge.serialization.errors import (
+    InputTypeError,
     InputValueError,
     RecordTooLargeError,
 )
@@ -88,6 +89,18 @@ def serialize_version_group(
         RecordTooLargeError: One mutation alone, or the version end, does not fit
             `max_record_bytes`.
     """
+    if type(strict_directory_clears) is not bool:
+        got_strict = type(strict_directory_clears).__name__
+        raise InputTypeError(
+            f"strict_directory_clears must be bool, got {got_strict}",
+            field="strict_directory_clears",
+        )
+    if directory_resolver is not None and not callable(directory_resolver):
+        got_resolver = type(directory_resolver).__name__
+        raise InputTypeError(
+            f"directory_resolver must be callable, got {got_resolver}",
+            field="directory_resolver",
+        )
     if strict_directory_clears and directory_resolver is None:
         raise InputValueError(
             "strict_directory_clears=True requires a directory_resolver",
@@ -112,7 +125,7 @@ def serialize_version_group(
         if directory_resolver is not None:
             dir_ctx = directory_resolver(mut)
             if dir_ctx is not None:
-                _checks.directory_context(dir_ctx)
+                _checks.directory_context(dir_ctx, index=index)
 
         if code == MutationType.CLEAR_RANGE:
             if dir_ctx is not None:

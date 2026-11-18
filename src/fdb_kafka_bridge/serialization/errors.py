@@ -90,8 +90,12 @@ class RecordDecodeError(SerializationError, ValueError):
         self.index = index
 
 
-class StateDecodeError(RecordDecodeError):
+class StateDecodeError(SerializationError, ValueError):
     """The bytes are an undecodable bridge control-plane state message.
+
+    Unlike data-plane RecordDecodeError (which readers may dead-letter to
+    maintain stream continuity), control-plane state decode failures must
+    fail closed.
 
     Attributes:
         reason: The check that failed.
@@ -99,4 +103,5 @@ class StateDecodeError(RecordDecodeError):
 
     def __init__(self, message: str, *, reason: DecodeFailure) -> None:
         """Store the failed check."""
-        super().__init__(message, reason=reason, index=None)
+        super().__init__(message)
+        self.reason = reason

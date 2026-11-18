@@ -11,6 +11,8 @@ from fdb_kafka_bridge.serialization.errors import (
     DecodeFailure,
     InputTypeError,
     InputValueError,
+    RecordDecodeError,
+    SerializationError,
     StateDecodeError,
 )
 from fdb_kafka_bridge.serialization.model import (
@@ -19,15 +21,16 @@ from fdb_kafka_bridge.serialization.model import (
     LeaderLease,
 )
 from fdb_kafka_bridge.serialization.state import (
-    INT64_MAX,
-    MAX_TIMESTAMP_NS,
-    UINT64_MAX,
     deserialize_checkpoint,
     deserialize_leader_lease,
     serialize_checkpoint,
     serialize_leader_lease,
 )
 from fdbkafka.bridge.state.v1 import state_pb2
+
+INT64_MAX: int = (1 << 63) - 1
+UINT64_MAX: int = (1 << 64) - 1
+MAX_TIMESTAMP_NS: int = 253_402_300_799_999_999_999
 
 CP_GOLDEN = bytes.fromhex(
     "0801120e6664622d7072696d6172792d64631a0d6f72646572735f73747265616d20cec2f105"
@@ -100,7 +103,7 @@ def test_checkpoint_fresh_cursor_and_boundary_values() -> None:
         sink=sink,
         updating_instance_id="i1",
         update_timestamp_ns=0,
-        lease_epoch=0,
+        lease_epoch=1,
         range_config_fingerprint=b"",
     )
     wire_fresh = serialize_checkpoint(cp_fresh)
@@ -108,7 +111,7 @@ def test_checkpoint_fresh_cursor_and_boundary_values() -> None:
     assert decoded_fresh.last_consumed_version == -1
     assert decoded_fresh.stream_id is None
     assert decoded_fresh.update_timestamp_ns == 0
-    assert decoded_fresh.lease_epoch == 0
+    assert decoded_fresh.lease_epoch == 1
 
     # Boundary 2: maximums
     cp_max = CDCCheckpoint(
@@ -207,6 +210,7 @@ def test_checkpoint_fresh_cursor_and_boundary_values() -> None:
             "update_timestamp_ns",
         ),
         ({"lease_epoch": -1}, "lease_epoch", InputValueError, "lease_epoch"),
+        ({"lease_epoch": 0}, "lease_epoch", InputValueError, "lease_epoch"),
         (
             {"lease_epoch": UINT64_MAX + 1},
             "lease_epoch",
@@ -328,6 +332,7 @@ def test_checkpoint_decode_errors() -> None:
         stream_name="st1",
         updating_instance_id="i1",
         update_timestamp=Timestamp(seconds=100, nanos=0),
+        lease_epoch=1,
     ).SerializeToString()
     with pytest.raises(StateDecodeError, match="sink"):
         deserialize_checkpoint(wire_no_sink)
@@ -372,6 +377,7 @@ def test_leader_lease_golden_bytes() -> None:
             "owner_instance_id",
         ),
         ({"lease_epoch": -1}, "lease_epoch", InputValueError, "lease_epoch"),
+        ({"lease_epoch": 0}, "lease_epoch", InputValueError, "lease_epoch"),
         (
             {"lease_epoch": UINT64_MAX + 1},
             "lease_epoch",
@@ -467,3 +473,41 @@ def test_leader_lease_decode_errors() -> None:
     with pytest.raises(StateDecodeError, match="format_version") as exc_bv:
         deserialize_leader_lease(wire_bad_v)
     assert exc_bv.value.reason == DecodeFailure.UNSUPPORTED_FORMAT_VERSION
+
+    # Wire with lease_epoch = 0 is rejected on decode
+    wire_bad_epoch = state_pb2.LeaderLease(
+        format_version=1,
+        source_id="s1",
+        stream_name="st1",
+        owner_instance_id="pod1",
+        lease_epoch=0,
+        expiration_timestamp=Timestamp(seconds=100, nanos=0),
+    ).SerializeToString()
+    with pytest.raises(
+        StateDecodeError, match="lease_epoch 0 is out of range"
+    ) as exc_epoch:
+        deserialize_leader_lease(wire_bad_epoch)
+    assert exc_epoch.value.reason == DecodeFailure.MALFORMED_WIRE
+
+
+def test_checkpoint_decode_zero_epoch_rejected() -> None:
+    wire_bad_epoch = state_pb2.CDCCheckpoint(
+        format_version=1,
+        source_id="s1",
+        stream_name="st1",
+        updating_instance_id="pod1",
+        sink=state_pb2.KafkaSinkIdentity(cluster_id="c1", topic="t1"),
+        update_timestamp=Timestamp(seconds=100, nanos=0),
+        lease_epoch=0,
+    ).SerializeToString()
+    with pytest.raises(
+        StateDecodeError, match="lease_epoch 0 is out of range"
+    ) as exc_epoch:
+        deserialize_checkpoint(wire_bad_epoch)
+    assert exc_epoch.value.reason == DecodeFailure.MALFORMED_WIRE
+
+
+def test_state_decode_error_hierarchy() -> None:
+    assert issubclass(StateDecodeError, SerializationError)
+    assert issubclass(StateDecodeError, ValueError)
+    assert not issubclass(StateDecodeError, RecordDecodeError)

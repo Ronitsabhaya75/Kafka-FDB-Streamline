@@ -40,7 +40,7 @@ Durable checkpoint state committed inside FoundationDB:
 | `sink` | `KafkaSinkIdentity` | Valid `KafkaSinkIdentity` | Destination Kafka cluster and topic. |
 | `updating_instance_id` | `string` | Non-empty UTF-8 `str` | Unique instance ID of the bridge worker that wrote this checkpoint. |
 | `update_timestamp` | `google.protobuf.Timestamp` | `0 <= seconds <= 253402300799`, `0 <= nanos < 10**9` | Wall-clock timestamp when checkpoint was committed. |
-| `lease_epoch` | `uint64` | `0..2**64 - 1` | Leader lease epoch during which this checkpoint was committed. |
+| `lease_epoch` | `uint64` | `1..2**64 - 1` | Positive leader lease epoch (`>= 1`; 0 is reserved/unset). |
 | `range_config_fingerprint` | `bytes` | `bytes` (may be empty) | Binary fingerprint of Directory Layer range configuration. |
 
 ### 2.3 LeaderLease
@@ -53,29 +53,30 @@ Leader lease state committed inside FoundationDB for active leader coordination:
 | `source_id` | `string` | Non-empty UTF-8 `str` | Stable operator-configured identity for the FDB cluster. |
 | `stream_name` | `string` | Non-empty UTF-8 `str` | Registered CDC stream name. |
 | `owner_instance_id` | `string` | Non-empty UTF-8 `str` | Unique instance ID of the active leaseholder. |
-| `lease_epoch` | `uint64` | `0..2**64 - 1` | Monotonically increasing lease epoch. |
+| `lease_epoch` | `uint64` | `1..2**64 - 1` | Monotonically increasing positive lease epoch (`>= 1`; 0 is reserved/unset). |
 | `heartbeat_sequence` | `uint64` | `0..2**64 - 1` | Monotonically increasing heartbeat sequence number within the epoch. |
 | `expiration_timestamp` | `google.protobuf.Timestamp` | `0 <= seconds <= 253402300799`, `0 <= nanos < 10**9` | Lease expiration wall-clock timestamp. |
 | `stream_id` | `optional uint64` | `0..2**64 - 1` or unset | Optional native CDC stream ID bound to this lease. |
 
 ## 3. Operational Invariants & Semantics
 
-The schemas and codecs in `fdbkafka.bridge.state.v1` define the wire formats, models, and domain validation. The operational invariants described below (inclusive cursor resumption, transactional epoch fencing, heartbeat renewal, and sink-mismatch startup refusal) form the system contract enforced by the bridge runtime and control-plane stores (Checkpoint Store and Leader Lease).
+The schemas and codecs in `fdbkafka.bridge.state.v1` define the wire formats, models, and domain validation. The operational invariants described below (inclusive cursor resumption, transactional epoch fencing, heartbeat renewal, and sink-mismatch startup refusal) are the architectural contract for the upcoming Checkpoint Store and Leader Lease cards, which will enforce them at runtime.
 
 ### 3.1 Inclusive Cursor Semantics
 
 - `last_consumed_version` is **inclusive**: it records the highest FDB commit version whose mutations have been fully persisted in Kafka and acknowledged.
-- A fresh CDC stream with no prior committed versions is initialized with `last_consumed_version = -1`.
-- When resuming replication, the bridge supplies `last_consumed_version` to `resume_cdc_consumer(cursor)`, and consumption resumes strictly after that version (i.e. the next consumed version is `> last_consumed_version`, beginning at `last_consumed_version + 1`).
+- A fresh CDC stream with no prior committed versions is initialized with `last_consumed_version = -1`, meaning the stream's current `minVersion`.
+- When resuming replication, the bridge supplies the persisted cursor (`stream_id`, `last_consumed_version`) unchanged to `resume_cdc_consumer(cursor)`, which natively delivers versions strictly after `last_consumed_version` (see `CDC-DEEP-DIVE.md` §1.3–1.6).
 
-### 3.2 Leader Lease Fencing & Recovery
+### 3.2 Leader Lease Fencing & Recovery (Contract for Leader Lease & Checkpoint Store)
 
-- Exactly one bridge instance may hold an active lease for a given `(source_id, stream_name)` pair.
+- Exactly one bridge instance may hold an active lease for a given `(source_id, stream_name)` (or `(source_id, stream_name, stream_id)` when configured).
+- Epochs start at 1 (`lease_epoch >= 1`); 0 represents unset/unassigned.
 - Checkpoint updates require transactional verification against the active lease in FoundationDB: if `checkpoint.lease_epoch` does not match the active `LeaderLease.lease_epoch`, the transaction aborts.
 - During failover, a new leader increments `lease_epoch`, updates `owner_instance_id`, resets `heartbeat_sequence = 0`, and writes a new `expiration_timestamp`.
 - Fenced former leaders attempting to commit stale checkpoints are rejected by FDB conflict detection or explicit epoch mismatch.
 
-### 3.3 Sink Mismatch Protection
+### 3.3 Sink Mismatch Protection (Contract for Bridge Startup)
 
 - The `sink` field records destination Kafka coordinates (`cluster_id`, `topic`).
 - On bridge startup, the worker compares its configured Kafka target against `checkpoint.sink`. If they do not match, the worker refuses to start, preventing cross-cluster corruption or duplicate delivery across disjoint clusters.

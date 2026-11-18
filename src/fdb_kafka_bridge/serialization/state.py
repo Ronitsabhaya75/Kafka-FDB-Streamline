@@ -22,13 +22,13 @@ from fdb_kafka_bridge.serialization.model import (
 )
 from fdbkafka.bridge.state.v1 import state_pb2
 
-CURRENT_FORMAT_VERSION: Final[int] = 1
-SUPPORTED_FORMAT_VERSIONS: Final[frozenset[int]] = frozenset({CURRENT_FORMAT_VERSION})
-INT64_MAX: Final[int] = _MAX_VERSION
-UINT64_MAX: Final[int] = (1 << 64) - 1
-MAX_TIMESTAMP_SECONDS: Final[int] = 253_402_300_799
-MAX_TIMESTAMP_NS: Final[int] = _MAX_BRIDGE_TIMESTAMP_NS
-NANOS_PER_SECOND: Final[int] = 10**9
+_CURRENT_FORMAT_VERSION: Final[int] = 1
+_SUPPORTED_FORMAT_VERSIONS: Final[frozenset[int]] = frozenset({_CURRENT_FORMAT_VERSION})
+_INT64_MAX: Final[int] = _MAX_VERSION
+_UINT64_MAX: Final[int] = (1 << 64) - 1
+_MAX_TIMESTAMP_SECONDS: Final[int] = 253_402_300_799
+_MAX_TIMESTAMP_NS: Final[int] = _MAX_BRIDGE_TIMESTAMP_NS
+_NANOS_PER_SECOND: Final[int] = 10**9
 
 
 def _ns_from_timestamp(msg: Timestamp) -> int:
@@ -43,20 +43,20 @@ def _ns_from_timestamp(msg: Timestamp) -> int:
     Raises:
         StateDecodeError: If timestamp is malformed or out of range.
     """
-    if not (0 <= msg.nanos < NANOS_PER_SECOND):
+    if not (0 <= msg.nanos < _NANOS_PER_SECOND):
         raise StateDecodeError(
             f"Invalid timestamp nanos: {msg.nanos}",
             reason=DecodeFailure.MALFORMED_WIRE,
         )
-    if not (0 <= msg.seconds <= MAX_TIMESTAMP_SECONDS):
+    if not (0 <= msg.seconds <= _MAX_TIMESTAMP_SECONDS):
         raise StateDecodeError(
             f"Invalid timestamp seconds: {msg.seconds}",
             reason=DecodeFailure.MALFORMED_WIRE,
         )
-    return msg.seconds * NANOS_PER_SECOND + msg.nanos
+    return msg.seconds * _NANOS_PER_SECOND + msg.nanos
 
 
-def validate_checkpoint_model(checkpoint: CDCCheckpoint) -> None:
+def _validate_checkpoint_model(checkpoint: CDCCheckpoint) -> None:
     """Validate a CDCCheckpoint model before serialization.
 
     Args:
@@ -85,15 +85,15 @@ def validate_checkpoint_model(checkpoint: CDCCheckpoint) -> None:
             checkpoint.stream_id,
             field="stream_id",
             minimum=0,
-            maximum=UINT64_MAX,
+            maximum=_UINT64_MAX,
         )
 
-    # -1 represents a fresh CDC cursor; commit versions run up to INT64_MAX
+    # -1 represents a fresh CDC cursor; commit versions run up to _INT64_MAX
     _checks._integer(
         checkpoint.last_consumed_version,
         field="last_consumed_version",
         minimum=-1,
-        maximum=INT64_MAX,
+        maximum=_INT64_MAX,
     )
 
     if not isinstance(checkpoint.sink, KafkaSinkIdentity):
@@ -109,13 +109,13 @@ def validate_checkpoint_model(checkpoint: CDCCheckpoint) -> None:
         checkpoint.update_timestamp_ns,
         field="update_timestamp_ns",
         minimum=0,
-        maximum=MAX_TIMESTAMP_NS,
+        maximum=_MAX_TIMESTAMP_NS,
     )
     _checks._integer(
         checkpoint.lease_epoch,
         field="lease_epoch",
-        minimum=0,
-        maximum=UINT64_MAX,
+        minimum=1,
+        maximum=_UINT64_MAX,
     )
 
     if not isinstance(checkpoint.range_config_fingerprint, bytes):
@@ -126,7 +126,7 @@ def validate_checkpoint_model(checkpoint: CDCCheckpoint) -> None:
         )
 
 
-def validate_lease_model(lease: LeaderLease) -> None:
+def _validate_lease_model(lease: LeaderLease) -> None:
     """Validate a LeaderLease model before serialization.
 
     Args:
@@ -154,20 +154,20 @@ def validate_lease_model(lease: LeaderLease) -> None:
     _checks._integer(
         lease.lease_epoch,
         field="lease_epoch",
-        minimum=0,
-        maximum=UINT64_MAX,
+        minimum=1,
+        maximum=_UINT64_MAX,
     )
     _checks._integer(
         lease.heartbeat_sequence,
         field="heartbeat_sequence",
         minimum=0,
-        maximum=UINT64_MAX,
+        maximum=_UINT64_MAX,
     )
     _checks._integer(
         lease.expiration_timestamp_ns,
         field="expiration_timestamp_ns",
         minimum=0,
-        maximum=MAX_TIMESTAMP_NS,
+        maximum=_MAX_TIMESTAMP_NS,
     )
 
     if lease.stream_id is not None:
@@ -175,7 +175,7 @@ def validate_lease_model(lease: LeaderLease) -> None:
             lease.stream_id,
             field="stream_id",
             minimum=0,
-            maximum=UINT64_MAX,
+            maximum=_UINT64_MAX,
         )
 
 
@@ -192,7 +192,7 @@ def serialize_checkpoint(checkpoint: CDCCheckpoint) -> bytes:
         InputTypeError: If checkpoint or any field has an invalid Python type.
         InputValueError: If any value is out of its permitted domain.
     """
-    validate_checkpoint_model(checkpoint)
+    _validate_checkpoint_model(checkpoint)
 
     sink_msg = state_pb2.KafkaSinkIdentity(
         cluster_id=checkpoint.sink.cluster_id,
@@ -241,7 +241,7 @@ def deserialize_checkpoint(data: bytes) -> CDCCheckpoint:
             reason=DecodeFailure.MALFORMED_WIRE,
         ) from exc
 
-    if msg.format_version not in SUPPORTED_FORMAT_VERSIONS:
+    if msg.format_version not in _SUPPORTED_FORMAT_VERSIONS:
         raise StateDecodeError(
             f"Checkpoint format_version {msg.format_version} is unsupported",
             reason=DecodeFailure.UNSUPPORTED_FORMAT_VERSION,
@@ -256,7 +256,7 @@ def deserialize_checkpoint(data: bytes) -> CDCCheckpoint:
             "Checkpoint missing or empty stream_name",
             reason=DecodeFailure.MALFORMED_WIRE,
         )
-    if not (-1 <= msg.last_consumed_version <= INT64_MAX):
+    if not (-1 <= msg.last_consumed_version <= _INT64_MAX):
         raise StateDecodeError(
             f"Checkpoint last_consumed_version {msg.last_consumed_version} "
             f"is out of range",
@@ -280,6 +280,11 @@ def deserialize_checkpoint(data: bytes) -> CDCCheckpoint:
     if not msg.HasField("update_timestamp"):
         raise StateDecodeError(
             "Checkpoint missing required update_timestamp",
+            reason=DecodeFailure.MALFORMED_WIRE,
+        )
+    if not (1 <= msg.lease_epoch <= _UINT64_MAX):
+        raise StateDecodeError(
+            f"Checkpoint lease_epoch {msg.lease_epoch} is out of range",
             reason=DecodeFailure.MALFORMED_WIRE,
         )
 
@@ -314,7 +319,7 @@ def serialize_leader_lease(lease: LeaderLease) -> bytes:
         InputTypeError: If lease or any field has an invalid Python type.
         InputValueError: If any value is out of its permitted domain.
     """
-    validate_lease_model(lease)
+    _validate_lease_model(lease)
 
     ts_msg = _wire.timestamp(lease.expiration_timestamp_ns)
     msg = state_pb2.LeaderLease(
@@ -356,7 +361,7 @@ def deserialize_leader_lease(data: bytes) -> LeaderLease:
             reason=DecodeFailure.MALFORMED_WIRE,
         ) from exc
 
-    if msg.format_version not in SUPPORTED_FORMAT_VERSIONS:
+    if msg.format_version not in _SUPPORTED_FORMAT_VERSIONS:
         raise StateDecodeError(
             f"LeaderLease format_version {msg.format_version} is unsupported",
             reason=DecodeFailure.UNSUPPORTED_FORMAT_VERSION,
@@ -374,6 +379,11 @@ def deserialize_leader_lease(data: bytes) -> LeaderLease:
     if not msg.owner_instance_id:
         raise StateDecodeError(
             "LeaderLease missing or empty owner_instance_id",
+            reason=DecodeFailure.MALFORMED_WIRE,
+        )
+    if not (1 <= msg.lease_epoch <= _UINT64_MAX):
+        raise StateDecodeError(
+            f"LeaderLease lease_epoch {msg.lease_epoch} is out of range",
             reason=DecodeFailure.MALFORMED_WIRE,
         )
     if not msg.HasField("expiration_timestamp"):

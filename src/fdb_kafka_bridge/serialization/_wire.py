@@ -4,8 +4,6 @@ Nothing here validates. Every argument must already have passed `_checks`:
 protobuf swallows a `None` kwarg instead of raising.
 """
 
-from typing import Any
-
 from google.protobuf.message import Message
 from google.protobuf.timestamp_pb2 import Timestamp
 
@@ -20,11 +18,9 @@ def timestamp(bridge_timestamp_ns: int) -> Timestamp:
 
 
 def directory_message(
-    directory: FDBDirectoryContext | None,
-) -> mutations_pb2.FDBDirectoryContext | None:
-    """Build an FDBDirectoryContext protobuf message if directory context is given."""
-    if directory is None:
-        return None
+    directory: FDBDirectoryContext,
+) -> mutations_pb2.FDBDirectoryContext:
+    """Build an FDBDirectoryContext protobuf message."""
     return mutations_pb2.FDBDirectoryContext(
         path=directory.path,
         subspace_prefix=directory.subspace_prefix,
@@ -41,19 +37,18 @@ def record(
     **body: Message,
 ) -> bytes:
     """An `FDBMutationRecord`'s bytes: the envelope plus the `body` oneof, if any."""
-    # The constructor kwarg keeps a zero Timestamp present on the wire.
-    kwargs: dict[str, Any] = {
-        "stream_name": stream_name,
-        "bridge_timestamp": timestamp(bridge_timestamp_ns),
-    }
+    msg = mutations_pb2.FDBMutationRecord(
+        stream_name=stream_name,
+        bridge_timestamp=timestamp(bridge_timestamp_ns),
+        **body,
+    )
     if directory is not None:
-        kwargs["directory"] = directory_message(directory)
+        msg.directory.CopyFrom(directory_message(directory))
     if stream_id is not None:
-        kwargs["stream_id"] = stream_id
+        msg.stream_id = stream_id
     if source_id is not None:
-        kwargs["source_id"] = source_id
-    kwargs.update(body)
-    return mutations_pb2.FDBMutationRecord(**kwargs).SerializeToString()
+        msg.source_id = source_id
+    return msg.SerializeToString()
 
 
 def mutation_message(

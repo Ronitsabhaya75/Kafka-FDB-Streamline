@@ -38,7 +38,7 @@ G5 = bytes.fromhex(
     "2d6112021501382a4208736f757263652d31"
 )
 DIRECTORY_RECORD_GOLDEN = G5
-GOLDEN = (G1, G2, G3, G4)
+GOLDEN = (G1, G2, G3, G4, G5)
 
 
 def test_single_key_mutation_record_bytes() -> None:

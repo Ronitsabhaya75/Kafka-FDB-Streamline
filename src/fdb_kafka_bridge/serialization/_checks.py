@@ -225,11 +225,13 @@ def natives(
 
 def is_range_within_subspace(begin_key: bytes, end_key: bytes, prefix: bytes) -> bool:
     """Check whether [begin_key, end_key) is contained within subspace prefix."""
+    if begin_key >= end_key:
+        return False
     if begin_key < prefix:
         return False
     stripped = prefix.rstrip(b"\xff")
     if not stripped:
-        return True
+        return False
     prefix_bound = stripped[:-1] + bytes([stripped[-1] + 1])
     return end_key <= prefix_bound
 
@@ -246,47 +248,62 @@ def source_id(value: str | None) -> None:
         _text(value, "source_id")
 
 
-def directory_context(value: Any) -> None:
+def directory_context(value: Any, *, index: int | None = None) -> None:
     """Require None or valid FDBDirectoryContext."""
     if value is not None:
         if not isinstance(value, FDBDirectoryContext):
+            got = type(value).__name__
             raise InputTypeError(
-                f"directory must be FDBDirectoryContext, got {type(value).__name__}",
+                f"directory{at(index)} must be FDBDirectoryContext, got {got}",
                 field="directory",
+                index=index,
             )
         if not isinstance(value.subspace_prefix, bytes):
+            got = type(value.subspace_prefix).__name__
             raise InputTypeError(
-                "directory.subspace_prefix must be bytes, got "
-                f"{type(value.subspace_prefix).__name__}",
+                f"directory.subspace_prefix{at(index)} must be bytes, got {got}",
                 field="directory.subspace_prefix",
+                index=index,
             )
         if not value.subspace_prefix:
             raise InputValueError(
-                "directory.subspace_prefix must not be empty",
+                f"directory.subspace_prefix{at(index)} must not be empty",
                 field="directory.subspace_prefix",
+                index=index,
+            )
+        if not value.subspace_prefix.rstrip(b"\xff"):
+            raise InputValueError(
+                f"directory.subspace_prefix{at(index)} must not be all \\xff bytes",
+                field="directory.subspace_prefix",
+                index=index,
             )
         if not isinstance(value.path, tuple):
             got = type(value.path).__name__
             raise InputTypeError(
-                f"directory.path must be tuple, got {got}",
+                f"directory.path{at(index)} must be tuple, got {got}",
                 field="directory.path",
+                index=index,
             )
         if not value.path:
             raise InputValueError(
-                "directory.path must not be empty",
+                f"directory.path{at(index)} must not be empty",
                 field="directory.path",
+                index=index,
             )
         for i, elem in enumerate(value.path):
             if not isinstance(elem, str):
+                got = type(elem).__name__
                 raise InputTypeError(
-                    f"directory.path[{i}] must be str, got {type(elem).__name__}",
+                    f"directory.path[{i}]{at(index)} must be str, got {got}",
                     field="directory.path",
+                    index=index,
                 )
             try:
                 elem.encode("utf-8")
             except UnicodeEncodeError:
                 raise InputValueError(
-                    f"directory.path[{i}] (str of length {len(elem)}) is not "
+                    f"directory.path[{i}]{at(index)} (length {len(elem)}) is not "
                     "UTF-8-encodable",
                     field="directory.path",
+                    index=index,
                 ) from None
