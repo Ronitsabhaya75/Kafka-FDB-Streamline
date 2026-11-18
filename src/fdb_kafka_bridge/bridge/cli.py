@@ -67,7 +67,10 @@ def build_parser() -> argparse.ArgumentParser:
     cdc_group.add_argument(
         "--cdc-max-record-bytes",
         type=int,
-        help="Maximum Protobuf record size in bytes (default: 1,000,000).",
+        help=(
+            "Maximum Protobuf record size in bytes (default: derived from the "
+            "stream name so a record fits Kafka's message.max.bytes)."
+        ),
     )
     cdc_group.add_argument(
         "--cdc-cursor-file",

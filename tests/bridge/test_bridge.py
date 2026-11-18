@@ -482,6 +482,87 @@ def test_run_reraises_fatal_kafka_error() -> None:
     assert bridge._shutdown_requested.is_set()
 
 
+def _size_error() -> KafkaException:
+    return KafkaException(
+        KafkaError(KafkaError.MSG_SIZE_TOO_LARGE, "Message size too large")
+    )
+
+
+@pytest.mark.parametrize("transactional", [False, True])
+def test_run_reraises_message_too_large(transactional: bool, tmp_path: Path) -> None:
+    """An oversize record fails identically on replay: shut down, never retry."""
+    cursor_file = tmp_path / "test.cursor"
+    bridge, listener, producer = _recovery_bridge(
+        transactional=transactional, cursor_file=str(cursor_file)
+    )
+    listener.poll_records.side_effect = _poll_script(
+        bridge, listener, [[_make_batch_record(1)]]
+    )
+    producer.produce.side_effect = _size_error()
+    rebuild = _fake_rebuild(listener)
+    _bounded(bridge, rebuild)
+    bridge._rebuild_pipeline = rebuild  # type: ignore[method-assign]
+
+    with pytest.raises(KafkaException, match="too large"):
+        bridge.run()
+
+    if transactional:
+        producer.abort_transaction.assert_called_once()
+    else:
+        producer.close.assert_called()
+    rebuild.assert_not_called()
+    listener.acknowledge.assert_not_called()
+    assert not cursor_file.exists()
+    assert bridge.metrics.errors_retried == 0
+    assert bridge._shutdown_requested.is_set()
+
+
+def test_run_reraises_message_too_large_from_flush(tmp_path: Path) -> None:
+    """An idempotent delivery report re-raised by flush is permanent too."""
+    cursor_file = tmp_path / "test.cursor"
+    bridge, listener, producer = _recovery_bridge(cursor_file=str(cursor_file))
+    listener.poll_records.side_effect = _poll_script(
+        bridge, listener, [[_make_batch_record(1)]]
+    )
+    producer.flush_or_raise.side_effect = _size_error()
+    rebuild = _fake_rebuild(listener)
+    _bounded(bridge, rebuild)
+    bridge._rebuild_pipeline = rebuild  # type: ignore[method-assign]
+
+    with pytest.raises(KafkaException, match="too large"):
+        bridge.run()
+
+    producer.produce.assert_called_once()
+    producer.close.assert_called()
+    rebuild.assert_not_called()
+    listener.acknowledge.assert_not_called()
+    assert not cursor_file.exists()
+    assert bridge.metrics.errors_retried == 0
+    assert bridge._shutdown_requested.is_set()
+
+
+def test_run_reraises_failed_abort_after_message_too_large() -> None:
+    """A failed abort is raised from the size error and is still permanent."""
+    bridge, listener, producer = _recovery_bridge(transactional=True)
+    listener.poll_records.side_effect = _poll_script(
+        bridge, listener, [[_make_batch_record(1)]]
+    )
+    producer.produce.side_effect = _size_error()
+    producer.abort_transaction.side_effect = KafkaException(
+        KafkaError(KafkaError._TIMED_OUT, "abort timed out")
+    )
+    rebuild = _fake_rebuild(listener)
+    _bounded(bridge, rebuild)
+    bridge._rebuild_pipeline = rebuild  # type: ignore[method-assign]
+
+    with pytest.raises(KafkaException, match="abort timed out"):
+        bridge.run()
+
+    rebuild.assert_not_called()
+    listener.acknowledge.assert_not_called()
+    assert bridge.metrics.errors_retried == 0
+
+
 def test_run_rebuilds_after_closed_producer() -> None:
     """An idempotent flush failure closes the producer; run() rebuilds."""
     bridge, listener, producer = _recovery_bridge()

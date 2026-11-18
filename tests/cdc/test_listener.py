@@ -86,6 +86,45 @@ def test_constructor_rejects_ambiguous_registration_range() -> None:
         )
 
 
+@pytest.mark.parametrize("name", ["stream", b"stream", "€" * 10, "s" * 10_000])
+def test_default_max_record_bytes_derived_from_stream_name_key(
+    name: str | bytes,
+) -> None:
+    raw = name if isinstance(name, bytes) else name.encode("utf-8")
+    listener = FDBMutationListener(MagicMock(spec=FDBClient), name)
+    assert listener.max_record_bytes == 1_000_000 - len(raw) - 36
+
+
+def test_explicit_max_record_bytes_preserved() -> None:
+    listener = FDBMutationListener(
+        MagicMock(spec=FDBClient), "stream", max_record_bytes=500
+    )
+    assert listener.max_record_bytes == 500
+
+
+# Worst-case VersionEnd for a 6-byte name is 56 bytes (8 of them name + framing).
+def test_explicit_max_record_bytes_below_largest_version_end_rejected() -> None:
+    client = MagicMock(spec=FDBClient)
+    assert FDBMutationListener(client, "stream", max_record_bytes=56)
+    with pytest.raises(ValueError, match="smaller than the 56-byte"):
+        FDBMutationListener(client, "stream", max_record_bytes=55)
+
+
+# Name of L >= 16_384 bytes: worst-case VersionEnd is L + 52, derived budget is
+# 999_964 - L, so the longest workable name is 499_956 bytes.
+def test_stream_name_too_long_for_any_version_end_rejected() -> None:
+    client = MagicMock(spec=FDBClient)
+    fits = FDBMutationListener(client, "s" * 499_956)
+    assert fits.max_record_bytes == 499_956 + 52
+    with pytest.raises(ValueError, match="smaller than the 500009-byte"):
+        FDBMutationListener(client, "s" * 499_957)
+
+
+def test_stream_name_leaving_no_record_budget_rejected() -> None:
+    with pytest.raises(ValueError, match="stream_name"):
+        FDBMutationListener(MagicMock(spec=FDBClient), "s" * (1_000_000 - 36))
+
+
 def test_start_registers_only_when_range_is_supplied() -> None:
     client = MagicMock(spec=FDBClient)
     client.create_cdc_consumer.return_value = MagicMock()

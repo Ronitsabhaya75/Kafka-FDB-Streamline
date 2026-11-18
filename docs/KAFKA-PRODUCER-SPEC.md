@@ -105,6 +105,43 @@ After `mark_fatal()` (or encountering an unrecoverable fatal Kafka error), these
 raise `RuntimeError("Producer is in a fatal error state")`. The `transactional` property
 remains accessible for configuration inspection.
 
+## Record size
+
+librdkafka checks each message's size inside `produce()`, before batching, and raises
+`KafkaException(MSG_SIZE_TOO_LARGE)` synchronously when
+
+```text
+KAFKA_MESSAGE_OVERHEAD_BYTES (36) + len(key) + len(value) + len(headers) > message.max.bytes
+```
+
+(`RD_KAFKAP_MESSAGE_V2_MAX_OVERHEAD`; `message.max.bytes` defaults to
+`DEFAULT_MESSAGE_MAX_BYTES`, 1,000,000). The error is not fatal and does not mark the
+producer fatal, and idempotence, transactions and compression do not change it. The
+error text says "Broker" but no broker is involved. Retrying the same record fails the
+same way; the bridge treats it as permanent
+([Error Classification](BRIDGE-PIPELINE-SPEC.md#error-classification-and-recovery-loop)).
+
+Callers must keep `max_record_bytes + len(key) + 36 <= message.max.bytes`.
+`max_record_bytes_for_key(key, message_max_bytes=DEFAULT_MESSAGE_MAX_BYTES)` returns the
+largest value size that fits, `message_max_bytes - len(key) - 36`; the CDC listener
+derives its default budget from it ([Mutation Stream Listener](CDC-CONSUMER-SPEC.md#22-mutation-stream-listener-srcfdb_kafka_bridgecdclistenerpy)).
+
+The broker checks each record batch, not each record, against topic
+`max.message.bytes` (broker `message.max.bytes` when the topic does not override it),
+counting the batch's 61-byte header. librdkafka packs queued messages for a partition
+into one batch up to `min(message.max.bytes, batch.size)`, overshooting only for a
+batch's first message. Every record of a reply shares its key, so all land on one partition,
+and `linger.ms=5` lets them accumulate. lz4 does not reduce the bound: a batch that does
+not shrink is sent uncompressed. The topic therefore needs
+
+```text
+max.message.bytes >= max(min(message.max.bytes, batch.size), max_record_bytes + len(key) + 36) + 61
+```
+
+With producer defaults (both 1,000,000) that is 1,000,061 whatever `max_record_bytes`
+is; lowering `max_record_bytes` does not let a smaller topic limit work. The broker
+default, 1,048,588, satisfies it.
+
 ## Flushing and close behaviour
 
 - `flush(timeout)` blocks until all queued messages are delivered or timeout
