@@ -220,6 +220,7 @@ class FDBMutationListener:
         self.idle_ack_max_seconds = idle_ack_max_seconds
         self._skipped_idle_replies = 0
         self._last_withheld_watermark = -1
+        self._withheld_idle_reply = False
         self._idle_window_start = 0.0
 
     def start(self) -> None:
@@ -294,6 +295,15 @@ class FDBMutationListener:
         return self._awaiting_ack
 
     @property
+    def withheld_idle_reply(self) -> bool:
+        """Whether the last ``poll_records`` withheld an idle reply and returned ``[]``.
+
+        Lets a caller tell coalescing apart from a genuinely empty reply, which
+        it may want to back off on.
+        """
+        return self._withheld_idle_reply
+
+    @property
     def consumer(self) -> Any:
         """Return the active native consumer, starting it on first access."""
         if self._is_closed:
@@ -348,6 +358,7 @@ class FDBMutationListener:
             CDCTerminalError: If the native consume failed with a terminal code.
             SerializationError: If a native mutation or record cannot be serialized.
         """
+        self._withheld_idle_reply = False
         batch = self._consume_batch()
         self._delivery_failed = True
         timestamp_ns = (
@@ -373,6 +384,7 @@ class FDBMutationListener:
             # Safe only because native ack is cumulative and this reply carries
             # nothing but watermark progress; a later ack subsumes it.
             self._last_withheld_watermark = watermark
+            self._withheld_idle_reply = True
             self._delivery_failed = False
             return []
         if watermark >= 0 and watermark > last_group_version:

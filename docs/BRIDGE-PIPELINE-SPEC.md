@@ -141,6 +141,7 @@ When `cdc.idle_ack_max_replies` or `cdc.idle_ack_max_seconds` is configured:
 3. The bridge publishes the watermark record to Kafka, persists the new cursor position to `cdc.cursor_file`, and invokes FoundationDB `acknowledge()`.
 4. Acknowledgement is cumulative, safely releasing retention for all intermediate skipped versions in one operation.
 5. If the bridge crashes before a coalesced flush, the uncheckpointed advancement is re-consumed after restart without losing data.
+6. `Bridge.run()` does not back off after a withheld idle reply (`listener.withheld_idle_reply is True`): it resets the backoff and polls again at once. Only a genuinely empty step backs off. Otherwise each withheld reply would cost a `backoff_base_seconds` nap and batch data behind it.
 
 ### Producer wiring
 

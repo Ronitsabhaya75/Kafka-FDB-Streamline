@@ -446,6 +446,63 @@ def test_producer_and_listener_expose_sticky_state() -> None:
     assert (listener.delivery_failed, listener.awaiting_ack) == (True, True)
 
 
+def _empty_polls(
+    bridge: Bridge, listener: MagicMock, withheld: list[bool]
+) -> Callable[..., list[mutations_pb2.FDBMutationRecord]]:
+    """Return ``[]`` once per entry, setting ``withheld_idle_reply``; then stop."""
+    remaining = list(withheld)
+
+    def poll(*_: object, **__: object) -> list[mutations_pb2.FDBMutationRecord]:
+        listener.withheld_idle_reply = remaining.pop(0)
+        if not remaining:
+            bridge.request_shutdown()
+        return []
+
+    return poll
+
+
+def test_run_skips_backoff_after_withheld_idle_reply() -> None:
+    """A withheld idle reply loops straight back to poll and resets backoff."""
+    bridge, listener, _ = _recovery_bridge()
+    _set_state(listener, FDBMutationListener, withheld_idle_reply=False)
+    listener.poll_records.side_effect = _empty_polls(
+        bridge, listener, [False, False, True, True, False, False]
+    )
+    event = bridge._shutdown_requested
+
+    with patch.object(event, "wait", wraps=event.wait) as wait:
+        bridge.run()
+
+    assert listener.poll_records.call_count == 6
+    assert [c.kwargs["timeout"] for c in wait.call_args_list] == [
+        0.001,
+        0.0015,
+        0.001,
+        0.0015,
+    ]
+
+
+def test_run_backs_off_when_withheld_idle_reply_is_not_strictly_true() -> None:
+    """Autospec leaves the property a truthy mock; that must not skip backoff."""
+    bridge, listener, _ = _recovery_bridge()
+    calls = 0
+
+    def poll(*_: object, **__: object) -> list[mutations_pb2.FDBMutationRecord]:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            bridge.request_shutdown()
+        return []
+
+    listener.poll_records.side_effect = poll
+    event = bridge._shutdown_requested
+
+    with patch.object(event, "wait", wraps=event.wait) as wait:
+        bridge.run()
+
+    assert wait.call_count == 2
+
+
 def test_run_retries_retryable_cdc_error() -> None:
     """A CDCRetryableError from poll is retried in place, without a rebuild."""
     bridge, listener, _ = _recovery_bridge()

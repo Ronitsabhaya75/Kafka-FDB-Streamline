@@ -531,6 +531,57 @@ def test_data_reply_after_skipped_idles_is_delivered_and_resets_window() -> None
     assert listener.poll_records(bridge_timestamp_ns=1) == []
 
 
+def test_withheld_idle_reply_tracks_only_the_last_poll() -> None:
+    data = MockConsumeResult(
+        [MockVersionGroup(300, [MockCdcMutation(0, b"key", b"value")])], 300
+    )
+    listener, _, _ = _listener_with_batches(
+        [
+            MockConsumeResult([], 100),
+            data,
+            MockConsumeResult([], 400),
+            MockConsumeResult([], -1),
+            MockConsumeResult([], 500),
+        ],
+        idle_ack_max_replies=2,
+    )
+    assert listener.withheld_idle_reply is False
+
+    assert listener.poll_records(bridge_timestamp_ns=1) == []
+    assert listener.withheld_idle_reply is True
+
+    assert listener.poll_records(bridge_timestamp_ns=1)
+    assert listener.withheld_idle_reply is False
+    listener.acknowledge()
+
+    assert listener.poll_records(bridge_timestamp_ns=1) == []
+    assert listener.withheld_idle_reply is True
+    # No watermark: a genuinely empty reply, nothing withheld.
+    assert listener.poll_records(bridge_timestamp_ns=1) == []
+    assert listener.withheld_idle_reply is False
+
+    flushed = listener.poll_records(bridge_timestamp_ns=1)
+    assert _version_ends(flushed) == [(500, 0)]
+    assert listener.withheld_idle_reply is False
+
+
+def test_withheld_idle_reply_clears_on_failed_poll_and_without_coalescing() -> None:
+    listener, _, consumer = _listener_with_batches(
+        [MockConsumeResult([], 100)], idle_ack_max_replies=3
+    )
+    assert listener.poll_records(bridge_timestamp_ns=1) == []
+    assert listener.withheld_idle_reply is True
+
+    consumer.consume.return_value.wait.side_effect = RuntimeError("boom")
+    with pytest.raises(CDCError):
+        listener.poll_records(bridge_timestamp_ns=1)
+    assert listener.withheld_idle_reply is False
+
+    plain, _, _ = _listener_with_batches([MockConsumeResult([], 100)])
+    assert plain.poll_records(bridge_timestamp_ns=1)
+    assert plain.withheld_idle_reply is False
+
+
 def test_resume_starts_a_fresh_idle_window() -> None:
     client = MagicMock(spec=FDBClient)
     consumer = MagicMock()

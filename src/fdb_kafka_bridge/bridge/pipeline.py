@@ -1120,10 +1120,17 @@ class Bridge:
                     published = self._pipeline.step()
                     if published == 0:
                         records = []
+                        # `is True`: an autospec listener mock is truthy here.
+                        withheld = self._listener.withheld_idle_reply is True
                     else:
                         records = self._counting_listener.pop_last_records()
 
                 if published == 0:
+                    if withheld:
+                        # Coalescing held back an idle reply; the stream is live,
+                        # so a backoff nap would only delay the next data reply.
+                        backoff = self.config.pipeline.backoff_base_seconds
+                        continue
                     self._shutdown_requested.wait(timeout=backoff)
                     backoff = min(
                         backoff * 1.5, self.config.pipeline.backoff_max_seconds

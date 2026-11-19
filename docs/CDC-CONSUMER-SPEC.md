@@ -126,6 +126,7 @@ class FDBMutationListener:
     awaiting_ack: bool               # a delivered reply needs acknowledge()
     delivery_failed: bool            # last reply failed to serialize; resume to clear
     has_pending_idle_progress: bool  # withheld idle progress awaits flush
+    withheld_idle_reply: bool        # last poll_records() returned [] by withholding an idle reply
 ```
 
 Supply at most one of `key_range`, `key_ranges` or `subspace` to register a stream when
