@@ -1,0 +1,127 @@
+--- a/profile.py
++++ b/profile.py
+@@ -36,6 +36,7 @@
+ from fdb_kafka_bridge.cdc import FDBClient, strinc
+ from fdb_kafka_bridge.cdc.listener import FDBMutationListener
+ from fdb_kafka_bridge.kafka import MutationProducer
++from latency_probe import batch_latency_ms
+ 
+ pc = time.perf_counter
+ 
+@@ -49,6 +50,7 @@
+ cur: dict[str, Any] = {}
+ last_end = [None]
+ stats_blobs: list[tuple[float, str]] = []
++lat_samples: list[tuple[float, float]] = []  # (pc() at flush return, ms)
+ 
+ 
+ def _reset() -> None:
+@@ -70,6 +72,7 @@
+     orig_flush = MutationProducer.flush_or_raise
+     orig_ca = pl.BridgePipeline._checkpoint_and_acknowledge
+     orig_step = pl.BridgePipeline.step
++    orig_paf = pl.BridgePipeline._produce_and_flush
+ 
+     def consume(self: Any) -> Any:
+         t = pc()
+@@ -125,6 +128,12 @@
+         last_end[0] = t1
+         return n
+ 
++    def paf(self: Any, records: Any, *a: Any, **k: Any) -> None:
++        orig_paf(self, records, *a, **k)
++        ms = batch_latency_ms(records, time.time_ns())
++        if ms is not None:
++            lat_samples.append((pc(), ms))
++
+     FDBMutationListener._consume_batch = consume
+     FDBMutationListener.poll_records = poll
+     FDBMutationListener.acknowledge = ack
+@@ -132,6 +141,7 @@
+     MutationProducer.flush_or_raise = flush
+     pl.BridgePipeline._checkpoint_and_acknowledge = ca
+     pl.BridgePipeline.step = step
++    pl.BridgePipeline._produce_and_flush = paf
+ 
+ 
+ FIELDS = [
+@@ -150,6 +160,10 @@
+     ap.add_argument("--bootstrap", default="kafka:19092")
+     ap.add_argument("--stats-ms", type=int, default=500)
+     ap.add_argument("--out", required=True)
++    ap.add_argument("--idle-ack-max-replies", type=int, default=None)
++    ap.add_argument("--idle-ack-max-seconds", type=float, default=None)
++    ap.add_argument("--cell", default="")
++    ap.add_argument("--repo-sha", default="")
+     args = ap.parse_args()
+ 
+     patch()
+@@ -161,15 +175,21 @@
+ 
+     client = FDBClient(api_version=800)
+     db = client.open()
++    cdc: dict[str, Any] = {
++        "stream_name": stream,
++        "begin_key": prefix,
++        "end_key": strinc(prefix),
++        "cursor_file": cursor_file,
++    }
++    # Set via BridgeConfig (no monkeypatch); omitted keys keep coalescing off.
++    if args.idle_ack_max_replies is not None:
++        cdc["idle_ack_max_replies"] = args.idle_ack_max_replies
++    if args.idle_ack_max_seconds is not None:
++        cdc["idle_ack_max_seconds"] = args.idle_ack_max_seconds
+     config = from_dict(
+         {
+             "fdb": {"api_version": 800},
+-            "cdc": {
+-                "stream_name": stream,
+-                "begin_key": prefix,
+-                "end_key": strinc(prefix),
+-                "cursor_file": cursor_file,
+-            },
++            "cdc": cdc,
+             "kafka": {"bootstrap_servers": args.bootstrap, "topic": topic},
+             "pipeline": {"flush_timeout_seconds": 30.0},
+         }
+@@ -201,6 +221,12 @@
+         "batch_size": 500, "value_size": 100, "transactional": False,
+         "checkpoint": "file (fsync tmp + rename + fsync dir), container /tmp",
+         "producer": "MutationProducer defaults + statistics.interval.ms",
++        "idle_ack_max_replies": args.idle_ack_max_replies,
++        "idle_ack_max_seconds": args.idle_ack_max_seconds,
++        "cell": args.cell,
++        "repo_sha": args.repo_sha,
++        "latency": "newest mutation's client write (value timestamp) -> "
++        "_produce_and_flush return",
+     }
+ 
+     if args.mode == "drain":
+@@ -244,6 +270,7 @@
+             time.sleep(0.05)
+         meta["drain_after_stop_s"] = time.monotonic() - w_mono
+     meta["published_total"] = bridge.metrics.mutations_published
++    meta["drained"] = meta["published_total"] >= target
+     meta["batches_acked"] = bridge.metrics.batches_acked
+     bridge.request_shutdown()
+     bt.join(15)
+@@ -255,6 +282,11 @@
+         meta["stream_removed"] = True
+     except Exception as e:  # noqa: BLE001
+         meta["stream_removed"] = repr(e)
++    try:  # single-process memory engine: drop this run's keys
++        del db[prefix : strinc(prefix)]
++        meta["keys_cleared"] = True
++    except Exception as e:  # noqa: BLE001
++        meta["keys_cleared"] = repr(e)
+     with open(args.out, "w") as f:
+         json.dump(
+             {
+@@ -262,6 +294,7 @@
+                 "fields": FIELDS,
+                 "steps": steps,
+                 "stats": [(t, json.loads(s)) for t, s in stats_blobs],
++                "lat": lat_samples,
+             },
+             f,
+         )
