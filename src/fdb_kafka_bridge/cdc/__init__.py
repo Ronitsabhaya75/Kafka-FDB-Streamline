@@ -4,6 +4,19 @@ Provides high-level client connection management and bounded Protobuf record
 polling for FoundationDB 8.0 native CDC.
 """
 
+from fdb_kafka_bridge.cdc.checkpoint import (
+    CheckpointCursor,
+    CheckpointError,
+    CheckpointFencedError,
+    CheckpointFormatError,
+    CheckpointOverlapError,
+    CheckpointRegressionError,
+    CheckpointSinkMismatchError,
+    CheckpointStore,
+    CheckpointStreamMismatchError,
+    CheckpointWriteError,
+    SinkIdentity,
+)
 from fdb_kafka_bridge.cdc.client import (
     DEFAULT_CDC_API_VERSION,
     MINIMUM_CDC_API_VERSION,
@@ -27,6 +40,17 @@ from fdb_kafka_bridge.cdc.listener import (
 )
 
 __all__ = [
+    "CheckpointCursor",
+    "CheckpointError",
+    "CheckpointFencedError",
+    "CheckpointFormatError",
+    "CheckpointOverlapError",
+    "CheckpointRegressionError",
+    "CheckpointSinkMismatchError",
+    "CheckpointStore",
+    "CheckpointStreamMismatchError",
+    "CheckpointWriteError",
+    "SinkIdentity",
     "CDCConsumeError",
     "CDCConsumerClosedError",
     "CDCError",

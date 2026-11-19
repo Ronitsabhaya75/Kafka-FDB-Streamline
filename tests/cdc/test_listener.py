@@ -357,6 +357,137 @@ def test_acknowledge_maps_native_error_code() -> None:
     assert excinfo.value.code == 1211
 
 
+class _PendingFuture:
+    def __init__(self) -> None:
+        import threading
+
+        self.ready = threading.Event()
+        self.cancelled = False
+        self.callback = None
+
+    def is_ready(self) -> bool:
+        return self.ready.is_set()
+
+    def on_ready(self, callback: object) -> None:
+        self.callback = callback
+        if self.ready.is_set():
+            callback(self)
+
+    def cancel(self) -> None:
+        self.cancelled = True
+        self.ready.set()
+        if self.callback is not None:
+            self.callback(self)
+
+    def wait(self) -> None:
+        assert self.ready.wait(2)
+        if self.cancelled:
+            raise _FakeFDBError(1101)
+
+
+@pytest.mark.parametrize("resumed", [False, True])
+def test_ack_timeout_cancels_future_and_retains_pending_reply(resumed: bool) -> None:
+    batch = MockConsumeResult([], 100)
+    listener, client, consumer = _listener_with_batch(batch, ack_timeout_seconds=0.01)
+    pending = _PendingFuture()
+    if resumed:
+        listener.initial_cursor = MockCursor(1, 100)
+        client.resume_cdc_consumer.return_value = consumer
+        client.get_read_version.return_value = 100
+    else:
+        listener.poll_records()
+    consumer.acknowledge.return_value = pending
+    with pytest.raises(CDCRetryableError, match="Timed out"):
+        listener.start() if resumed else listener.acknowledge()
+    assert pending.cancelled
+    # cancel() must be followed by wait() so the handle is clear before retry.
+    assert pending.ready.is_set()
+    assert listener.awaiting_ack is not resumed
+    if not resumed:
+        consumer.acknowledge.return_value = MagicMock()
+        listener.acknowledge()
+        consumer.consume.assert_called_once()
+
+
+@pytest.mark.parametrize("close", [False, True])
+def test_cancel_parked_consume_without_ack(close: bool) -> None:
+    import threading
+
+    listener, _, consumer = _listener_with_batch(MockConsumeResult([], 100))
+    pending = _PendingFuture()
+    entered = threading.Event()
+
+    def consume() -> _PendingFuture:
+        entered.set()
+        return pending
+
+    consumer.consume.side_effect = consume
+    errors = []
+
+    def poll() -> None:
+        try:
+            listener.poll_records()
+        except Exception as exc:
+            errors.append(exc)
+
+    worker = threading.Thread(target=poll)
+    worker.start()
+    assert entered.wait(2)
+    listener.close() if close else listener.cancel_pending()
+    worker.join(2)
+    assert not worker.is_alive()
+    assert pending.cancelled
+    assert isinstance(errors[0], CDCConsumerClosedError)
+    consumer.acknowledge.assert_not_called()
+    with pytest.raises(CDCConsumerClosedError):
+        listener.poll_records()
+
+
+def test_first_consume_collision_is_retried_for_fresh_and_resumed() -> None:
+    listener, client, consumer = _listener_with_batch(MockConsumeResult([], 100))
+    assert listener._restart_poll is True
+    consumer.consume.return_value.wait.side_effect = [
+        _FakeFDBError(2000),
+        MockConsumeResult([], 100),
+        _FakeFDBError(2000),
+    ]
+    assert listener.poll_records()
+    listener.acknowledge()
+    with pytest.raises(CDCTerminalError) as error:
+        listener.poll_records()
+    assert error.value.code == 2000
+    assert consumer.consume.call_count == 3
+
+    resumed, client, consumer = _listener_with_batch(MockConsumeResult([], 100))
+    resumed.initial_cursor = MockCursor(1, 90)
+    client.resume_cdc_consumer.return_value = consumer
+    client.get_read_version.return_value = 100
+    consumer.consume.return_value.wait.side_effect = [
+        _FakeFDBError(2000),
+        MockConsumeResult([], 100),
+    ]
+    assert resumed._restart_poll is True
+    assert resumed.poll_records()
+    assert consumer.consume.call_count == 2
+
+
+def test_restart_collision_window_expires() -> None:
+    listener = _listener_whose_consume_raises(_FakeFDBError(2000))
+    listener.proxy_consume_poll_timeout_seconds = 0.01
+    with pytest.raises(CDCTerminalError) as error:
+        listener.poll_records()
+    assert error.value.code == 2000
+
+
+@pytest.mark.parametrize(
+    "name", ["ack_timeout_seconds", "proxy_consume_poll_timeout_seconds"]
+)
+@pytest.mark.parametrize("value", [0, -1, True, float("nan"), float("inf"), "5"])
+def test_invalid_operation_timeouts(name: str, value: object) -> None:
+    with pytest.raises(ValueError):
+        FDBMutationListener(MagicMock(), "s", **{name: value})
+
+
 def _listener_with_batches(
     batches: list[MockConsumeResult],
     **kwargs: object,
@@ -636,3 +767,109 @@ def test_constructor_accepts_integer_idle_ack_seconds() -> None:
 
     assert isinstance(listener.idle_ack_max_seconds, float)
     assert listener.idle_ack_max_seconds == 5.0
+
+
+def test_coalesced_idle_watermark_survives_ack_timeout() -> None:
+    listener, _, consumer = _listener_with_batches(
+        [MockConsumeResult([], 100), MockConsumeResult([], 101)],
+        idle_ack_max_replies=2,
+        ack_timeout_seconds=0.01,
+    )
+    assert listener.poll_records() == []
+    assert _version_ends(listener.poll_records()) == [(101, 0)]
+    pending = _PendingFuture()
+    consumer.acknowledge.return_value = pending
+    with pytest.raises(CDCRetryableError, match="Timed out"):
+        listener.acknowledge()
+    assert pending.cancelled
+    assert listener.awaiting_ack
+    assert listener._skipped_idle_replies == 2
+    consumer.acknowledge.return_value = MagicMock()
+    listener.acknowledge()
+    assert not listener.awaiting_ack
+    assert listener._skipped_idle_replies == 0
+    assert consumer.consume.call_count == 2
+
+
+def test_ack_retry_waits_for_native_cancellation_completion() -> None:
+    import threading
+
+    listener, _, consumer = _listener_with_batch(
+        MockConsumeResult([], 100), ack_timeout_seconds=0.01
+    )
+    listener.poll_records()
+    cancel_requested = threading.Event()
+    completed = threading.Event()
+    waiting = threading.Event()
+    pending = MagicMock()
+    pending.is_ready.return_value = False
+    pending.cancel.side_effect = cancel_requested.set
+
+    def wait() -> None:
+        waiting.set()
+        assert completed.wait(2)
+        raise _FakeFDBError(1101)
+
+    pending.wait.side_effect = wait
+    consumer.acknowledge.side_effect = [pending, MagicMock()]
+    failures = []
+
+    def acknowledge() -> None:
+        try:
+            listener.acknowledge()
+        except CDCRetryableError as exc:
+            failures.append(exc)
+
+    worker = threading.Thread(target=acknowledge)
+    worker.start()
+    try:
+        assert cancel_requested.wait(2)
+        assert waiting.wait(2)
+        assert worker.is_alive()
+        assert listener._pending_future is pending
+        assert not failures
+        consumer.acknowledge.assert_called_once()
+    finally:
+        completed.set()
+        worker.join(2)
+    assert not worker.is_alive()
+    assert len(failures) == 1
+    assert listener.awaiting_ack
+    listener.acknowledge()
+    assert consumer.acknowledge.call_count == 2
+    consumer.consume.assert_called_once()
+
+
+@pytest.mark.parametrize("code", [None, 1007, 1211])
+def test_ack_timeout_preserves_result_racing_with_cancellation(
+    code: int | None,
+) -> None:
+    listener, _, consumer = _listener_with_batch(
+        MockConsumeResult([], 100), ack_timeout_seconds=0.001
+    )
+    listener.poll_records()
+    future = MagicMock()
+    future.is_ready.return_value = False
+    future.wait.side_effect = None if code is None else _FakeFDBError(code)
+    consumer.acknowledge.return_value = future
+    error_type = CDCTerminalError if code == 1007 else CDCRetryableError
+    with pytest.raises(error_type) as error:
+        listener.acknowledge()
+    future.cancel.assert_called_once()
+    future.wait.assert_called_once()
+    assert error.value.code == code
+
+
+@pytest.mark.parametrize("resumed", [False, True])
+def test_shutdown_before_ack_preserves_closed_error(resumed: bool) -> None:
+    listener, client, consumer = _listener_with_batch(MockConsumeResult([], 100))
+    if resumed:
+        listener.initial_cursor = MockCursor(1, 100)
+        client.resume_cdc_consumer.return_value = consumer
+        client.get_read_version.return_value = 100
+    else:
+        listener.poll_records()
+    listener.cancel_pending()
+    with pytest.raises(CDCConsumerClosedError):
+        listener.start() if resumed else listener.acknowledge()
+    consumer.acknowledge.assert_not_called()

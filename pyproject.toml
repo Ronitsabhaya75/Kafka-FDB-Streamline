@@ -15,6 +15,9 @@ dependencies = [
     "protobuf>=7.34,<8",
 ]
 
+[project.scripts]
+streamline-daemon = "fdb_kafka_bridge.bridge.cli:main"
+
 [tool.setuptools]
 packages = [
     "fdb_kafka_bridge",
