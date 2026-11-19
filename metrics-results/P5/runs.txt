@@ -1,0 +1,10 @@
+before@8fc47ec 1 us/mutation: checks 0.53 build-msgs 1.64 bytesize 0.18 whole-group 3.10 reparse 0.06 reencode 0.06 pickle-rt(natives) 0.22
+after@ca8fab9 1 us/mutation: checks 0.20 build-msgs 1.62 bytesize 0.19 whole-group 2.79 reparse 0.05 reencode 0.06 pickle-rt(natives) 0.22
+before@8fc47ec 2 us/mutation: checks 0.53 build-msgs 1.63 bytesize 0.18 whole-group 3.14 reparse 0.06 reencode 0.06 pickle-rt(natives) 0.21
+after@ca8fab9 2 us/mutation: checks 0.20 build-msgs 1.63 bytesize 0.19 whole-group 2.80 reparse 0.06 reencode 0.06 pickle-rt(natives) 0.22
+before@8fc47ec 3 us/mutation: checks 0.53 build-msgs 1.64 bytesize 0.18 whole-group 3.09 reparse 0.05 reencode 0.06 pickle-rt(natives) 0.22
+after@ca8fab9 3 us/mutation: checks 0.20 build-msgs 1.64 bytesize 0.18 whole-group 2.81 reparse 0.05 reencode 0.06 pickle-rt(natives) 0.22
+before@8fc47ec 4 us/mutation: checks 0.53 build-msgs 1.64 bytesize 0.18 whole-group 3.11 reparse 0.06 reencode 0.07 pickle-rt(natives) 0.25
+after@ca8fab9 4 us/mutation: checks 0.20 build-msgs 1.65 bytesize 0.18 whole-group 2.78 reparse 0.05 reencode 0.06 pickle-rt(natives) 0.22
+before@8fc47ec 5 us/mutation: checks 0.54 build-msgs 1.66 bytesize 0.18 whole-group 3.15 reparse 0.05 reencode 0.06 pickle-rt(natives) 0.21
+after@ca8fab9 5 us/mutation: checks 0.21 build-msgs 1.66 bytesize 0.18 whole-group 3.00 reparse 0.05 reencode 0.06 pickle-rt(natives) 0.23

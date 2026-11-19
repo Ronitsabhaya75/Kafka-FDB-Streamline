@@ -1,0 +1,35 @@
+import time, os, pickle
+from types import SimpleNamespace as NS
+from fdb_kafka_bridge.serialization import _checks, _wire
+from fdb_kafka_bridge.serialization.version_group import serialize_version_group
+from fdbkafka.cdc.v1 import mutations_pb2 as pb
+N=3000
+muts=[NS(type=0,param1=os.urandom(24),param2=os.urandom(100)) for _ in range(N)]
+def t(f,r=50):
+    s=time.perf_counter()
+    for _ in range(r): out=f()
+    return (time.perf_counter()-s)/r*1e6/N, out
+c,_=t(lambda:_checks.natives(muts))
+nat=_checks.natives(muts)
+m,msgs=t(lambda:_wire.mutation_messages(nat,fdb_version=1))
+sz,_=t(lambda:[x.ByteSize() for x in msgs])
+g,recs=t(lambda:serialize_version_group(muts,fdb_version=1,max_record_bytes=1<<20,stream_name="s",bridge_timestamp_ns=1))
+p,objs=t(lambda:[pb.FDBMutationRecord.FromString(d) for d in recs])
+e,_=t(lambda:[o.SerializeToString() for o in objs])
+pk,_=t(lambda:pickle.loads(pickle.dumps(nat)))
+print(f"us/mutation: checks {c:.2f} build-msgs {m:.2f} bytesize {sz:.2f} whole-group {g:.2f} reparse {p:.2f} reencode {e:.2f} pickle-rt(natives) {pk:.2f}")
+def vi(n):
+    out=bytearray()
+    while True:
+        b=n&0x7f; n>>=7
+        if n: out.append(b|0x80)
+        else: out.append(b); return bytes(out)
+def ld(tag,payload): return bytes([tag])+vi(len(payload))+payload
+def raw_mut(t_,k,v,ver,seq):
+    idx=b"\x08"+vi(ver)+(b"\x10"+vi(seq) if seq else b"")
+    if t_==1: body=ld(0x1a,ld(0x0a,k)+ld(0x12,v))
+    else: body=ld(0x12,(ld(0x0a,k) if k else b"")+(ld(0x12,v) if v else b"")+(b"\x18"+vi(t_) if t_ else b""))
+    return ld(0x0a,idx)+body
+r,raw=t(lambda:[raw_mut(*n,1,i) for i,n in enumerate(nat)])
+assert b"".join(ld(0x0a,x) for x in raw)==pb.FDBMutationBatch(mutations=msgs).SerializeToString()
+print(f"hand-rolled wire: {r:.2f} us/mutation (byte-identical)")
