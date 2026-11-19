@@ -241,9 +241,9 @@ def test_stop_does_not_hang_behind_idle_step(wiring: dict[str, MagicMock]) -> No
     bridge.start()
     listener = bridge._listener
     unblock = threading.Event()
-    listener.close.side_effect = lambda: unblock.set()
+    listener.cancel_pending.side_effect = lambda: unblock.set()
 
-    # Simulate step() parked in consume().wait() until the listener closes.
+    # Simulate a native consume that only future cancellation unblocks.
     held = threading.Event()
 
     def _park() -> None:
@@ -284,7 +284,7 @@ def test_stop_skips_commit_retry_while_step_still_running(
     worker.start()
     held.wait()
     try:
-        with patch.object(pipeline, "step") as step:
+        with patch.object(pipeline, "step") as step, pytest.raises(TimeoutError):
             bridge.stop()
         step.assert_not_called()
     finally:
@@ -304,3 +304,131 @@ def test_checkpoint_round_trips_through_stream_check(tmp_path: Any) -> None:
 
     cursor = _load_cursor_from_file(cursor_file, stream_name="s")
     assert (cursor.stream_id, cursor.last_consumed_version) == (7, 42)
+
+
+def test_unresponsive_close_cannot_extend_total_shutdown_budget(
+    wiring: dict[str, MagicMock],
+) -> None:
+    bridge = Bridge(_config())
+    bridge.start()
+    producer = bridge._producer
+    release = threading.Event()
+    producer.close.side_effect = lambda **_: release.wait(3)
+    began = time.monotonic()
+    try:
+        with pytest.raises(TimeoutError, match="total shutdown"):
+            bridge.stop()
+        elapsed = time.monotonic() - began
+        assert 0.15 <= elapsed < 0.6
+        assert producer.close.call_args.kwargs["timeout"] <= 0.2
+    finally:
+        release.set()
+
+
+def test_shutdown_during_rebuild_skips_new_listener_poll(
+    wiring: dict[str, MagicMock],
+) -> None:
+    config = from_dict(
+        {
+            "cdc": {"stream_name": "s"},
+            "pipeline": {"backoff_base_seconds": 0.001, "shutdown_timeout_seconds": 2},
+        }
+    )
+    bridge = Bridge(config)
+    bridge.start()
+    client = bridge._client
+    old_pipeline = bridge._pipeline
+    replacement = _listener()
+    rebuilding, release = threading.Event(), threading.Event()
+    failures: list[BaseException] = []
+
+    def build_listener(*args: Any, **kwargs: Any) -> MagicMock:
+        rebuilding.set()
+        assert release.wait(2)
+        return replacement
+
+    def run() -> None:
+        try:
+            bridge.run()
+        except BaseException as exc:
+            failures.append(exc)
+
+    def stop() -> None:
+        try:
+            bridge.stop()
+        except BaseException as exc:
+            failures.append(exc)
+
+    wiring["listener_cls"].side_effect = build_listener
+    with (
+        patch.object(old_pipeline, "step", side_effect=RuntimeError("rebuild")),
+        patch.object(bridge, "_needs_rebuild", return_value=True),
+    ):
+        worker = threading.Thread(target=run)
+        closer = threading.Thread(target=stop)
+        worker.start()
+        try:
+            assert rebuilding.wait(2)
+            assert bridge._listener is None
+            closer.start()
+            assert bridge._shutdown_requested.wait(2)
+        finally:
+            release.set()
+            worker.join(3)
+            if closer.ident is not None:
+                closer.join(3)
+    assert not worker.is_alive()
+    assert not closer.is_alive()
+    assert not failures
+    replacement.poll_records.assert_not_called()
+    replacement.acknowledge.assert_not_called()
+    replacement.close.assert_called_once()
+    client.close.assert_called_once()
+    assert bridge._listener is None
+    assert bridge._producer is None
+
+
+def test_run_after_stop_is_a_clean_noop(wiring: dict[str, MagicMock]) -> None:
+    bridge = Bridge(_config())
+    bridge.start()
+    listener, producer = bridge._listener, bridge._producer
+    bridge.stop()
+    bridge.run()
+    listener.poll_records.assert_not_called()
+    listener.acknowledge.assert_not_called()
+    producer.produce.assert_not_called()
+    assert bridge.metrics.errors_retried == 0
+
+
+def test_sigterm_between_daemon_gate_and_run_returns_cleanly(
+    wiring: dict[str, MagicMock],
+) -> None:
+    import os
+    import signal
+
+    from fdb_kafka_bridge.bridge.cli import run_daemon
+
+    bridge = Bridge(_config())
+    run, stop = bridge.run, bridge.stop
+    closed = threading.Event()
+
+    def late_run() -> None:
+        os.kill(os.getpid(), signal.SIGTERM)
+        assert closed.wait(2)
+        run()
+
+    def stop_then_release(*, deadline: float | None = None) -> None:
+        try:
+            stop(deadline=deadline)
+        finally:
+            closed.set()
+
+    with (
+        patch.object(bridge, "run", side_effect=late_run),
+        patch.object(bridge, "stop", side_effect=stop_then_release),
+    ):
+        run_daemon(bridge)
+    assert closed.is_set()
+    assert bridge._listener is None
+    assert bridge._producer is None
+    assert bridge._client is None

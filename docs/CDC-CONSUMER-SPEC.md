@@ -11,6 +11,12 @@ Schema: [`mutations.proto`](../protobuf/proto/fdbkafka/cdc/v1/mutations.proto).
 
 - **FoundationDB API version:** Strictly gated on API version 800 (`fdb.api_version(800)`).
   Selecting an API version < 800 raises `CDCNotSupportedError`.
+- **Stream mode:** Only unordered native CDC streams are supported. Ordered streams,
+  including single-partition ordered streams, are unsupported: cancelling an ordered
+  acknowledgement can reset the native position backwards before retry succeeds.
+  `CdcStreamInfo` does not expose ordered mode, so the bridge cannot reliably reject it
+  at startup. An ordered stream's replay may then trigger a checkpoint regression.
+  Mode detection and post-ack position validation are follow-up work.
 - **Subspace range alignment:** Stream registration covers `[rawPrefix, strinc(rawPrefix))`,
   ensuring bare prefix and escaped suffix keys are strictly included
   ([CDC deep dive §2.5](CDC-DEEP-DIVE.md#25-registering-a-directorys-range-)).
@@ -70,6 +76,7 @@ class FDBClient:
     def register_cdc_stream(self, name: bytes | str, begin_key: bytes, end_key: bytes) -> int: ...
     def create_cdc_consumer(self, name: bytes | str) -> Any: ...
     def resume_cdc_consumer(self, cursor: Any) -> Any: ...
+    def validate_resume_cursor(self, name: bytes | str, cursor: Any) -> None: ...
     def remove_cdc_stream(self, name: bytes | str) -> None: ...
     def list_cdc_streams(self) -> list[Any]: ...
     def get_read_version(self) -> int: ...
@@ -90,12 +97,16 @@ class FDBMutationListener:
         max_record_bytes: int | None = None,
         resume_timeout_seconds: float = 10.0,
         resume_poll_interval_seconds: float = 0.05,
+        ack_timeout_seconds: float = 5.0,
+        proxy_consume_poll_timeout_seconds: float = 5.0,
+        before_ack: Callable[[], None] | None = None,
         idle_ack_max_replies: int | None = None,
         idle_ack_max_seconds: float | None = None,
     ) -> None: ...
 
     def start(self) -> None: ...
     def close(self) -> None: ...
+    def cancel_pending(self) -> None: ...
     def poll_records(self, bridge_timestamp_ns: int | None = None) -> list[mutations_pb2.FDBMutationRecord]: ...
     def acknowledge(self) -> None: ...
     def get_position(self) -> Any: ...
@@ -103,6 +114,9 @@ class FDBMutationListener:
 
 Supply exactly one of `key_range` or `subspace` to register a stream when the listener
 starts. Omit both to consume a stream registered elsewhere. Supplying both is invalid.
+The listener's `before_ack` callback runs before restoring a resumed acknowledgement.
+The independent `BridgePipeline.before_ack` hook runs before every normal ack attempt,
+including retries.
 Leave both `idle_ack_*` bounds `None` for per-reply idle acks; set either to coalesce
 idle replies (§1). N must be an `int` >= 1 and T a finite `int` or `float` > 0 (`bool`
 rejected); wrong types raise `TypeError`, bad values `ValueError`.
@@ -139,12 +153,14 @@ otherwise used as given; the caller owns the full budget, see
 - `CDCInvalidRangeError`: Invalid key range supplied.
 - `CDCConsumeError`: Base for a failed native `consume`/`acknowledge`. Carries the
   native FoundationDB `code` on the surface, not behind `__cause__`.
-  - `CDCRetryableError`: `server_overloaded` (1211). Retry with bounded backoff;
+  - `CDCRetryableError`: `server_overloaded` (1211) or an acknowledgement timeout. Retry with bounded backoff;
     if it repeats at one commit version it is the L1 poison pill — escalate, do
     not spin.
   - `CDCTerminalError`: `transaction_too_old` (1007) or `client_invalid_operation`
-    (2000). Do not retry; 1007 means rebuild, and the narrow ≤5 s retry-once case
-    for 2000 is the caller's to implement from `code`.
+    (2000). 1007 requires operator recovery. The listener retries 2000 only on the
+    first consume of each new handle (fresh or resume), within
+    `proxy_consume_poll_timeout_seconds`, then
+    raises it as terminal. Match that setting to the server's consume poll timeout.
 
 Only these three CDC error codes are classified ([CDC deep dive §3](CDC-DEEP-DIVE.md#errors-we-have-to-map-),
 whose standard `is_retryable` predicate is wrong about two of them). Any other native
@@ -156,3 +172,29 @@ non-native consume/ack failure is wrapped as `CDCError` with the original as its
 Unit tests run without FoundationDB. The live-cluster integration test is skipped unless
 `FDB_CDC_INTEGRATION=1` is set in an environment containing the API-800 Python bindings,
 CDC-enabled client library, and a reachable CDC-enabled cluster.
+
+## Durable FDB checkpoints
+
+`fdb_kafka_bridge.cdc` exports `CheckpointStore`, `CheckpointCursor`, `SinkIdentity`
+and the checkpoint error classes. The store validates Kafka destination identity
+and cursor monotonicity before advancing. See [FDB checkpoints](FDB-CHECKPOINT-SPEC.md)
+for the storage layout, overlap guards and bridge integration.
+
+
+Resume checks the current stream registration and requires `cursor + 1 >= min_version`
+before restoring an ack. A stale cursor raises `CDCInvalidCursorError`. Both restored
+and normal ack futures use `ack_timeout_seconds`; expiry explicitly cancels the future
+and waits for cancellation completion before returning a retryable timeout. Only native
+1101 (`operation_cancelled`) is suppressed; a racing success still permits safe ack
+retry, while other native errors keep their original classification. The delivered
+reply remains pending for retry. Waiting for cancellation can exceed the ack timeout;
+the daemon's separate total shutdown deadline still bounds process teardown.
+`cancel_pending()` prevents new operations and cancels a parked consume. Restored and
+normal acknowledgement paths preserve `CDCConsumerClosedError` when shutdown prevents
+an operation, rather than wrapping it as a generic `CDCError`. `close()` cancels any
+pending future before releasing the handle; closing the native handle alone does not
+cancel a consume.
+
+Native-client deployment requirements, including the `release-8.0` future-lifetime
+fix required for off-network-thread cancellation/release, are in
+[FDB checkpoint specification](FDB-CHECKPOINT-SPEC.md#native-client-minimum).

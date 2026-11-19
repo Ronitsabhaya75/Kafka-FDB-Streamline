@@ -141,3 +141,15 @@ def test_resolved_foundationdb_matches_dockerfile_minor(
         "import importlib.metadata as m; print(m.version('foundationdb'))"
     ).strip()
     assert resolved.split(".")[:2] == docker_version[1].split(".")[:2]
+
+
+def test_daemon_entrypoint_outside_checkout(installed: InstalledWheel) -> None:
+    output = installed.run(
+        "import pathlib, subprocess, sys; "
+        "script = pathlib.Path(sys.executable).with_name('streamline-daemon'); "
+        "result = subprocess.run([str(script), '--help'], "
+        "capture_output=True, text=True); "
+        "assert result.returncode == 0, result.stderr; print(result.stdout)"
+    )
+    assert "--checkpoint-path" in output
+    assert "--transactional-id" in output

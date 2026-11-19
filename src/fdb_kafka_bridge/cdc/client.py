@@ -22,6 +22,7 @@ MINIMUM_CDC_API_VERSION: Final[int] = 800
 # Native FoundationDB error codes the consumer classifies explicitly.
 # See CDC-DEEP-DIVE.md §3 "Errors we have to map".
 FDB_TRANSACTION_TOO_OLD: Final[int] = 1007
+FDB_OPERATION_CANCELLED: Final[int] = 1101
 FDB_SERVER_OVERLOADED: Final[int] = 1211
 FDB_CLIENT_INVALID_OPERATION: Final[int] = 2000
 
@@ -298,6 +299,29 @@ class FDBClient:
             return self.db.resume_cdc_consumer(cursor).wait()
         except RuntimeError as exc:
             _translate_cdc_runtime_error(exc)
+
+    def validate_resume_cursor(self, name: bytes | str, cursor: Any) -> None:
+        """Reject a resumed cursor whose required history is no longer retained.
+
+        Args:
+            name: Registered stream name.
+            cursor: Last durably delivered cursor.
+
+        Raises:
+            CDCInvalidCursorError: If the registration changed or history was lost.
+        """
+        stream = next(
+            (s for s in self.list_cdc_streams() if s.name == _to_bytes(name)), None
+        )
+        if stream is None or stream.stream_id != cursor.stream_id:
+            raise CDCInvalidCursorError(
+                "Checkpoint stream registration is missing or changed"
+            )
+        if cursor.last_consumed_version + 1 < stream.min_version:
+            raise CDCInvalidCursorError(
+                f"Checkpoint {cursor.last_consumed_version} precedes retained history "
+                f"{stream.min_version}; operator recovery is required"
+            )
 
     def remove_cdc_stream(self, name: bytes | str) -> None:
         """Remove a registered CDC stream by name.
