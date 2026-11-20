@@ -739,5 +739,81 @@ def test_cdc_batch_fixtures_and_timestamp(
         assert parsed.bridge_timestamp.seconds == sample_timestamp.seconds
 
 
+class TestFDBDirectoryContext(unittest.TestCase):
+    """Tests for the FDBDirectoryContext message."""
+
+    def test_create_and_serialize(self) -> None:
+        ctx = mutations_pb2.FDBDirectoryContext(
+            path=["tenants", "tenant_a", "orders"],
+            subspace_prefix=b"\x15\x01\xfe",
+        )
+        self.assertEqual(list(ctx.path), ["tenants", "tenant_a", "orders"])
+        self.assertEqual(ctx.subspace_prefix, b"\x15\x01\xfe")
+
+        data = ctx.SerializeToString()
+        parsed = mutations_pb2.FDBDirectoryContext.FromString(data)
+        self.assertEqual(list(parsed.path), ["tenants", "tenant_a", "orders"])
+        self.assertEqual(parsed.subspace_prefix, b"\x15\x01\xfe")
+
+    def test_empty_defaults(self) -> None:
+        ctx = mutations_pb2.FDBDirectoryContext()
+        self.assertEqual(list(ctx.path), [])
+        self.assertEqual(ctx.subspace_prefix, b"")
+
+
+class TestFDBMutationRecordV2Fields(unittest.TestCase):
+    """Tests for v0.2.0 extensions to FDBMutationRecord."""
+
+    def test_record_with_directory_and_source_fields(self) -> None:
+        dir_ctx = mutations_pb2.FDBDirectoryContext(
+            path=["app", "users"],
+            subspace_prefix=b"\x01\x02",
+        )
+        rec = mutations_pb2.FDBMutationRecord(
+            stream_name="user_stream",
+            directory=dir_ctx,
+            stream_id=123456789,
+            source_id="fdb-cluster-us-east",
+            version_end=mutations_pb2.VersionEnd(fdb_version=5000),
+        )
+
+        data = rec.SerializeToString()
+        parsed = mutations_pb2.FDBMutationRecord.FromString(data)
+        self.assertEqual(parsed.stream_name, "user_stream")
+        self.assertTrue(parsed.HasField("directory"))
+        self.assertEqual(list(parsed.directory.path), ["app", "users"])
+        self.assertEqual(parsed.directory.subspace_prefix, b"\x01\x02")
+        self.assertEqual(parsed.stream_id, 123456789)
+        self.assertEqual(parsed.source_id, "fdb-cluster-us-east")
+        self.assertEqual(parsed.version_end.fdb_version, 5000)
+
+    def test_record_without_v2_fields_backward_compatible(self) -> None:
+        rec = mutations_pb2.FDBMutationRecord(
+            stream_name="legacy_stream",
+            version_end=mutations_pb2.VersionEnd(fdb_version=1000),
+        )
+        data = rec.SerializeToString()
+        parsed = mutations_pb2.FDBMutationRecord.FromString(data)
+        self.assertEqual(parsed.stream_name, "legacy_stream")
+        self.assertFalse(parsed.HasField("directory"))
+        self.assertFalse(parsed.HasField("stream_id"))
+        self.assertFalse(parsed.HasField("source_id"))
+
+    def test_record_stream_id_zero_presence(self) -> None:
+        rec = mutations_pb2.FDBMutationRecord(
+            stream_name="zero_stream",
+            stream_id=0,
+            source_id="fdb-src",
+            version_end=mutations_pb2.VersionEnd(fdb_version=1000),
+        )
+        data = rec.SerializeToString()
+        parsed = mutations_pb2.FDBMutationRecord.FromString(data)
+        self.assertEqual(parsed.stream_name, "zero_stream")
+        self.assertTrue(parsed.HasField("stream_id"))
+        self.assertEqual(parsed.stream_id, 0)
+        self.assertTrue(parsed.HasField("source_id"))
+        self.assertEqual(parsed.source_id, "fdb-src")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -7,6 +7,8 @@ is a real regression. Each literal is the bytes of the equivalent hand-built
 """
 
 from fdb_kafka_bridge.serialization import (
+    FDBDirectoryContext,
+    deserialize_record,
     serialize_batch,
     serialize_mutation,
     serialize_version_end,
@@ -30,7 +32,13 @@ G4 = bytes.fromhex(
     "1003120d0a0415016b001203ff007618020a140a090887808080802010041a070a01"
     "61120262ff"
 )
-GOLDEN = (G1, G2, G3, G4)
+G5 = bytes.fromhex(
+    "0a066f7264657273120b0880e2cfaa0610959aef3a1a1a0a09088780808080201003"
+    "120d0a0415016b001203ff0076180232170a0774656e616e74730a0874656e616e74"
+    "2d6112021501382a4208736f757263652d31"
+)
+DIRECTORY_RECORD_GOLDEN = G5
+GOLDEN = (G1, G2, G3, G4, G5)
 
 
 def test_single_key_mutation_record_bytes() -> None:
@@ -49,3 +57,24 @@ def test_batch_record_bytes() -> None:
     data = serialize_batch([ADD, CLEAR], fdb_version=V, first_sequence_no=3, **ENV)
 
     assert data == G4
+
+
+def test_directory_record_golden_bytes() -> None:
+    dir_ctx = FDBDirectoryContext(
+        path=("tenants", "tenant-a"),
+        subspace_prefix=b"\x15\x01",
+    )
+    wire = serialize_mutation(
+        ADD,
+        fdb_version=V,
+        sequence_no=3,
+        directory=dir_ctx,
+        stream_id=42,
+        source_id="source-1",
+        **ENV,
+    )
+    assert wire == DIRECTORY_RECORD_GOLDEN
+    rec = deserialize_record(wire)
+    assert rec.directory == dir_ctx
+    assert rec.stream_id == 42
+    assert rec.source_id == "source-1"

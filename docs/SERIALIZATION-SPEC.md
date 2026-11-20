@@ -44,17 +44,21 @@ Ranges (inclusive; the limits are not exported):
 | `fdb_version` | 0..2**63-1 |
 | `sequence_no`, `total_mutations` | 0..2**32-1 |
 | `bridge_timestamp_ns` | 0..9999-12-31T23:59:59.999999999Z |
+| `stream_id` | 0..2**64-1 |
+| `source_id` | non-empty UTF-8 `str` |
+| `directory` | `FDBDirectoryContext(path=tuple[str, ...], subspace_prefix=bytes)` with non-empty UTF-8 path elements and non-empty prefix |
 
 ### 2.2 Serialize
 
 All arguments after the first are keyword-only and required, except `first_sequence_no`
-(default `0`). `bridge_timestamp_ns` is integer nanoseconds since the Unix epoch.
+(default `0`) and v0.2.0 envelope fields (`directory`, `stream_id`, `source_id`, which default to `None`).
+`bridge_timestamp_ns` is integer nanoseconds since the Unix epoch.
 
 ```python
-serialize_mutation(mutation, *, fdb_version, sequence_no, stream_name, bridge_timestamp_ns) -> bytes
-serialize_batch(mutations, *, fdb_version, first_sequence_no=0, stream_name, bridge_timestamp_ns) -> bytes
-serialize_version_end(*, fdb_version, total_mutations, stream_name, bridge_timestamp_ns) -> bytes
-serialize_version_group(mutations, *, fdb_version, max_record_bytes, stream_name, bridge_timestamp_ns) -> list[bytes]
+serialize_mutation(mutation, *, fdb_version, sequence_no, stream_name, bridge_timestamp_ns, directory=None, stream_id=None, source_id=None) -> bytes
+serialize_batch(mutations, *, fdb_version, first_sequence_no=0, stream_name, bridge_timestamp_ns, directory=None, stream_id=None, source_id=None) -> bytes
+serialize_version_end(*, fdb_version, total_mutations, stream_name, bridge_timestamp_ns, stream_id=None, source_id=None) -> bytes
+serialize_version_group(mutations, *, fdb_version, max_record_bytes, stream_name, bridge_timestamp_ns, stream_id=None, source_id=None, directory_resolver=None, strict_directory_clears=False) -> list[bytes]
 ```
 
 - **`serialize_mutation`**: one mutation record at version index `(fdb_version, sequence_no)`.
@@ -66,21 +70,29 @@ serialize_version_group(mutations, *, fdb_version, max_record_bytes, stream_name
   Filtering corrupts the dedup identity.
 - **`serialize_version_end`**: one version-end record. `total_mutations` counts native mutations in
   the whole group, however it was sliced; `0` means none at this version (an empty group and an
-  idle watermark are the same record).
+  idle watermark are the same record). VersionEnd remains stream-wide; no directory prefix is accepted.
 - **`serialize_version_group`**: the whole group as batch records covering `(fdb_version, 0) …
   (fdb_version, n-1)` in order, then exactly one version end with `total_mutations == n`. An
-  empty group returns only the version end. *Caller precondition:* `mutations` is the whole
-  group.
-  - `max_record_bytes` bounds `len()` of each returned value only; Kafka key, headers and
-    framing are the caller's to subtract ([Record size](KAFKA-PRODUCER-SPEC.md#record-size)).
-  - Slicing is greedy in native order; each batch record is byte-identical to
-    `serialize_batch` of its slice.
+  empty group returns only the version end.
+  *Caller preconditions:*
+  - `mutations` is the whole version group. Caller must pass the whole group.
+  - Slicing is greedy in native order. Batches are split whenever the resolved directory context
+    changes or when the next mutation would push the record over `max_record_bytes`.
+  - Every batch record returned is byte-identical to `serialize_batch` of its slice with the
+    resolved directory.
+  - Native sequence numbers are assigned before splitting and native mutation order is strictly
+    preserved (mutations are never regrouped by directory in a way that reorders them).
   - A mutation is never split. If one mutation's one-element batch record, or the version-end
     record, exceeds the budget → `RecordTooLargeError`.
+  - An ambiguous clear range crossing directory boundaries preserves the native clear unchanged
+    and omits directory context on that batch; under `strict_directory_clears=True`, it raises
+    `InputValueError`.
+  - When `strict_directory_clears=True`, `directory_resolver` is required. Calling with
+    `strict_directory_clears=True` and `directory_resolver=None` raises `InputValueError`.
   - Returns a list, so an invalid mutation anywhere raises before any record is produced.
 
 The primitives have no size cap. Sizing: FDB caps keys at 10,000 B and values at 100,000 B, so
-a budget of 128 KiB plus the stream name's length never raises on real CDC data.
+a budget of 128 KiB plus the stream name, source ID, and directory prefix bytes never raises on real CDC data.
 
 ### 2.3 Deserialize
 
@@ -92,7 +104,8 @@ Output values are frozen, slotted dataclasses (compared field-wise, hashable):
 
 | Type | Fields |
 |---|---|
-| `Record` | `stream_name: str`, `bridge_timestamp_ns: int \| None`, `body: RecordBody` |
+| `Record` | `stream_name: str`, `bridge_timestamp_ns: int \| None`, `body: RecordBody`, `directory: FDBDirectoryContext \| None`, `stream_id: int \| None`, `source_id: str \| None` |
+| `FDBDirectoryContext` | `path: tuple[str, ...]`, `subspace_prefix: bytes` |
 | `RecordBody` | `Mutation \| MutationBatch \| VersionEnd` |
 | `Mutation` | `type: int`, `param1: bytes`, `param2: bytes`, `version_index: VersionIndex` |
 | `MutationBatch` | `mutations: tuple[Mutation, ...]` |
@@ -104,9 +117,31 @@ Guarantees on every returned `Record`: `type` is a plain `int` in 0..255; versio
 Every returned `Mutation` / `MutationBatch` can be re-serialized (`Mutation` satisfies
 `NativeMutation`). A returned `VersionEnd` is not always a valid
 `serialize_version_end` input: its `bridge_timestamp_ns` may be `None` or outside the
-serializer range. Metadata carries no guarantee: `stream_name` may be `""`, and
+serializer range. A `VersionEnd` record on wire carrying a `directory` field is rejected as `MALFORMED_WIRE`.
+Metadata carries no guarantee: `stream_name` may be `""`, and
 `Record.bridge_timestamp_ns` and `VersionEnd.bridge_timestamp_ns` may each be `None`
 (absent) or outside the serializer's range. They are read independently of each other.
+
+### 2.4 Control-plane state serialization
+
+Defined in `fdbkafka.bridge.state.v1` ([`state.proto`](../protobuf/proto/fdbkafka/bridge/state/v1/state.proto))
+and handled by `serialize_checkpoint`, `deserialize_checkpoint`, `serialize_leader_lease`, and
+`deserialize_leader_lease`:
+
+```python
+serialize_checkpoint(checkpoint: CDCCheckpoint) -> bytes
+deserialize_checkpoint(data: bytes) -> CDCCheckpoint
+serialize_leader_lease(lease: LeaderLease) -> bytes
+deserialize_leader_lease(data: bytes) -> LeaderLease
+```
+
+| State Type | Fields |
+|---|---|
+| `KafkaSinkIdentity` | `cluster_id: str`, `topic: str` |
+| `CDCCheckpoint` | `format_version: int`, `source_id: str`, `stream_name: str`, `last_consumed_version: int`, `sink: KafkaSinkIdentity`, `updating_instance_id: str`, `update_timestamp_ns: int`, `lease_epoch: int`, `stream_id: int \| None`, `range_config_fingerprint: bytes` |
+| `LeaderLease` | `format_version: int`, `source_id: str`, `stream_name: str`, `owner_instance_id: str`, `lease_epoch: int`, `heartbeat_sequence: int`, `expiration_timestamp_ns: int`, `stream_id: int \| None` |
+
+See [`BRIDGE-STATE-SPEC.md`](BRIDGE-STATE-SPEC.md) for full control-plane contract and recovery invariants.
 
 ## 3. Wire format
 
@@ -116,8 +151,11 @@ serializer range. Metadata carries no guarantee: `stream_name` may be `""`, and
 | any other `type` in 0..255, declared or not | `FDBMutation.single_key_mutation` (`key = param1`, `value = param2`, `mutation_type = type`, raw int) |
 | `fdb_version`, sequence position | `FDBMutation.version_index`, always present (incl. `(0, 0)`) |
 | `fdb_version`, `total_mutations` | `version_end` arm |
-| `stream_name` | `stream_name` |
-| `bridge_timestamp_ns` | `bridge_timestamp`, always present (incl. `0`); on a version end also `VersionEnd.bridge_timestamp`, same value |
+| `stream_name` | `stream_name` (field 1) |
+| `bridge_timestamp_ns` | `bridge_timestamp` (field 2), always present (incl. `0`); on a version end also `VersionEnd.bridge_timestamp`, same value |
+| `directory` | `directory` (field 6): `FDBDirectoryContext(path, subspace_prefix)` |
+| `stream_id` | `stream_id` (field 7, optional uint64, distinguishes unset from 0) |
+| `source_id` | `source_id` (field 8, optional string) |
 
 Record body: `serialize_mutation` → `mutation` arm, `serialize_batch` / group slices → `batch`
 arm, version end → `version_end` arm.
@@ -136,7 +174,11 @@ surfaces as `VersionEnd.bridge_timestamp_ns`. Unknown fields are ignored. An abs
 | `type` | not `int`, or `bool` | outside 0..255 |
 | `param1`, `param2` | not `bytes` (incl. `bytearray`, `memoryview`, `None`) | — |
 | `stream_name` | not `str` | `""`, or not UTF-8-encodable |
+| `source_id` | not `str` (when not `None`) | `""`, not UTF-8-encodable, or set without `stream_id` |
+| `stream_id` | not `int` (when not `None`) | outside `0..2**64 - 1`, or set without `source_id` |
+| `directory` | not `FDBDirectoryContext`, `subspace_prefix` not `bytes`, or `path` not tuple of `str` | empty `subspace_prefix`, all-`\xff` `subspace_prefix`, empty `path`, `path` element not UTF-8-encodable, or mutation key/range outside prefix |
 | other integer keywords | `type(x) is not int` (rejects `bool`, `IntEnum`, `float`) | outside its range in §2.1; `max_record_bytes < 1`; an assigned `sequence_no` past 2**32-1 |
+| strict clear range | — | ambiguous clear range crossing boundaries or unresolved under `strict_directory_clears=True`; `strict_directory_clears=True` without `directory_resolver` |
 
 - The type code alone accepts `IntEnum` (upstream `CdcMutationType`), normalized to plain `int`.
 - Not checked: FDB key/value size limits, system keys, empty keys/values, clear-range order,
@@ -148,10 +190,11 @@ surfaces as `VersionEnd.bridge_timestamp_ns`. Unknown fields are ignored. An abs
 
 ```
 SerializationError(Exception)
-├── InputTypeError(SerializationError, TypeError)      .field, .index
-├── InputValueError(SerializationError, ValueError)    .field, .index
-│   └── RecordTooLargeError                            .record_bytes, .max_record_bytes
-└── RecordDecodeError(SerializationError, ValueError)  .reason: DecodeFailure, .index
+├── InputTypeError(SerializationError, TypeError)        .field, .index
+├── InputValueError(SerializationError, ValueError)      .field, .index
+│   └── RecordTooLargeError                              .record_bytes, .max_record_bytes
+├── RecordDecodeError(SerializationError, ValueError)    .reason: DecodeFailure, .index
+└── StateDecodeError(SerializationError, ValueError)     .reason: DecodeFailure
 ```
 
 - `field` is the parameter or attribute name as spelled in the public API (`"data"` for
@@ -160,8 +203,9 @@ SerializationError(Exception)
   `index = None` when the version end is what does not fit.
 - Serialize functions raise only `InputTypeError` / `InputValueError` (and
   `RecordTooLargeError` from `serialize_version_group`). `deserialize_record` raises only
-  `InputTypeError` (non-`bytes` data) / `RecordDecodeError`. No protobuf exception escapes
-  (protobuf's 2 GiB `EncodeError` is unreachable under CDC's 10 MB reply budget).
+  `InputTypeError` (non-`bytes` data) / `RecordDecodeError`. `deserialize_checkpoint` and
+  `deserialize_leader_lease` raise `InputTypeError` or `StateDecodeError`. No protobuf exception
+  escapes.
 - Messages never contain key, value or stream-name content: `bytes` and `str` inputs are
   described by their Python type.
 
@@ -169,21 +213,25 @@ SerializationError(Exception)
 
 | `DecodeFailure` | Condition |
 |---|---|
-| `MALFORMED_WIRE` | protobuf cannot parse (corrupt, truncated, invalid UTF-8 `stream_name`); cause chained |
+| `MALFORMED_WIRE` | protobuf cannot parse bytes or invalid UTF-8 string on wire (cause chained); empty `source_id` or unpaired `stream_id`/`source_id` on wire |
+| `DIRECTORY_MISMATCH` | directory context violation on wire: empty directory path or prefix, `VersionEnd` carrying a directory, or mutation key/range outside directory subspace prefix |
 | `NO_RECORD_ARM` | no `record` arm set: `b""`, foreign bytes, or an arm from a newer schema |
 | `NO_MUTATION_ARM` | mutation with no `mutation` arm set |
 | `MISSING_VERSION_INDEX` | mutation without `version_index` |
-| `VERSION_OUT_OF_RANGE` | `fdb_version > 2**63-1` (the wire field is `uint64`, a native version `int64`) |
+| `VERSION_OUT_OF_RANGE` | `fdb_version > 2**63-1` (the wire field is `uint64`, a native version `int64`) or state version outside `-1..2**63-1` |
 | `TYPE_CODE_OUT_OF_RANGE` | `mutation_type` outside 0..255 |
 | `EMPTY_BATCH` | `batch` arm with no mutations |
 | `INCONSISTENT_BATCH` | mixed `fdb_version`, or `sequence_no[i] != sequence_no[0] + i`; `index` = first offender |
+| `UNSUPPORTED_FORMAT_VERSION` | state format version not in supported format versions (`2` for `CDCCheckpoint`, `1` for `LeaderLease`) |
 
 Arms that are present but all-default (e.g. empty `version_end` → `VersionEnd(0, 0, None)`) are
 accepted: presence is checked, not content.
 
 **Handling.** Input errors are programmer or configuration bugs: the bridge must fail, not skip
 (dropping one mutation breaks its version group), and must not acknowledge. `RecordDecodeError`
-is the only error a reader should route around (skip or dead-letter, and alarm).
+is the only error a reader should route around (skip or dead-letter, and alarm). In contrast,
+control-plane state decode failures (`StateDecodeError`) must **fail closed**; checkpoints and
+leases cannot be skipped or dead-lettered.
 
 ## 6. Reader contract for one version group
 
@@ -200,5 +248,20 @@ across calls, and `deserialize_record` checks one record at a time.
   `(V, 0)` reappearing before the version end means redelivery: discard the partial group
   ([deep-dive §5.1](CDC-DEEP-DIVE.md#51-kafka-record-key-partitioning-and-atomicity-)).
 - Identity is the version index. Never dedup on bytes or on either bridge timestamp; a
-  redelivered group gets new timestamps. The record value names its stream only by
-  `stream_name`, so any stronger stream identity must travel outside it.
+  redelivered group gets new timestamps.
+- **Deduplication identity**:
+  ```python
+  key = deduplication_identity(record, mutation)
+  ```
+  Returns `(source_id, stream_id, fdb_version, sequence_no)` when both `source_id` and `stream_id`
+  are present on the record. If both are `None` (such as on legacy v0.1.0 records), it falls back
+  to `(fdb_version, sequence_no)`. If exactly one of `source_id` or `stream_id` is present, it
+  raises `InputValueError`. Downstream consumers must not mix 2-tuple and 4-tuple key shapes in a
+  single deduplication store across rolling upgrades; state must be partitioned or cleared on schema
+  boundary changes.
+- **Explicit legacy identity helper**:
+  ```python
+  key = legacy_deduplication_identity(mutation)  # returns (fdb_version, sequence_no)
+  ```
+- Bridge timestamps (`bridge_timestamp`, `bridge_timestamp_ns`) are strictly processing timestamps
+  and must **never** be used for ordering or deduplication.

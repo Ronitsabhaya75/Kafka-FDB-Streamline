@@ -20,7 +20,7 @@ from fdb_kafka_bridge.serialization import (
 )
 from fdbkafka.cdc.v1 import mutations_pb2
 from tests.serialization.doubles import CLEAR, ENV, SET, STREAM, TS, V
-from tests.serialization.test_golden_bytes import GOLDEN
+from tests.serialization.test_golden_bytes import G5, GOLDEN
 
 ENVELOPE_ONLY = mutations_pb2.FDBMutationRecord(
     stream_name=STREAM, bridge_timestamp=Timestamp(seconds=1_700_000_000, nanos=5)
@@ -412,11 +412,17 @@ def test_unknown_nested_field_is_ignored() -> None:
     assert deserialize_record(with_unknown) == SET_RECORD
 
 
-@pytest.mark.parametrize("golden", GOLDEN, ids=["G1", "G2", "G3", "G4"])
+@pytest.mark.parametrize("golden", GOLDEN, ids=["G1", "G2", "G3", "G4", "G5"])
 def test_every_proper_prefix_of_a_golden_record_is_undecodable(golden: bytes) -> None:
     for cut in range(len(golden)):
-        with pytest.raises(RecordDecodeError):
+        try:
             deserialize_record(golden[:cut])
+        except RecordDecodeError:
+            pass
+        else:
+            # Trailing optional fields in G5 allow prefixes at exact field boundaries
+            assert golden == G5
+            assert cut in (49, 74, 76)
 
 
 @given(st.binary(max_size=256))

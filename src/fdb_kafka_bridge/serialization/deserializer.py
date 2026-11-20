@@ -11,6 +11,7 @@ from fdb_kafka_bridge.serialization.errors import (
 from fdb_kafka_bridge.serialization.model import (
     _MAX_TYPE_CODE,
     _MAX_VERSION,
+    FDBDirectoryContext,
     Mutation,
     MutationBatch,
     MutationType,
@@ -121,6 +122,43 @@ def _bridge_timestamp_ns(
     return timestamp.seconds * 10**9 + timestamp.nanos
 
 
+def _verify_mutation_in_directory(
+    mutation: Mutation,
+    prefix: bytes,
+    index: int | None,
+) -> None:
+    if mutation.type == MutationType.CLEAR_RANGE.value:
+        if not _checks.is_range_within_subspace(
+            mutation.param1, mutation.param2, prefix
+        ):
+            raise RecordDecodeError(
+                f"clear range{_checks.at(index, label='batch position')} "
+                "falls outside directory subspace prefix",
+                reason=DecodeFailure.DIRECTORY_MISMATCH,
+                index=index,
+            )
+    else:
+        if not mutation.param1.startswith(prefix):
+            raise RecordDecodeError(
+                f"mutation key{_checks.at(index, label='batch position')} "
+                "does not start with directory subspace prefix",
+                reason=DecodeFailure.DIRECTORY_MISMATCH,
+                index=index,
+            )
+
+
+def _verify_directory_bounds(
+    body: RecordBody,
+    directory: FDBDirectoryContext,
+) -> None:
+    prefix = directory.subspace_prefix
+    if isinstance(body, Mutation):
+        _verify_mutation_in_directory(body, prefix, None)
+    elif isinstance(body, MutationBatch):
+        for i, mutation in enumerate(body.mutations):
+            _verify_mutation_in_directory(mutation, prefix, i)
+
+
 def deserialize_record(data: bytes) -> Record:
     """Parse one Kafka record value.
 
@@ -140,8 +178,9 @@ def deserialize_record(data: bytes) -> Record:
     Raises:
         InputTypeError: `data` is not `bytes`.
         RecordDecodeError: The bytes are an undecodable record. `reason` names the
-            failed check and `index` the batch position, if any. For
-            `MALFORMED_WIRE` the protobuf exception is the `__cause__`.
+            failed check and `index` the batch position, if any. For protobuf
+            parse failures `MALFORMED_WIRE` chains the protobuf exception as
+            `__cause__`.
     """
     if not isinstance(data, bytes):
         raise InputTypeError(
@@ -157,8 +196,44 @@ def deserialize_record(data: bytes) -> Record:
             f"{len(data)} bytes are not a parseable FDBMutationRecord",
             reason=DecodeFailure.MALFORMED_WIRE,
         ) from exc
+    directory: FDBDirectoryContext | None = None
+    if message.HasField("directory"):
+        if not message.directory.subspace_prefix or not message.directory.path:
+            raise RecordDecodeError(
+                "directory context on wire has empty path or subspace prefix",
+                reason=DecodeFailure.DIRECTORY_MISMATCH,
+            )
+        directory = FDBDirectoryContext(
+            path=tuple(message.directory.path),
+            subspace_prefix=message.directory.subspace_prefix,
+        )
+    has_stream_id = message.HasField("stream_id")
+    has_source_id = message.HasField("source_id")
+    if has_source_id and not message.source_id:
+        raise RecordDecodeError(
+            "source_id on wire must not be empty",
+            reason=DecodeFailure.MALFORMED_WIRE,
+        )
+    if has_stream_id != has_source_id:
+        raise RecordDecodeError(
+            "stream_id and source_id must both be present or both be omitted",
+            reason=DecodeFailure.MALFORMED_WIRE,
+        )
+    stream_id = message.stream_id if has_stream_id else None
+    source_id = message.source_id if has_source_id else None
+    body = _body(message)
+    if directory is not None:
+        if isinstance(body, VersionEnd):
+            raise RecordDecodeError(
+                "VersionEnd record must not carry directory context",
+                reason=DecodeFailure.DIRECTORY_MISMATCH,
+            )
+        _verify_directory_bounds(body, directory)
     return Record(
         stream_name=message.stream_name,
         bridge_timestamp_ns=_bridge_timestamp_ns(message),
-        body=_body(message),
+        body=body,
+        directory=directory,
+        stream_id=stream_id,
+        source_id=source_id,
     )

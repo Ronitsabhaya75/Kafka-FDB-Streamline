@@ -63,11 +63,13 @@ class DecodeFailure(enum.Enum):
     """Why bytes are not a decodable record. The value is the metric label."""
 
     MALFORMED_WIRE = "malformed_wire"
+    DIRECTORY_MISMATCH = "directory_mismatch"
     NO_RECORD_ARM = "no_record_arm"
     NO_MUTATION_ARM = "no_mutation_arm"
     MISSING_VERSION_INDEX = "missing_version_index"
     TYPE_CODE_OUT_OF_RANGE = "type_code_out_of_range"
     VERSION_OUT_OF_RANGE = "version_out_of_range"
+    UNSUPPORTED_FORMAT_VERSION = "unsupported_format_version"
     EMPTY_BATCH = "empty_batch"
     INCONSISTENT_BATCH = "inconsistent_batch"
 
@@ -87,3 +89,20 @@ class RecordDecodeError(SerializationError, ValueError):
         super().__init__(message)
         self.reason = reason
         self.index = index
+
+
+class StateDecodeError(SerializationError, ValueError):
+    """The bytes are an undecodable bridge control-plane state message.
+
+    Unlike data-plane RecordDecodeError (which readers may dead-letter to
+    maintain stream continuity), control-plane state decode failures must
+    fail closed.
+
+    Attributes:
+        reason: The check that failed.
+    """
+
+    def __init__(self, message: str, *, reason: DecodeFailure) -> None:
+        """Store the failed check."""
+        super().__init__(message)
+        self.reason = reason

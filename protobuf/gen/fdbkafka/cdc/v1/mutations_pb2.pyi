@@ -94,16 +94,30 @@ class FDBMutationBatch(_message.Message):
     mutations: _containers.RepeatedCompositeFieldContainer[FDBMutation]
     def __init__(self, mutations: _Optional[_Iterable[_Union[FDBMutation, _Mapping]]] = ...) -> None: ...
 
+class FDBDirectoryContext(_message.Message):
+    __slots__ = ("path", "subspace_prefix")
+    PATH_FIELD_NUMBER: _ClassVar[int]
+    SUBSPACE_PREFIX_FIELD_NUMBER: _ClassVar[int]
+    path: _containers.RepeatedScalarFieldContainer[str]
+    subspace_prefix: bytes
+    def __init__(self, path: _Optional[_Iterable[str]] = ..., subspace_prefix: _Optional[bytes] = ...) -> None: ...
+
 class FDBMutationRecord(_message.Message):
-    __slots__ = ("stream_name", "bridge_timestamp", "mutation", "version_end", "batch")
+    __slots__ = ("stream_name", "bridge_timestamp", "mutation", "version_end", "batch", "directory", "stream_id", "source_id")
     STREAM_NAME_FIELD_NUMBER: _ClassVar[int]
     BRIDGE_TIMESTAMP_FIELD_NUMBER: _ClassVar[int]
     MUTATION_FIELD_NUMBER: _ClassVar[int]
     VERSION_END_FIELD_NUMBER: _ClassVar[int]
     BATCH_FIELD_NUMBER: _ClassVar[int]
+    DIRECTORY_FIELD_NUMBER: _ClassVar[int]
+    STREAM_ID_FIELD_NUMBER: _ClassVar[int]
+    SOURCE_ID_FIELD_NUMBER: _ClassVar[int]
     stream_name: str
     bridge_timestamp: _timestamp_pb2.Timestamp
     mutation: FDBMutation
     version_end: VersionEnd
     batch: FDBMutationBatch
-    def __init__(self, stream_name: _Optional[str] = ..., bridge_timestamp: _Optional[_Union[_timestamp_pb2.Timestamp, _Mapping]] = ..., mutation: _Optional[_Union[FDBMutation, _Mapping]] = ..., version_end: _Optional[_Union[VersionEnd, _Mapping]] = ..., batch: _Optional[_Union[FDBMutationBatch, _Mapping]] = ...) -> None: ...
+    directory: FDBDirectoryContext
+    stream_id: int
+    source_id: str
+    def __init__(self, stream_name: _Optional[str] = ..., bridge_timestamp: _Optional[_Union[_timestamp_pb2.Timestamp, _Mapping]] = ..., mutation: _Optional[_Union[FDBMutation, _Mapping]] = ..., version_end: _Optional[_Union[VersionEnd, _Mapping]] = ..., batch: _Optional[_Union[FDBMutationBatch, _Mapping]] = ..., directory: _Optional[_Union[FDBDirectoryContext, _Mapping]] = ..., stream_id: _Optional[int] = ..., source_id: _Optional[str] = ...) -> None: ...

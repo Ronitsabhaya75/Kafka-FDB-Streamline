@@ -7,7 +7,7 @@ protobuf swallows a `None` kwarg instead of raising.
 from google.protobuf.message import Message
 from google.protobuf.timestamp_pb2 import Timestamp
 
-from fdb_kafka_bridge.serialization.model import MutationType
+from fdb_kafka_bridge.serialization.model import FDBDirectoryContext, MutationType
 from fdbkafka.cdc.v1 import mutations_pb2
 
 
@@ -17,14 +17,38 @@ def timestamp(bridge_timestamp_ns: int) -> Timestamp:
     return Timestamp(seconds=seconds, nanos=nanos)
 
 
-def record(stream_name: str, bridge_timestamp_ns: int, **body: Message) -> bytes:
+def directory_message(
+    directory: FDBDirectoryContext,
+) -> mutations_pb2.FDBDirectoryContext:
+    """Build an FDBDirectoryContext protobuf message."""
+    return mutations_pb2.FDBDirectoryContext(
+        path=directory.path,
+        subspace_prefix=directory.subspace_prefix,
+    )
+
+
+def record(
+    stream_name: str,
+    bridge_timestamp_ns: int,
+    *,
+    directory: FDBDirectoryContext | None = None,
+    stream_id: int | None = None,
+    source_id: str | None = None,
+    **body: Message,
+) -> bytes:
     """An `FDBMutationRecord`'s bytes: the envelope plus the `body` oneof, if any."""
-    # The constructor kwarg keeps a zero Timestamp present on the wire.
-    return mutations_pb2.FDBMutationRecord(
+    msg = mutations_pb2.FDBMutationRecord(
         stream_name=stream_name,
         bridge_timestamp=timestamp(bridge_timestamp_ns),
         **body,
-    ).SerializeToString()
+    )
+    if directory is not None:
+        msg.directory.CopyFrom(directory_message(directory))
+    if stream_id is not None:
+        msg.stream_id = stream_id
+    if source_id is not None:
+        msg.source_id = source_id
+    return msg.SerializeToString()
 
 
 def mutation_message(

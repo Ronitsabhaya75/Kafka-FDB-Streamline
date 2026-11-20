@@ -15,6 +15,8 @@ from fdb_kafka_bridge.serialization.model import (
     _MAX_TOTAL_MUTATIONS,
     _MAX_TYPE_CODE,
     _MAX_VERSION,
+    FDBDirectoryContext,
+    MutationType,
     NativeMutation,
 )
 
@@ -81,22 +83,51 @@ def max_record_bytes(value: int) -> None:
     _integer(value, field="max_record_bytes", maximum=None, minimum=1)
 
 
-def stream_name(value: str) -> None:
-    """Require a non-empty `str` that encodes as UTF-8."""
+def _text(
+    value: Any,
+    field: str,
+    *,
+    allow_empty: bool = False,
+    index: int | None = None,
+) -> None:
+    """Require a str that encodes as UTF-8.
+
+    Args:
+        value: The value to check.
+        field: Parameter or attribute name to report.
+        allow_empty: Whether an empty string is permissible.
+        index: Position in mutations, or None outside a batch.
+
+    Raises:
+        InputTypeError: If value is not a str.
+        InputValueError: If value is empty (when not allow_empty) or not
+            UTF-8 encodable.
+    """
     if not isinstance(value, str):
         raise InputTypeError(
-            f"stream_name must be str, got {type(value).__name__}", field="stream_name"
+            f"{field}{at(index)} must be str, got {type(value).__name__}",
+            field=field,
+            index=index,
         )
-    if not value:
-        raise InputValueError("stream_name must not be empty", field="stream_name")
+    if not allow_empty and not value:
+        raise InputValueError(
+            f"{field}{at(index)} must not be empty",
+            field=field,
+            index=index,
+        )
     try:
         value.encode("utf-8")
     except UnicodeEncodeError:
-        # `from None` because the codec error carries the whole name.
         raise InputValueError(
-            f"stream_name (str of length {len(value)}) is not UTF-8-encodable",
-            field="stream_name",
+            f"{field}{at(index)} (str of length {len(value)}) is not UTF-8-encodable",
+            field=field,
+            index=index,
         ) from None
+
+
+def stream_name(value: str) -> None:
+    """Require a non-empty `str` that encodes as UTF-8."""
+    _text(value, "stream_name")
 
 
 def bridge_timestamp_ns(value: int) -> None:
@@ -191,3 +222,139 @@ def natives(
         assigned_sequence_no(first_sequence_no + index, index=index)
         checked.append(native(mutation, index=index))
     return checked
+
+
+def is_range_within_subspace(begin_key: bytes, end_key: bytes, prefix: bytes) -> bool:
+    """Check whether [begin_key, end_key) is contained within subspace prefix."""
+    if begin_key >= end_key:
+        return False
+    if begin_key < prefix:
+        return False
+    stripped = prefix.rstrip(b"\xff")
+    if not stripped:
+        return False
+    prefix_bound = stripped[:-1] + bytes([stripped[-1] + 1])
+    return end_key <= prefix_bound
+
+
+def stream_id(value: int | None) -> None:
+    """Require None or uint64 in 0..2**64 - 1."""
+    if value is not None:
+        _integer(value, field="stream_id", maximum=2**64 - 1)
+
+
+def source_id(value: str | None) -> None:
+    """Require None or non-empty UTF-8 str."""
+    if value is not None:
+        _text(value, "source_id")
+
+
+def directory_context(value: Any, *, index: int | None = None) -> None:
+    """Require None or valid FDBDirectoryContext."""
+    if value is not None:
+        if not isinstance(value, FDBDirectoryContext):
+            got = type(value).__name__
+            raise InputTypeError(
+                f"directory{at(index)} must be FDBDirectoryContext, got {got}",
+                field="directory",
+                index=index,
+            )
+        if not isinstance(value.subspace_prefix, bytes):
+            got = type(value.subspace_prefix).__name__
+            raise InputTypeError(
+                f"directory.subspace_prefix{at(index)} must be bytes, got {got}",
+                field="directory.subspace_prefix",
+                index=index,
+            )
+        if not value.subspace_prefix:
+            raise InputValueError(
+                f"directory.subspace_prefix{at(index)} must not be empty",
+                field="directory.subspace_prefix",
+                index=index,
+            )
+        if not value.subspace_prefix.rstrip(b"\xff"):
+            raise InputValueError(
+                f"directory.subspace_prefix{at(index)} must not be all \\xff bytes",
+                field="directory.subspace_prefix",
+                index=index,
+            )
+        if not isinstance(value.path, tuple):
+            got = type(value.path).__name__
+            raise InputTypeError(
+                f"directory.path{at(index)} must be tuple, got {got}",
+                field="directory.path",
+                index=index,
+            )
+        if not value.path:
+            raise InputValueError(
+                f"directory.path{at(index)} must not be empty",
+                field="directory.path",
+                index=index,
+            )
+        for i, elem in enumerate(value.path):
+            if not isinstance(elem, str):
+                got = type(elem).__name__
+                raise InputTypeError(
+                    f"directory.path[{i}]{at(index)} must be str, got {got}",
+                    field="directory.path",
+                    index=index,
+                )
+            try:
+                elem.encode("utf-8")
+            except UnicodeEncodeError:
+                raise InputValueError(
+                    f"directory.path[{i}]{at(index)} (length {len(elem)}) is not "
+                    "UTF-8-encodable",
+                    field="directory.path",
+                    index=index,
+                ) from None
+
+
+def identity_pair(
+    stream_id: int | None,
+    source_id: str | None,
+) -> None:
+    """Require stream_id and source_id to both be present or both be None."""
+    if (stream_id is None) != (source_id is None):
+        field = "source_id" if source_id is None else "stream_id"
+        raise InputValueError(
+            "stream_id and source_id must both be present or both be None",
+            field=field,
+        )
+
+
+def check_mutation_within_directory(
+    code: int,
+    param1: bytes,
+    param2: bytes,
+    directory: FDBDirectoryContext,
+    *,
+    field: str = "mutation",
+    index: int | None = None,
+    fdb_version: int | None = None,
+) -> None:
+    """Verify that a mutation key or clear range falls within directory prefix."""
+    if code == MutationType.CLEAR_RANGE:
+        if not is_range_within_subspace(param1, param2, directory.subspace_prefix):
+            suffix = (
+                f" at version {fdb_version}, sequence {index}"
+                if fdb_version is not None
+                else at(index, label="position")
+            )
+            raise InputValueError(
+                f"Clear range falls outside directory subspace prefix{suffix}",
+                field=field,
+                index=index,
+            )
+    else:
+        if not param1.startswith(directory.subspace_prefix):
+            suffix = (
+                f" at version {fdb_version}, sequence {index}"
+                if fdb_version is not None
+                else at(index, label="position")
+            )
+            raise InputValueError(
+                f"Mutation key does not start with directory subspace prefix{suffix}",
+                field=field,
+                index=index,
+            )

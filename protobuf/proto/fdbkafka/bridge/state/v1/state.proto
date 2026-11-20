@@ -1,0 +1,78 @@
+syntax = "proto3";
+
+package fdbkafka.bridge.state.v1;
+
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/Ronitsabhaya75/Kafka-FDB-Streamline/gen/go/fdbkafka/bridge/state/v1;statev1";
+option java_multiple_files = true;
+option java_package = "com.fdbkafka.bridge.state.v1";
+
+// Identifies the target Kafka cluster and topic sink for bridge state validation.
+message KafkaSinkIdentity {
+    // Unique identifier of the destination Kafka cluster
+    string cluster_id = 1;
+
+    // Target Kafka topic name
+    string topic = 2;
+}
+
+// Durable CDC checkpoint state recorded in FoundationDB.
+message CDCCheckpoint {
+    // State schema format version (format version 2; format 1 is tuple-encoded per docs/FDB-CHECKPOINT-SPEC.md)
+    uint32 format_version = 1;
+
+    // Stable operator-configured identity of the FDB source
+    string source_id = 2;
+
+    // CDC stream name
+    string stream_name = 3;
+
+    // Native CDC stream identifier
+    optional uint64 stream_id = 4;
+
+    // Highest commit version fully delivered to Kafka and acknowledged (-1 represents fresh cursor)
+    int64 last_consumed_version = 5;
+
+    // Target Kafka sink identity for sink-mismatch protection
+    KafkaSinkIdentity sink = 6;
+
+    // Unique identity of the bridge instance that committed this checkpoint
+    string updating_instance_id = 7;
+
+    // Timestamp when this checkpoint was updated
+    google.protobuf.Timestamp update_timestamp = 8;
+
+    // Leader lease epoch during which this checkpoint was committed
+    uint64 lease_epoch = 9;
+
+    // Directory Layer range-configuration fingerprint for schema/range evolution safety
+    bytes range_config_fingerprint = 10;
+}
+
+// Leader lease state recorded in FoundationDB for active leader coordination.
+message LeaderLease {
+    // State schema format version (format version 1)
+    uint32 format_version = 1;
+
+    // Stable operator-configured identity of the FDB source
+    string source_id = 2;
+
+    // CDC stream name
+    string stream_name = 3;
+
+    // Identity of the current leaseholder instance
+    string owner_instance_id = 4;
+
+    // Monotonically increasing lease epoch
+    uint64 lease_epoch = 5;
+
+    // Monotonically increasing heartbeat sequence number within the epoch
+    uint64 heartbeat_sequence = 6;
+
+    // Wall-clock expiration timestamp of the lease
+    google.protobuf.Timestamp expiration_timestamp = 7;
+
+    // Optional native CDC stream identifier
+    optional uint64 stream_id = 8;
+}

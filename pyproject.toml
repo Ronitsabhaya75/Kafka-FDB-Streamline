@@ -26,6 +26,9 @@ packages = [
     "fdb_kafka_bridge.kafka",
     "fdb_kafka_bridge.serialization",
     "fdbkafka",
+    "fdbkafka.bridge",
+    "fdbkafka.bridge.state",
+    "fdbkafka.bridge.state.v1",
     "fdbkafka.cdc",
     "fdbkafka.cdc.v1",
 ]
