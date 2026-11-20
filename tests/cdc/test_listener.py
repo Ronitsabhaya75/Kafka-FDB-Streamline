@@ -171,12 +171,14 @@ def test_resume_waits_for_read_version_and_restores_ack() -> None:
         resume_poll_interval_seconds=0.001,
     )
 
-    with patch("fdb_kafka_bridge.cdc.listener.time.sleep") as sleep:
+    with patch.object(
+        listener._stopping, "wait", wraps=listener._stopping.wait
+    ) as wait:
         listener.start()
 
     client.resume_cdc_consumer.assert_called_once_with(cursor)
     assert client.get_read_version.call_count == 2
-    sleep.assert_called_once()
+    wait.assert_called_once_with(0.001)
     consumer.acknowledge.return_value.wait.assert_called_once()
 
 
@@ -872,4 +874,32 @@ def test_shutdown_before_ack_preserves_closed_error(resumed: bool) -> None:
     listener.cancel_pending()
     with pytest.raises(CDCConsumerClosedError):
         listener.start() if resumed else listener.acknowledge()
+    consumer.acknowledge.assert_not_called()
+
+
+def test_shutdown_during_resumed_read_version_wait_raises_closed_error() -> None:
+    listener, client, consumer = _listener_with_batch(MockConsumeResult([], 100))
+    listener.initial_cursor = MockCursor(1, 100)
+    client.resume_cdc_consumer.return_value = consumer
+
+    def read_version() -> int:
+        listener.cancel_pending()
+        return 90
+
+    client.get_read_version.side_effect = read_version
+    with pytest.raises(CDCConsumerClosedError):
+        listener.start()
+    consumer.close.assert_called_once()
+    consumer.acknowledge.assert_not_called()
+
+
+def test_shutdown_before_resumed_read_version_wait_raises_closed_error() -> None:
+    listener, client, consumer = _listener_with_batch(MockConsumeResult([], 100))
+    listener.initial_cursor = MockCursor(1, 100)
+    client.resume_cdc_consumer.return_value = consumer
+    client.get_read_version.return_value = 90
+    listener.cancel_pending()
+    with pytest.raises(CDCConsumerClosedError):
+        listener.start()
+    consumer.close.assert_called_once()
     consumer.acknowledge.assert_not_called()

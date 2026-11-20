@@ -257,9 +257,12 @@ def test_unexpected_consumer_closure_is_still_a_failure(phase: str) -> None:
 def test_signal_does_not_hide_unrelated_startup_failures(error: Exception) -> None:
     bridge = MagicMock()
     bridge.config = from_dict({"cdc": {"stream_name": "s"}})
+    shutdown_requested = threading.Event()
+    bridge.request_shutdown.side_effect = shutdown_requested.set
 
     def start() -> None:
         os.kill(os.getpid(), signal.SIGTERM)
+        assert shutdown_requested.wait(2)
         raise error
 
     bridge.start.side_effect = start
