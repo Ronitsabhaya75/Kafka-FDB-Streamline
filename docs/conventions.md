@@ -39,15 +39,12 @@ How the team lays out the repo, branches, writes Python, and merges. Tooling enf
 
 | Branch | Purpose |
 |--------|---------|
-| `main` | Stable, protected. Only receives PRs from `develop` (or hotfixes). |
-| `develop` | Integration branch. Work branches are cut from and merged back into it. |
+| `main` | Stable, protected. Work branches are cut from and merged back into it. |
 | `<type>/<name>` | Work branches. `<name>` is short kebab-case. |
 
 Work branch types: `feature/` (product code), `fix/`, `dev/` (tooling, CI, repo infra), `research/` (spikes, write-ups), `docs/`. E.g. `feature/cdc-consumer`, `dev/scaffolding`.
 
-The integration branch is `develop`, not `dev`: git cannot hold a branch named `dev` alongside `dev/<name>` branches.
-
-- Nothing is pushed directly to `main` or `develop`; every merge goes through a PR (see [Pull requests](#pull-requests)).
+- Nothing is pushed directly to `main`; every merge goes through a PR (see [Pull requests](#pull-requests)).
 - All commits must be **signed and verified** (see [Signed commits](#signed-commits)).
 
 ## Code style
@@ -146,7 +143,7 @@ Then add the same public key on GitHub under Settings → SSH and GPG keys → N
 
 ## Pull requests
 
-- Open from a work branch against `develop` (against `main` until `develop` exists). The [PR template](../.github/pull_request_template.md) fills in automatically.
+- Open from a work branch against `main`. The [PR template](../.github/pull_request_template.md) fills in automatically.
 - Link the Trello card in the description.
 - At least 1 approval required.
 - CI must pass: the [`Lint`](../.github/workflows/lint.yml) workflow runs `ruff check` and `black --check` on every PR. It is check-only — it never edits files or pushes commits.
@@ -160,5 +157,5 @@ Then add the same public key on GitHub under Settings → SSH and GPG keys → N
 | Formatting, lint, naming, type hints, docstrings | pre-commit locally; `Lint` workflow on PRs |
 | Tests pass | `make test` locally; `Tests` workflow on PRs |
 | Wheel builds, installs and imports | `make test-packaging` locally; `Packaging` workflow on PRs, which fails on skipped or missing tests |
-| `main`/`develop` protected, PR required, 1 approval, CI green, signed commits | GitHub branch protection — a repo admin enables it under Settings → Branches |
+| `main` protected, PR required, 1 approval, CI green, signed commits | GitHub branch protection — a repo admin enables it under Settings → Branches |
 | Branch naming, Trello link | PR template + review |
