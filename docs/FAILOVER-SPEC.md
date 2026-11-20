@@ -82,9 +82,11 @@ disjoint from the text-led pod keys.
   time.
 - **v1 records.** A single-process `(1, epoch, random ID)` record reads as held with no
   heartbeat. It goes stale after the stale period, and the claim rewrites it as v2.
-  Migrating a running v1 deployment is open; see
-  [Unverified and provisional](#unverified-and-provisional). A v1-only binary that reads
-  v2 raises `CheckpointFormatError`, so an old pod cannot steal a stream mid-rollout.
+  A v1 bridge never renews, so a pool pod would claim its stream while it still consumes.
+  The move from v1 to the pool therefore needs one `Recreate` rollout; see
+  [Deployment, exit codes and alerts](#deployment-exit-codes-and-alerts). A v1-only binary
+  that reads v2 raises `CheckpointFormatError`, so an old pod cannot steal a stream
+  mid-rollout.
 - **Unreadable owner record**, from an unknown version or corruption. Every pod blocks the
   stream locally, never claims it, and logs `stream_blocked`. Pods keep serving their other
   streams.
@@ -98,8 +100,9 @@ always fenced, and there is no unfenced peek.
 
 ## Lease transactions
 
-Renew, watch and claim run at `priority_system_immediate`. The priority of release and
-pod-heartbeat GC is open; see [Unverified and provisional](#unverified-and-provisional).
+Renew, watch and claim run at `priority_system_immediate`. Release runs at default
+priority: a throttled release degrades to a drop, and the lease goes stale 1 s later.
+Pod-heartbeat GC runs at `priority_batch`, since it is idempotent and has no deadline.
 
 **Claim.** A non-snapshot read of the owner record and heartbeat. The watcher proceeds
 only if `owner_id` is `None` (released) or `(owner record, heartbeat)` still equals the
@@ -179,10 +182,19 @@ claim-delay formula.
 ## Taking and giving up a stream
 
 **Pod start.** Before it watches anything, the pod opens FDB, runs the overlap guard over
-all configured streams, fetches and caches the sink `cluster_id`, registers streams
-(described in [Pool runtime](#pool-runtime)) and warms the spare producer. If FDB open or
-the overlap guard fails, the pod exits 3. Handling of the other pod-start failures is
-open; see [Unverified and provisional](#unverified-and-provisional).
+all configured streams, fetches and caches the sink `cluster_id` and registers streams
+(described in [Pool runtime](#pool-runtime)). If FDB open or the overlap guard fails, the
+pod exits 3. The other steps never exit:
+
+| Step | On failure |
+|---|---|
+| Sink `cluster_id` fetch | Retry with the pipeline backoff. The pod does not watch until it succeeds, since it cannot lead without it |
+| Registration | See [Registration](#pool-runtime) |
+| Spare producer warm-up | Does not delay watching. The pod watches without a spare (a slower takeover) and keeps building one in the background |
+
+The renew and watcher threads, and with them the pod heartbeat, start only once these
+steps succeed, so a pod counts in N only when it can lead. SIGTERM during pod start exits
+0 with nothing to release.
 
 **Take.** The order is claim commits → `init_transactions()` (transactional mode only) →
 stream checks → first consume → run loop. The stream checks are the
@@ -220,9 +232,10 @@ is left to its fence. A save or ack that lands after a self-drop is harmless.
 
 **Release order.** Stop polling and cancel the parked consume → finish the polled reply
 through ack (`_finish_outstanding_commit`) → close the producer → close the
-listener → release. A budget overrun, or `lost` firing part way, switches to drop. SIGTERM
-releases all leases in parallel under one budget, then exits 0. The budget for shed and
-runtime-failure releases is open; see [Unverified and provisional](#unverified-and-provisional).
+listener → release. A budget overrun, or `lost` firing part way, switches to drop. Every
+release, whether for SIGTERM, a shed or a runtime failure, runs under the
+`--shutdown-timeout-s` budget. The lease keeps renewing throughout, so a long budget is
+safe. SIGTERM releases all leases in parallel under one budget, then exits 0.
 
 **In-tenure failures.** Transient errors retry in place with the pipeline backoff. A rebuild
 stays inside the tenure and never claims. It builds a new listener from the checkpoint and
@@ -287,7 +300,8 @@ on re-registration, or the epoch, which changes on every claim. Either would lea
 zombie unfenced. The config key is `kafka.transactional_id_prefix`
 (`STREAMLINE_TRANSACTIONAL_ID_PREFIX`, `--transactional-id-prefix`), replacing
 `kafka.transactional_id`. Transactional mode is on iff the prefix is set. It has no
-default.
+default. The old `kafka.transactional_id` key is a config error naming the prefix key,
+not a silent mapping, because the ID would change from `X` to `X.{stream}`.
 
 > **The prefix must be unique per deployment per Kafka cluster. Reusing it makes
 > deployments fence each other.**
@@ -333,17 +347,42 @@ drop would purge or block other streams' in-flight records. The spare producer a
 cached sink identity are under pre-warming in
 [Taking and giving up a stream](#taking-and-giving-up-a-stream).
 
+**Mode.** The pool is the only runtime. There is no unleased single-process path. A
+single pod is a pool with N = 1.
+
 **Configuration.** A `streams:` list of `{name, topic}` entries sits beside the shared
-`fdb`, `kafka` and pipeline sections. An entry holds only fields that differ per stream.
-The existing `cdc.stream_name` and `kafka.topic` keys still parse as M = 1 and are
-deprecated. Every pod in a deployment must carry the same list. Nothing detects drift.
+`fdb`, `kafka` and pipeline sections. An entry holds only fields that differ per stream,
+plus an optional registration range (`begin_key`/`end_key` or `subspace_prefix`). The
+existing `cdc.stream_name` and `kafka.topic` keys still parse as M = 1 and log a
+deprecation warning. Setting both those keys and `streams:` is a config error.
+`streams:` comes only from the config file; the CLI flags stay single-stream. Every pod in
+a deployment must carry the same list. Nothing detects drift.
+
+`cdc.checkpoint_path` is required, because leases live in the checkpoint store.
+`cdc.cursor_file` is a config error that names the migration, and running without a
+checkpoint is no longer possible.
 
 **Registration.** A pod registers missing streams only at pod start, never on the takeover
 path. A freshly registered stream's first consume waits for the next commit, about 3 s in
-the prototype, which would blow the takeover target. A stream found missing after a claim
-blocks, as in [Error mapping](#error-mapping). Three things are open: how registration
-failures are handled, whether `streams:` needs a per-stream range, and what happens when
-pods race to register. See [Unverified and provisional](#unverified-and-provisional).
+the prototype, which would blow the takeover target. The pod lists streams and registers
+each missing one that has a configured range. A missing stream without a range is left
+alone and blocks after its claim.
+
+- **Races.** FDB serializes registration, and a same-name, same-range register returns
+  the existing `stream_id` without committing. Pods racing with the same `streams:` list
+  therefore all succeed with one ID, and no coordination is needed. A live devcontainer
+  test registers the same name and range twice and expects the same ID, pinning this on
+  the build we run.
+- **Failures.** Transient FDB errors retry with the pipeline backoff before watching. A
+  non-retryable failure logs `stream_register_failed` and the pod carries on. The stream
+  is still missing or mismatched after its claim, so it blocks while other streams run.
+  The fix is to correct the config and restart.
+- **Range conflict.** A same-name register with a different range fails with
+  `client_invalid_operation` (2000). `FDBClient.register_cdc_stream` translates it to
+  `CDCRangeConflictError`, which keeps it apart from the foreign-consumer 2000 at consume.
+  It is non-retryable, and the post-claim range check blocks the stream.
+
+A stream found missing after a claim blocks, as in [Error mapping](#error-mapping).
 
 ### Pod heartbeat and live N
 
@@ -387,6 +426,7 @@ hold-off. `led` is the number of streams this pod leads, blocked streams include
 | `led ≥ ceil(M/(N−1))` and claimable longer than the backstop | Yes |
 | Otherwise | No |
 
+With N = 1, `ceil(M/(N−1))` is unbounded, so the third row never applies.
 The second row lets survivors absorb a dead pod's streams before N has dropped. The
 backstop (stale + 2 × claim-delay max = 1400 ms) means a wrong N can never leave a stream
 unled. The claim delay is `min(led × step, max) + jitter`, with step 50 ms, max 200 ms
@@ -438,6 +478,10 @@ Kubernetes default of 30 s fits.
 | Node anti-affinity | Soft (preferred) |
 | Probes | None |
 | systemd / Compose | ≥ 2 instances on different hosts |
+
+**Migrating from v1.** A single-process deployment moves to the pool with one `Recreate`
+rollout, so no v1 bridge is still consuming when pool pods start. Later rollouts use the
+settings above.
 
 There are no probes because process exit is the liveness signal. A dead pod-level thread
 exits the pod, and a hung tenure hits the 10 s progress deadline and releases. Full
@@ -503,7 +547,7 @@ nothing could flow anyway.
 | Layer | Covers |
 |---|---|
 | Unit, fake clock + fake lease store (`tests/cdc/`, `tests/bridge/`) | All timing and decision logic: renew-to-deadline timeout, failed-watch anchors, run-loop self-drop gate and 200 ms stop budget, cooldown, progress deadline, caps, claim delay, backstop, shedding, pod-heartbeat join/leave, and the full block/drop/release/retry mapping. Spreading runs as a discrete simulation of N pods over the fake store. |
-| Live devcontainer FDB | Transaction semantics only: conditional claim races, `tr.add` heartbeat, conflict-free snapshot renew, release, watch range read. |
+| Live devcontainer FDB | Transaction semantics only: conditional claim races, `tr.add` heartbeat, conflict-free snapshot renew, release, watch range read, same-range re-registration returning the same `stream_id`. |
 | Devcontainer multi-process (CI) | Kill/term correctness, not latency. |
 | Benchmark (manual) | Takeover p99. |
 | Staging | GIL and self-drop rate. |
@@ -567,18 +611,3 @@ fails, renew moves to a separate process.
   gives 15 to 58 self-drops per hour on an idle cluster for 50 ms holds at 50 % duty. This
   spec sets no hard limit. The staging soak decides, and renew in a separate process is
   the fallback.
-
-### Open
-
-- **Pod-start failures** other than FDB open and the overlap guard: registration, sink
-  identity fetch, spare-producer warm-up. Should they block the stream, retry, or exit,
-  and with which code? Does `streams:` need a per-stream range for registration? Does
-  "already registered with the same range" count as success when pods race to register?
-- **Rollout from a single-process deployment.** A v1 bridge never renews, so a pool pod
-  sees the v1 record go stale after 1 s and claims while the v1 bridge still consumes.
-  Require one `Recreate` rollout for the transition, or accept a single fenced overlap?
-- **Priority** of release and pod-heartbeat GC transactions.
-- **Release budget** for shed and runtime-failure releases. SIGTERM uses
-  `--shutdown-timeout-s`.
-- **Enabling lease mode.** How is it enabled, and does the single-process path survive
-  alongside it?
