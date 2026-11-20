@@ -265,17 +265,24 @@ class FDBMutationListener:
 
     def _reconcile_resumed_consumer(self) -> None:
         """Wait for the cursor version to be readable, then restore its ack."""
+        if self._is_closed or self._stopping.is_set():
+            raise CDCConsumerClosedError("CDC consumer is stopping")
         self.client.validate_resume_cursor(self.raw_stream_name, self.initial_cursor)
         target_version = self.initial_cursor.last_consumed_version
         deadline = time.monotonic() + self.resume_timeout_seconds
         while self.client.get_read_version() < target_version:
+            if self._is_closed or self._stopping.is_set():
+                raise CDCConsumerClosedError("CDC consumer is stopping")
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise CDCInvalidCursorError(
                     "Timed out waiting for the cluster read version to reach "
                     f"resumed cursor version {target_version}"
                 )
-            time.sleep(min(self.resume_poll_interval_seconds, remaining))
+            if self._stopping.wait(min(self.resume_poll_interval_seconds, remaining)):
+                raise CDCConsumerClosedError("CDC consumer is stopping")
+        if self._is_closed or self._stopping.is_set():
+            raise CDCConsumerClosedError("CDC consumer is stopping")
         if self._before_ack is not None:
             self._before_ack()
         try:

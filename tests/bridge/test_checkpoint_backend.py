@@ -194,7 +194,10 @@ def test_takeover_prevents_ack_retry_after_successful_checkpoint() -> None:
 
 
 @pytest.mark.parametrize("sig", ["SIGTERM", "SIGINT"])
-def test_signal_during_resumed_start_returns_clean_exit(sig: str) -> None:
+@pytest.mark.parametrize("reported_version", [10, 9])
+def test_signal_during_resumed_start_returns_clean_exit(
+    sig: str, reported_version: int
+) -> None:
     import os
     import signal
 
@@ -209,7 +212,7 @@ def test_signal_during_resumed_start_returns_clean_exit(sig: str) -> None:
         assert listener is not None
         os.kill(os.getpid(), getattr(signal, sig))
         assert listener._stopping.wait(2)
-        return 10
+        return reported_version
 
     deps.client.get_read_version.side_effect = read_version
     with patch("fdb_kafka_bridge.bridge.cli.Bridge", return_value=deps.bridge):
