@@ -141,6 +141,20 @@ def test_renew_reports_lost_tenures(lease_env: LeaseEnv) -> None:
     assert heartbeat(lease_env) is None
 
 
+def test_renew_reports_unreadable_records_apart_from_lost(
+    lease_env: LeaseEnv,
+) -> None:
+    leader = lease_env.leases("pod-a")
+    claimed = leader.claim(S)
+    assert claimed is not None
+    lease_env.put(lease_env.store.subspace.pack((S, "owner")), b"bad")
+    result = leader.renew({claimed.lease: claimed.started})
+    assert result.started is not None
+    assert result.unreadable == {claimed.lease}
+    assert not result.lost and not result.renewed
+    assert heartbeat(lease_env) is None
+
+
 def test_renew_is_not_aborted_by_a_racing_claim(lease_env: LeaseEnv) -> None:
     leader = lease_env.leases("pod-a")
     claimed = leader.claim(S)

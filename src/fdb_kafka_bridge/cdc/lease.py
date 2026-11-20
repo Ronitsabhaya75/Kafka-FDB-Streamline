@@ -46,7 +46,6 @@ POD_GC_STALE_S: float = 300.0
 
 OWNER_RECORD_V2: int = 2
 _V1 = 1
-_LEGACY = 0
 
 
 class Clock(Protocol):
@@ -86,9 +85,8 @@ class OwnerRecord:
     """Decoded owner record.
 
     Attributes:
-        version: 2 for the current format, 1 for a single-process record, 0 for
-            the legacy unversioned ``(epoch, owner_id)`` record. Versions below 2
-            are held with no heartbeat, so they only ever go stale.
+        version: 2 for the current format, 1 for a single-process record. A v1
+            record is held with no heartbeat, so it only ever goes stale.
         epoch: Claim counter; never decreases.
         owner_id: Current tenure's 16-byte identity, or None once released.
         pod_name: Holder's display name (v2 only); never compared.
@@ -147,8 +145,6 @@ def decode_owner(value: bytes | None) -> OwnerRecord | None:
             return OwnerRecord(OWNER_RECORD_V2, epoch, owner_id, pod_name)
         case (1, epoch, owner_id) if _is_epoch(epoch) and _is_owner_id(owner_id):
             return OwnerRecord(_V1, epoch, owner_id, None)
-        case (epoch, owner_id) if _is_epoch(epoch) and _is_owner_id(owner_id):
-            return OwnerRecord(_LEGACY, epoch, owner_id, None)
     raise CheckpointFormatError(f"Unreadable owner record {fields!r}")
 
 
@@ -213,12 +209,15 @@ class RenewResult:
             the deadline.
         renewed: Leases whose heartbeat the committed attempt bumped.
         lost: Leases whose owner record no longer names their tenure.
+        unreadable: Leases whose owner record cannot be decoded; never claimed,
+            so the stream blocks rather than moving.
         expired: Leases whose self-drop deadline passed before an attempt.
     """
 
     started: float | None
     renewed: frozenset[Lease]
     lost: frozenset[Lease]
+    unreadable: frozenset[Lease]
     expired: frozenset[Lease]
 
 
@@ -341,7 +340,9 @@ class Leases:
                     expired.add(lease)
                     del pending[lease]
             if now >= pod_deadline:
-                return RenewResult(None, frozenset(), frozenset(), frozenset(expired))
+                return RenewResult(
+                    None, frozenset(), frozenset(), frozenset(), frozenset(expired)
+                )
             deadline = min([t + SELF_DROP_S for t in pending.values()] + [pod_deadline])
             tr = self.store.client.db.create_transaction()
             try:
@@ -352,8 +353,14 @@ class Leases:
                     for lease in pending
                 }
                 renewed: set[Lease] = set()
+                unreadable: set[Lease] = set()
                 for lease, future in reads.items():
-                    if _shows(future.value, lease.epoch, lease.owner_id):
+                    try:
+                        record = decode_owner(future.value)
+                    except CheckpointFormatError:
+                        unreadable.add(lease)
+                        continue
+                    if _shows(record, lease.epoch, lease.owner_id):
                         tr.add(self._key(lease.stream_name, "hb"), _ONE)
                         renewed.add(lease)
                 tr.add(self._pod_key("hb"), _ONE)
@@ -361,7 +368,8 @@ class Leases:
                 return RenewResult(
                     now,
                     frozenset(renewed),
-                    frozenset(pending) - renewed,
+                    frozenset(pending) - renewed - unreadable,
+                    frozenset(unreadable),
                     frozenset(expired),
                 )
             except fdb.FDBError as exc:
@@ -396,11 +404,11 @@ class Leases:
                 try:
                     tr.options.set_timeout(int(RELEASE_TIMEOUT_S * 1000))
                     tr.options.set_retry_limit(RELEASE_RETRY_LIMIT)
-                    value = tr.get(key).value
-                    if not _shows(value, lease.epoch, lease.owner_id):
+                    record = _record(tr.get(key).value)
+                    if not _shows(record, lease.epoch, lease.owner_id):
                         # Every claim raises the epoch, so only this tenure can
                         # have written (epoch, None): our own earlier attempt.
-                        return _shows(value, lease.epoch, None)
+                        return _shows(record, lease.epoch, None)
                     tr[key] = encode_owner(lease.epoch, None, self.pod_name)
                     tr.commit().wait()
                     return True
@@ -469,9 +477,8 @@ def _record(value: bytes | None) -> OwnerRecord | None:
         return None
 
 
-def _shows(value: bytes | None, epoch: int, owner_id: bytes | None) -> bool:
-    """Return whether a raw owner record holds exactly ``(epoch, owner_id)``."""
-    record = _record(value)
+def _shows(record: OwnerRecord | None, epoch: int, owner_id: bytes | None) -> bool:
+    """Return whether an owner record holds exactly ``(epoch, owner_id)``."""
     return record is not None and (record.epoch, record.owner_id) == (epoch, owner_id)
 
 

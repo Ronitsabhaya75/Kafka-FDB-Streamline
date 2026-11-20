@@ -171,7 +171,9 @@ them.
 
 The invariant is that no watcher takes over earlier than stale after the leader's last
 renew start. A leader that self-drops on time therefore has the stop budget to stop
-consuming. The deadline anchor sits before the GRV, never at commit acknowledgement. A
+consuming. The one exception is a renew that starts before a racing claim and commits
+after it: the next renew tick reports the loss, the save fence blocks ack and checkpoint
+meanwhile, and any extra Kafka duplicates fall within at-least-once. The deadline anchor sits before the GRV, never at commit acknowledgement. A
 slow commit reply would otherwise stretch the leader's belief past a watcher's takeover.
 [Pool runtime](#pool-runtime) covers pod-heartbeat join and leave, shedding and the
 claim-delay formula.

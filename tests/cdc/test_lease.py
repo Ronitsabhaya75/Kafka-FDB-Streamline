@@ -32,17 +32,9 @@ def test_owner_record_v2_round_trips(fake_env: LeaseEnv) -> None:
     assert decode_owner(None) is None
 
 
-@pytest.mark.parametrize(
-    ("fields", "expected"),
-    [
-        ((1, 3, TOKEN), OwnerRecord(1, 3, TOKEN, None)),
-        ((4, TOKEN), OwnerRecord(0, 4, TOKEN, None)),
-    ],
-)
-def test_older_formats_read_as_held(
-    fake_env: LeaseEnv, fields: tuple, expected: OwnerRecord
-) -> None:
-    assert decode_owner(fake_env.fdb.tuple.pack(fields)) == expected
+def test_v1_record_reads_as_held(fake_env: LeaseEnv) -> None:
+    v1 = fake_env.fdb.tuple.pack((1, 3, TOKEN))
+    assert decode_owner(v1) == OwnerRecord(1, 3, TOKEN, None)
 
 
 @pytest.mark.parametrize(
@@ -58,6 +50,7 @@ def test_older_formats_read_as_held(
         (2, 1, TOKEN),
         (1, 1, None),
         (1, 0, TOKEN),
+        (4, TOKEN),
         ("x", TOKEN),
         (0, TOKEN),
         (1, b"short"),
@@ -240,7 +233,7 @@ def test_renew_that_never_commits_gives_up_at_the_deadline(
     fail(fake_env, "commit", 1020, times=1000)
     result = leases.renew({claimed.lease: claimed.started})
     assert result == RenewResult(
-        None, frozenset(), frozenset(), frozenset({claimed.lease})
+        None, frozenset(), frozenset(), frozenset(), frozenset({claimed.lease})
     )
     assert fake_env.clock.monotonic() >= start + SELF_DROP_S
 
