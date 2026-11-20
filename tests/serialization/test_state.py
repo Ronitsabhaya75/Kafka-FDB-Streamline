@@ -33,7 +33,7 @@ UINT64_MAX: int = (1 << 64) - 1
 MAX_TIMESTAMP_NS: int = 253_402_300_799_999_999_999
 
 CP_GOLDEN = bytes.fromhex(
-    "0801120e6664622d7072696d6172792d64631a0d6f72646572735f73747265616d20cec2f105"
+    "0802120e6664622d7072696d6172792d64631a0d6f72646572735f73747265616d20cec2f105"
     "2896d5d02f321f0a0f636c75737465722d70726f642d3031120c6f72646572732d746f706963"
     "3a116272696467652d696e7374616e63652d31420b0880e2cfaa0610959aef3a482a521e7368"
     "613235363a66696e6765727072696e745f686173685f616263313233"
@@ -48,7 +48,7 @@ LEASE_GOLDEN = bytes.fromhex(
 def _sample_checkpoint() -> CDCCheckpoint:
     sink = KafkaSinkIdentity(cluster_id="cluster-prod-01", topic="orders-topic")
     return CDCCheckpoint(
-        format_version=1,
+        format_version=2,
         source_id="fdb-primary-dc",
         stream_name="orders_stream",
         stream_id=12345678,
@@ -93,12 +93,12 @@ def test_checkpoint_golden_bytes() -> None:
 def test_checkpoint_fresh_cursor_and_boundary_values() -> None:
     sink = KafkaSinkIdentity(cluster_id="c1", topic="t1")
 
-    # Boundary 1: minimums (fresh cursor -1, epoch 0, stream_id None)
+    # Boundary 1: minimums (fresh cursor -1, epoch 1, stream_id 0)
     cp_fresh = CDCCheckpoint(
-        format_version=1,
+        format_version=2,
         source_id="s1",
         stream_name="str1",
-        stream_id=None,
+        stream_id=0,
         last_consumed_version=-1,
         sink=sink,
         updating_instance_id="i1",
@@ -109,13 +109,13 @@ def test_checkpoint_fresh_cursor_and_boundary_values() -> None:
     wire_fresh = serialize_checkpoint(cp_fresh)
     decoded_fresh = deserialize_checkpoint(wire_fresh)
     assert decoded_fresh.last_consumed_version == -1
-    assert decoded_fresh.stream_id is None
+    assert decoded_fresh.stream_id == 0
     assert decoded_fresh.update_timestamp_ns == 0
     assert decoded_fresh.lease_epoch == 1
 
     # Boundary 2: maximums
     cp_max = CDCCheckpoint(
-        format_version=1,
+        format_version=2,
         source_id="s1",
         stream_name="str1",
         stream_id=UINT64_MAX,
@@ -139,12 +139,14 @@ def test_checkpoint_fresh_cursor_and_boundary_values() -> None:
     ("changes", "expected_field", "exc_type", "match"),
     [
         ({"format_version": 0}, "format_version", InputValueError, "format_version"),
-        ({"format_version": 2}, "format_version", InputValueError, "format_version"),
-        ({"format_version": "1"}, "format_version", InputTypeError, "format_version"),
+        ({"format_version": 1}, "format_version", InputValueError, "format_version"),
+        ({"format_version": 3}, "format_version", InputValueError, "format_version"),
+        ({"format_version": "2"}, "format_version", InputTypeError, "format_version"),
         ({"source_id": ""}, "source_id", InputValueError, "source_id"),
         ({"source_id": 123}, "source_id", InputTypeError, "source_id"),
         ({"stream_name": ""}, "stream_name", InputValueError, "stream_name"),
         ({"stream_name": 123}, "stream_name", InputTypeError, "stream_name"),
+        ({"stream_id": None}, "stream_id", InputTypeError, "stream_id"),
         ({"stream_id": -1}, "stream_id", InputValueError, "stream_id"),
         ({"stream_id": UINT64_MAX + 1}, "stream_id", InputValueError, "stream_id"),
         ({"stream_id": "1"}, "stream_id", InputTypeError, "stream_id"),
@@ -285,11 +287,12 @@ def test_checkpoint_decode_errors() -> None:
     assert exc_info.value.reason == DecodeFailure.MALFORMED_WIRE
 
     # Unsupported format versions on wire
-    for bad_ver in (0, 2):
+    for bad_ver in (0, 1, 3):
         wire_bad_ver = state_pb2.CDCCheckpoint(
             format_version=bad_ver,
             source_id="s1",
             stream_name="st1",
+            stream_id=123,
             updating_instance_id="i1",
             sink=state_pb2.KafkaSinkIdentity(cluster_id="c1", topic="t1"),
             update_timestamp=Timestamp(seconds=100, nanos=0),
@@ -300,9 +303,10 @@ def test_checkpoint_decode_errors() -> None:
 
     # Out of range version on wire
     wire_overflow_ver = state_pb2.CDCCheckpoint(
-        format_version=1,
+        format_version=2,
         source_id="s1",
         stream_name="st1",
+        stream_id=123,
         last_consumed_version=-2,
         updating_instance_id="i1",
         sink=state_pb2.KafkaSinkIdentity(cluster_id="c1", topic="t1"),
@@ -314,9 +318,10 @@ def test_checkpoint_decode_errors() -> None:
 
     # Missing / empty identities on wire
     wire_empty_source = state_pb2.CDCCheckpoint(
-        format_version=1,
+        format_version=2,
         source_id="",
         stream_name="st1",
+        stream_id=123,
         updating_instance_id="i1",
         sink=state_pb2.KafkaSinkIdentity(cluster_id="c1", topic="t1"),
         update_timestamp=Timestamp(seconds=100, nanos=0),
@@ -327,9 +332,10 @@ def test_checkpoint_decode_errors() -> None:
 
     # Missing required sink
     wire_no_sink = state_pb2.CDCCheckpoint(
-        format_version=1,
+        format_version=2,
         source_id="s1",
         stream_name="st1",
+        stream_id=123,
         updating_instance_id="i1",
         update_timestamp=Timestamp(seconds=100, nanos=0),
         lease_epoch=1,
@@ -492,9 +498,10 @@ def test_leader_lease_decode_errors() -> None:
 
 def test_checkpoint_decode_zero_epoch_rejected() -> None:
     wire_bad_epoch = state_pb2.CDCCheckpoint(
-        format_version=1,
+        format_version=2,
         source_id="s1",
         stream_name="st1",
+        stream_id=123,
         updating_instance_id="pod1",
         sink=state_pb2.KafkaSinkIdentity(cluster_id="c1", topic="t1"),
         update_timestamp=Timestamp(seconds=100, nanos=0),
@@ -505,6 +512,21 @@ def test_checkpoint_decode_zero_epoch_rejected() -> None:
     ) as exc_epoch:
         deserialize_checkpoint(wire_bad_epoch)
     assert exc_epoch.value.reason == DecodeFailure.MALFORMED_WIRE
+
+
+def test_checkpoint_decode_missing_stream_id_rejected() -> None:
+    wire_no_stream = state_pb2.CDCCheckpoint(
+        format_version=2,
+        source_id="s1",
+        stream_name="st1",
+        updating_instance_id="pod1",
+        sink=state_pb2.KafkaSinkIdentity(cluster_id="c1", topic="t1"),
+        update_timestamp=Timestamp(seconds=100, nanos=0),
+        lease_epoch=1,
+    ).SerializeToString()
+    with pytest.raises(StateDecodeError, match="stream_id") as exc_sid:
+        deserialize_checkpoint(wire_no_stream)
+    assert exc_sid.value.reason == DecodeFailure.MALFORMED_WIRE
 
 
 def test_state_decode_error_hierarchy() -> None:

@@ -19,7 +19,7 @@ message KafkaSinkIdentity {
 
 // Durable CDC checkpoint state recorded in FoundationDB.
 message CDCCheckpoint {
-    // State schema format version (e.g. 1 for v0.2.0)
+    // State schema format version (format version 2; format 1 is tuple-encoded per docs/FDB-CHECKPOINT-SPEC.md)
     uint32 format_version = 1;
 
     // Stable operator-configured identity of the FDB source
@@ -52,7 +52,7 @@ message CDCCheckpoint {
 
 // Leader lease state recorded in FoundationDB for active leader coordination.
 message LeaderLease {
-    // State schema format version (e.g. 1 for v0.2.0)
+    // State schema format version (format version 1)
     uint32 format_version = 1;
 
     // Stable operator-configured identity of the FDB source

@@ -16,6 +16,7 @@ from fdb_kafka_bridge.serialization.model import (
     _MAX_TYPE_CODE,
     _MAX_VERSION,
     FDBDirectoryContext,
+    MutationType,
     NativeMutation,
 )
 
@@ -307,3 +308,53 @@ def directory_context(value: Any, *, index: int | None = None) -> None:
                     field="directory.path",
                     index=index,
                 ) from None
+
+
+def identity_pair(
+    stream_id: int | None,
+    source_id: str | None,
+) -> None:
+    """Require stream_id and source_id to both be present or both be None."""
+    if (stream_id is None) != (source_id is None):
+        field = "source_id" if source_id is None else "stream_id"
+        raise InputValueError(
+            "stream_id and source_id must both be present or both be None",
+            field=field,
+        )
+
+
+def check_mutation_within_directory(
+    code: int,
+    param1: bytes,
+    param2: bytes,
+    directory: FDBDirectoryContext,
+    *,
+    field: str = "mutation",
+    index: int | None = None,
+    fdb_version: int | None = None,
+) -> None:
+    """Verify that a mutation key or clear range falls within directory prefix."""
+    if code == MutationType.CLEAR_RANGE:
+        if not is_range_within_subspace(param1, param2, directory.subspace_prefix):
+            suffix = (
+                f" at version {fdb_version}, sequence {index}"
+                if fdb_version is not None
+                else at(index, label="position")
+            )
+            raise InputValueError(
+                f"Clear range falls outside directory subspace prefix{suffix}",
+                field=field,
+                index=index,
+            )
+    else:
+        if not param1.startswith(directory.subspace_prefix):
+            suffix = (
+                f" at version {fdb_version}, sequence {index}"
+                if fdb_version is not None
+                else at(index, label="position")
+            )
+            raise InputValueError(
+                f"Mutation key does not start with directory subspace prefix{suffix}",
+                field=field,
+                index=index,
+            )

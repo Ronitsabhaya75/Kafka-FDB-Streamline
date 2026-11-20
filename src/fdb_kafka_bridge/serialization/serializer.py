@@ -45,8 +45,13 @@ def serialize_mutation(
     _checks.envelope(stream_name, bridge_timestamp_ns)
     _checks.stream_id(stream_id)
     _checks.source_id(source_id)
+    _checks.identity_pair(stream_id, source_id)
     _checks.directory_context(directory)
     native = _checks.native(mutation)
+    if directory is not None:
+        _checks.check_mutation_within_directory(
+            native[0], native[1], native[2], directory, field="mutation"
+        )
     return _wire.record(
         stream_name,
         bridge_timestamp_ns,
@@ -101,6 +106,7 @@ def serialize_batch(
     _checks.envelope(stream_name, bridge_timestamp_ns)
     _checks.stream_id(stream_id)
     _checks.source_id(source_id)
+    _checks.identity_pair(stream_id, source_id)
     _checks.directory_context(directory)
     natives = _checks.natives(mutations, first_sequence_no=first_sequence_no)
     if not natives:
@@ -109,6 +115,11 @@ def serialize_batch(
         raise InputValueError(
             "mutations must yield at least one native mutation", field="mutations"
         )
+    if directory is not None:
+        for idx, (code, p1, p2) in enumerate(natives):
+            _checks.check_mutation_within_directory(
+                code, p1, p2, directory, field="mutations", index=idx
+            )
     return _wire.record(
         stream_name,
         bridge_timestamp_ns,

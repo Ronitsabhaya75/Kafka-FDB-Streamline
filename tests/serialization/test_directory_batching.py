@@ -29,7 +29,10 @@ from fdb_kafka_bridge.serialization.model import (
     deduplication_identity,
     legacy_deduplication_identity,
 )
-from fdb_kafka_bridge.serialization.serializer import serialize_mutation
+from fdb_kafka_bridge.serialization.serializer import (
+    serialize_batch,
+    serialize_mutation,
+)
 from fdb_kafka_bridge.serialization.version_group import serialize_version_group
 from fdbkafka.cdc.v1 import mutations_pb2
 
@@ -505,7 +508,7 @@ def test_version_end_with_directory_rejected_on_decode() -> None:
         RecordDecodeError, match="VersionEnd record must not carry directory"
     ) as exc_info:
         deserialize_record(wire)
-    assert exc_info.value.reason == DecodeFailure.MALFORMED_WIRE
+    assert exc_info.value.reason == DecodeFailure.DIRECTORY_MISMATCH
 
 
 def test_deduplication_identity() -> None:
@@ -603,16 +606,94 @@ def test_deduplication_identity() -> None:
             stream_name="stream_dedup",
             bridge_timestamp_ns=1000,
             source_id="",
+            stream_id=7,
         )
 
-    # Wire containing empty source_id string normalizes to None on decode
+    # Half-set stream_id / source_id rejected on serialization
+    with pytest.raises(
+        InputValueError, match="stream_id and source_id must both be present"
+    ) as exc_hs1:
+        serialize_mutation(
+            _FakeNativeMutation(MutationType.SET_VALUE, b"\x01key", b"val"),
+            fdb_version=7000,
+            sequence_no=5,
+            stream_name="stream_dedup",
+            bridge_timestamp_ns=1000,
+            stream_id=7,
+        )
+    assert exc_hs1.value.field == "source_id"
+
+    with pytest.raises(
+        InputValueError, match="stream_id and source_id must both be present"
+    ) as exc_hs2:
+        serialize_mutation(
+            _FakeNativeMutation(MutationType.SET_VALUE, b"\x01key", b"val"),
+            fdb_version=7000,
+            sequence_no=5,
+            stream_name="stream_dedup",
+            bridge_timestamp_ns=1000,
+            source_id="s1",
+        )
+    assert exc_hs2.value.field == "stream_id"
+
+    # Batch and version_group also reject half-set stream_id / source_id
+    with pytest.raises(
+        InputValueError, match="stream_id and source_id must both be present"
+    ):
+        serialize_batch(
+            [_FakeNativeMutation(MutationType.SET_VALUE, b"\x01key", b"val")],
+            fdb_version=7000,
+            first_sequence_no=0,
+            stream_name="stream_dedup",
+            bridge_timestamp_ns=1000,
+            stream_id=7,
+        )
+
+    with pytest.raises(
+        InputValueError, match="stream_id and source_id must both be present"
+    ):
+        serialize_version_group(
+            [_FakeNativeMutation(MutationType.SET_VALUE, b"\x01key", b"val")],
+            fdb_version=7000,
+            max_record_bytes=1000,
+            stream_name="stream_dedup",
+            bridge_timestamp_ns=1000,
+            source_id="s1",
+        )
+
+    # Wire with empty or unpaired source_id / stream_id raises RecordDecodeError
     wire_empty_source = mutations_pb2.FDBMutationRecord(
         stream_name="stream_dedup",
         source_id="",
         version_end=mutations_pb2.VersionEnd(fdb_version=7000),
     ).SerializeToString()
-    rec_empty_source = deserialize_record(wire_empty_source)
-    assert rec_empty_source.source_id is None
+    with pytest.raises(
+        RecordDecodeError, match="source_id on wire must not be empty"
+    ) as exc_es:
+        deserialize_record(wire_empty_source)
+    assert exc_es.value.reason == DecodeFailure.MALFORMED_WIRE
+
+    wire_half_stream = mutations_pb2.FDBMutationRecord(
+        stream_name="stream_dedup",
+        stream_id=7,
+        version_end=mutations_pb2.VersionEnd(fdb_version=7000),
+    ).SerializeToString()
+    with pytest.raises(
+        RecordDecodeError, match="stream_id and source_id must both be present"
+    ) as exc_hs:
+        deserialize_record(wire_half_stream)
+    assert exc_hs.value.reason == DecodeFailure.MALFORMED_WIRE
+
+    wire_half_source = mutations_pb2.FDBMutationRecord(
+        stream_name="stream_dedup",
+        source_id="source-1",
+        version_end=mutations_pb2.VersionEnd(fdb_version=7000),
+    ).SerializeToString()
+    with pytest.raises(
+        RecordDecodeError, match="stream_id and source_id must both be present"
+    ) as exc_hs_src:
+        deserialize_record(wire_half_source)
+    assert exc_hs_src.value.reason == DecodeFailure.MALFORMED_WIRE
 
 
 def test_directory_context_surrogate_path_rejected() -> None:
@@ -724,7 +805,7 @@ def test_read_side_directory_verification() -> None:
 
     with pytest.raises(RecordDecodeError) as exc_info:
         deserialize_record(wire_bad_key)
-    assert exc_info.value.reason == DecodeFailure.MALFORMED_WIRE
+    assert exc_info.value.reason == DecodeFailure.DIRECTORY_MISMATCH
     assert "does not start with directory subspace prefix" in str(exc_info.value)
 
     # Wire with clear range outside subspace fails closed
@@ -743,7 +824,7 @@ def test_read_side_directory_verification() -> None:
 
     with pytest.raises(RecordDecodeError) as exc_info:
         deserialize_record(wire_bad_clear)
-    assert exc_info.value.reason == DecodeFailure.MALFORMED_WIRE
+    assert exc_info.value.reason == DecodeFailure.DIRECTORY_MISMATCH
     assert "falls outside directory subspace prefix" in str(exc_info.value)
 
     # Wire with empty subspace_prefix fails closed
@@ -762,7 +843,7 @@ def test_read_side_directory_verification() -> None:
 
     with pytest.raises(RecordDecodeError) as exc_info:
         deserialize_record(wire_empty_prefix)
-    assert exc_info.value.reason == DecodeFailure.MALFORMED_WIRE
+    assert exc_info.value.reason == DecodeFailure.DIRECTORY_MISMATCH
     assert "empty path or subspace prefix" in str(exc_info.value)
 
     # Wire with empty path fails closed
@@ -779,8 +860,150 @@ def test_read_side_directory_verification() -> None:
 
     with pytest.raises(RecordDecodeError) as exc_info:
         deserialize_record(wire_empty_path)
-    assert exc_info.value.reason == DecodeFailure.MALFORMED_WIRE
+    assert exc_info.value.reason == DecodeFailure.DIRECTORY_MISMATCH
     assert "empty path or subspace prefix" in str(exc_info.value)
+
+
+def test_read_side_batch_second_mutation_outside_subspace_rejected() -> None:
+    # A batch whose second mutation key is outside the directory prefix
+    wire = mutations_pb2.FDBMutationRecord(
+        stream_name="test_stream",
+        directory=mutations_pb2.FDBDirectoryContext(
+            path=["tenants", "a"], subspace_prefix=b"\x01"
+        ),
+        batch=mutations_pb2.FDBMutationBatch(
+            mutations=[
+                mutations_pb2.FDBMutation(
+                    version_index=mutations_pb2.FDBVersionIndex(
+                        fdb_version=100, sequence_no=0
+                    ),
+                    single_key_mutation=mutations_pb2.FDBSingleKeyMutation(
+                        mutation_type=0, key=b"\x01valid_key", value=b"val1"
+                    ),
+                ),
+                mutations_pb2.FDBMutation(
+                    version_index=mutations_pb2.FDBVersionIndex(
+                        fdb_version=100, sequence_no=1
+                    ),
+                    single_key_mutation=mutations_pb2.FDBSingleKeyMutation(
+                        mutation_type=0, key=b"\x02foreign_key", value=b"val2"
+                    ),
+                ),
+            ]
+        ),
+    ).SerializeToString()
+
+    with pytest.raises(RecordDecodeError) as exc_info:
+        deserialize_record(wire)
+    assert exc_info.value.reason == DecodeFailure.DIRECTORY_MISMATCH
+    assert exc_info.value.index == 1
+    assert "batch position 1" in str(exc_info.value)
+    assert "does not start with directory subspace prefix" in str(exc_info.value)
+
+
+def test_read_side_batch_second_mutation_clear_outside_subspace_rejected() -> None:
+    # A batch whose second mutation is a clear range outside the directory prefix
+    wire = mutations_pb2.FDBMutationRecord(
+        stream_name="test_stream",
+        directory=mutations_pb2.FDBDirectoryContext(
+            path=["tenants", "a"], subspace_prefix=b"\x01"
+        ),
+        batch=mutations_pb2.FDBMutationBatch(
+            mutations=[
+                mutations_pb2.FDBMutation(
+                    version_index=mutations_pb2.FDBVersionIndex(
+                        fdb_version=100, sequence_no=0
+                    ),
+                    single_key_mutation=mutations_pb2.FDBSingleKeyMutation(
+                        mutation_type=0, key=b"\x01valid_key", value=b"val1"
+                    ),
+                ),
+                mutations_pb2.FDBMutation(
+                    version_index=mutations_pb2.FDBVersionIndex(
+                        fdb_version=100, sequence_no=1
+                    ),
+                    clear_range=mutations_pb2.FDBClearRange(
+                        begin_key=b"\x01begin", end_key=b"\x02end"
+                    ),
+                ),
+            ]
+        ),
+    ).SerializeToString()
+
+    with pytest.raises(RecordDecodeError) as exc_info:
+        deserialize_record(wire)
+    assert exc_info.value.reason == DecodeFailure.DIRECTORY_MISMATCH
+    assert exc_info.value.index == 1
+    assert "batch position 1" in str(exc_info.value)
+    assert "falls outside directory subspace prefix" in str(exc_info.value)
+
+
+def test_writer_checks_reject_mutations_outside_directory() -> None:
+    dir_ctx = FDBDirectoryContext(path=("tenants", "a"), subspace_prefix=b"\x01")
+
+    # serialize_mutation: key outside prefix
+    with pytest.raises(
+        InputValueError, match="does not start with directory subspace prefix"
+    ) as exc_m1:
+        serialize_mutation(
+            _FakeNativeMutation(MutationType.SET_VALUE, b"\x02key", b"val"),
+            fdb_version=100,
+            sequence_no=0,
+            stream_name="test_stream",
+            bridge_timestamp_ns=1000,
+            directory=dir_ctx,
+        )
+    assert exc_m1.value.field == "mutation"
+
+    # serialize_mutation: clear range outside prefix
+    with pytest.raises(
+        InputValueError, match="falls outside directory subspace prefix"
+    ) as exc_m2:
+        serialize_mutation(
+            _FakeNativeMutation(MutationType.CLEAR_RANGE, b"\x01start", b"\x02end"),
+            fdb_version=100,
+            sequence_no=0,
+            stream_name="test_stream",
+            bridge_timestamp_ns=1000,
+            directory=dir_ctx,
+        )
+    assert exc_m2.value.field == "mutation"
+
+    # serialize_batch: mutation key at index 1 outside prefix
+    with pytest.raises(
+        InputValueError, match="does not start with directory subspace prefix"
+    ) as exc_b1:
+        serialize_batch(
+            [
+                _FakeNativeMutation(MutationType.SET_VALUE, b"\x01k1", b"v1"),
+                _FakeNativeMutation(MutationType.SET_VALUE, b"\x02k2", b"v2"),
+            ],
+            fdb_version=100,
+            first_sequence_no=0,
+            stream_name="test_stream",
+            bridge_timestamp_ns=1000,
+            directory=dir_ctx,
+        )
+    assert exc_b1.value.field == "mutations"
+    assert exc_b1.value.index == 1
+
+    # serialize_batch: clear range at index 1 outside prefix
+    with pytest.raises(
+        InputValueError, match="falls outside directory subspace prefix"
+    ) as exc_b2:
+        serialize_batch(
+            [
+                _FakeNativeMutation(MutationType.SET_VALUE, b"\x01k1", b"v1"),
+                _FakeNativeMutation(MutationType.CLEAR_RANGE, b"\x01begin", b"\x02end"),
+            ],
+            fdb_version=100,
+            first_sequence_no=0,
+            stream_name="test_stream",
+            bridge_timestamp_ns=1000,
+            directory=dir_ctx,
+        )
+    assert exc_b2.value.field == "mutations"
+    assert exc_b2.value.index == 1
 
 
 def test_directory_context_all_xff_prefix_rejected() -> None:

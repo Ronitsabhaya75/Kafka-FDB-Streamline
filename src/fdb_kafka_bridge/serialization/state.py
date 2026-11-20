@@ -22,8 +22,14 @@ from fdb_kafka_bridge.serialization.model import (
 )
 from fdbkafka.bridge.state.v1 import state_pb2
 
-_CURRENT_FORMAT_VERSION: Final[int] = 1
-_SUPPORTED_FORMAT_VERSIONS: Final[frozenset[int]] = frozenset({_CURRENT_FORMAT_VERSION})
+_CHECKPOINT_FORMAT_VERSION: Final[int] = 2
+_LEASE_FORMAT_VERSION: Final[int] = 1
+_SUPPORTED_CHECKPOINT_FORMAT_VERSIONS: Final[frozenset[int]] = frozenset(
+    {_CHECKPOINT_FORMAT_VERSION}
+)
+_SUPPORTED_LEASE_FORMAT_VERSIONS: Final[frozenset[int]] = frozenset(
+    {_LEASE_FORMAT_VERSION}
+)
 _INT64_MAX: Final[int] = _MAX_VERSION
 _UINT64_MAX: Final[int] = (1 << 64) - 1
 _MAX_TIMESTAMP_SECONDS: Final[int] = 253_402_300_799
@@ -74,19 +80,18 @@ def _validate_checkpoint_model(checkpoint: CDCCheckpoint) -> None:
     _checks._integer(
         checkpoint.format_version,
         field="format_version",
-        minimum=1,
-        maximum=1,
+        minimum=_CHECKPOINT_FORMAT_VERSION,
+        maximum=_CHECKPOINT_FORMAT_VERSION,
     )
     _checks._text(checkpoint.source_id, "source_id")
     _checks._text(checkpoint.stream_name, "stream_name")
 
-    if checkpoint.stream_id is not None:
-        _checks._integer(
-            checkpoint.stream_id,
-            field="stream_id",
-            minimum=0,
-            maximum=_UINT64_MAX,
-        )
+    _checks._integer(
+        checkpoint.stream_id,  # type: ignore[arg-type]
+        field="stream_id",
+        minimum=0,
+        maximum=_UINT64_MAX,
+    )
 
     # -1 represents a fresh CDC cursor; commit versions run up to _INT64_MAX
     _checks._integer(
@@ -144,8 +149,8 @@ def _validate_lease_model(lease: LeaderLease) -> None:
     _checks._integer(
         lease.format_version,
         field="format_version",
-        minimum=1,
-        maximum=1,
+        minimum=_LEASE_FORMAT_VERSION,
+        maximum=_LEASE_FORMAT_VERSION,
     )
     _checks._text(lease.source_id, "source_id")
     _checks._text(lease.stream_name, "stream_name")
@@ -241,7 +246,7 @@ def deserialize_checkpoint(data: bytes) -> CDCCheckpoint:
             reason=DecodeFailure.MALFORMED_WIRE,
         ) from exc
 
-    if msg.format_version not in _SUPPORTED_FORMAT_VERSIONS:
+    if msg.format_version not in _SUPPORTED_CHECKPOINT_FORMAT_VERSIONS:
         raise StateDecodeError(
             f"Checkpoint format_version {msg.format_version} is unsupported",
             reason=DecodeFailure.UNSUPPORTED_FORMAT_VERSION,
@@ -287,10 +292,15 @@ def deserialize_checkpoint(data: bytes) -> CDCCheckpoint:
             f"Checkpoint lease_epoch {msg.lease_epoch} is out of range",
             reason=DecodeFailure.MALFORMED_WIRE,
         )
+    if not msg.HasField("stream_id"):
+        raise StateDecodeError(
+            "Checkpoint missing required stream_id",
+            reason=DecodeFailure.MALFORMED_WIRE,
+        )
 
     sink = KafkaSinkIdentity(cluster_id=msg.sink.cluster_id, topic=msg.sink.topic)
     update_ts = _ns_from_timestamp(msg.update_timestamp)
-    stream_id = msg.stream_id if msg.HasField("stream_id") else None
+    stream_id = msg.stream_id
 
     return CDCCheckpoint(
         format_version=msg.format_version,
@@ -361,7 +371,7 @@ def deserialize_leader_lease(data: bytes) -> LeaderLease:
             reason=DecodeFailure.MALFORMED_WIRE,
         ) from exc
 
-    if msg.format_version not in _SUPPORTED_FORMAT_VERSIONS:
+    if msg.format_version not in _SUPPORTED_LEASE_FORMAT_VERSIONS:
         raise StateDecodeError(
             f"LeaderLease format_version {msg.format_version} is unsupported",
             reason=DecodeFailure.UNSUPPORTED_FORMAT_VERSION,

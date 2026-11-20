@@ -28,14 +28,14 @@ Identifies the destination Kafka cluster and topic sink:
 
 ### 2.2 CDCCheckpoint
 
-Durable checkpoint state committed inside FoundationDB:
+Durable checkpoint state committed inside FoundationDB. Format version 1 is the tuple-encoded checkpoint format documented in [`docs/FDB-CHECKPOINT-SPEC.md`](FDB-CHECKPOINT-SPEC.md). `CDCCheckpoint` defines the future Protobuf format version 2 (`format_version = 2`):
 
 | Field | Protobuf Type | Validation Rules | Description |
 |---|---|---|---|
-| `format_version` | `uint32` | Must equal `1` | State schema format version. |
+| `format_version` | `uint32` | Must equal `2` | State schema format version (format 1 is the tuple format in [`FDB-CHECKPOINT-SPEC.md`](FDB-CHECKPOINT-SPEC.md)). |
 | `source_id` | `string` | Non-empty UTF-8 `str` | Stable operator-configured identity for the FDB cluster. |
 | `stream_name` | `string` | Non-empty UTF-8 `str` | Registered CDC stream name. |
-| `stream_id` | `optional uint64` | `0..2**64 - 1` or unset | Native CDC stream ID (distinguishes recreated streams; 0 is distinct from unset). |
+| `stream_id` | `optional uint64` | `0..2**64 - 1` (required by codec) | Native CDC stream ID (required for safe resumption; optional on wire). |
 | `last_consumed_version` | `int64` | `-1..2**63 - 1` | Highest commit version fully acknowledged to Kafka (`-1` indicates fresh cursor). |
 | `sink` | `KafkaSinkIdentity` | Valid `KafkaSinkIdentity` | Destination Kafka cluster and topic. |
 | `updating_instance_id` | `string` | Non-empty UTF-8 `str` | Unique instance ID of the bridge worker that wrote this checkpoint. |
@@ -60,7 +60,7 @@ Leader lease state committed inside FoundationDB for active leader coordination:
 
 ## 3. Operational Invariants & Semantics
 
-The schemas and codecs in `fdbkafka.bridge.state.v1` define the wire formats, models, and domain validation. The operational invariants described below (inclusive cursor resumption, transactional epoch fencing, heartbeat renewal, and sink-mismatch startup refusal) are the architectural contract for the upcoming Checkpoint Store and Leader Lease cards, which will enforce them at runtime.
+The production bridge runtime currently uses the tuple-encoded format version 1 checkpoint backend documented in [`docs/FDB-CHECKPOINT-SPEC.md`](FDB-CHECKPOINT-SPEC.md). The schemas and codecs in `fdbkafka.bridge.state.v1` define the Protobuf-based v2 state models, wire formats, and domain validation. The operational invariants described below (inclusive cursor resumption, transactional epoch fencing, heartbeat renewal, and sink-mismatch startup refusal) provide the architectural contract for future leader lease coordination and v2 state migration.
 
 ### 3.1 Inclusive Cursor Semantics
 

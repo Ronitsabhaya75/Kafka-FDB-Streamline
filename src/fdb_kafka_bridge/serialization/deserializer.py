@@ -134,7 +134,7 @@ def _verify_mutation_in_directory(
             raise RecordDecodeError(
                 f"clear range{_checks.at(index, label='batch position')} "
                 "falls outside directory subspace prefix",
-                reason=DecodeFailure.MALFORMED_WIRE,
+                reason=DecodeFailure.DIRECTORY_MISMATCH,
                 index=index,
             )
     else:
@@ -142,7 +142,7 @@ def _verify_mutation_in_directory(
             raise RecordDecodeError(
                 f"mutation key{_checks.at(index, label='batch position')} "
                 "does not start with directory subspace prefix",
-                reason=DecodeFailure.MALFORMED_WIRE,
+                reason=DecodeFailure.DIRECTORY_MISMATCH,
                 index=index,
             )
 
@@ -178,8 +178,9 @@ def deserialize_record(data: bytes) -> Record:
     Raises:
         InputTypeError: `data` is not `bytes`.
         RecordDecodeError: The bytes are an undecodable record. `reason` names the
-            failed check and `index` the batch position, if any. For
-            `MALFORMED_WIRE` the protobuf exception is the `__cause__`.
+            failed check and `index` the batch position, if any. For protobuf
+            parse failures `MALFORMED_WIRE` chains the protobuf exception as
+            `__cause__`.
     """
     if not isinstance(data, bytes):
         raise InputTypeError(
@@ -200,24 +201,32 @@ def deserialize_record(data: bytes) -> Record:
         if not message.directory.subspace_prefix or not message.directory.path:
             raise RecordDecodeError(
                 "directory context on wire has empty path or subspace prefix",
-                reason=DecodeFailure.MALFORMED_WIRE,
+                reason=DecodeFailure.DIRECTORY_MISMATCH,
             )
         directory = FDBDirectoryContext(
             path=tuple(message.directory.path),
             subspace_prefix=message.directory.subspace_prefix,
         )
-    stream_id = message.stream_id if message.HasField("stream_id") else None
-    source_id = (
-        message.source_id
-        if (message.HasField("source_id") and message.source_id)
-        else None
-    )
+    has_stream_id = message.HasField("stream_id")
+    has_source_id = message.HasField("source_id")
+    if has_source_id and not message.source_id:
+        raise RecordDecodeError(
+            "source_id on wire must not be empty",
+            reason=DecodeFailure.MALFORMED_WIRE,
+        )
+    if has_stream_id != has_source_id:
+        raise RecordDecodeError(
+            "stream_id and source_id must both be present or both be omitted",
+            reason=DecodeFailure.MALFORMED_WIRE,
+        )
+    stream_id = message.stream_id if has_stream_id else None
+    source_id = message.source_id if has_source_id else None
     body = _body(message)
     if directory is not None:
         if isinstance(body, VersionEnd):
             raise RecordDecodeError(
                 "VersionEnd record must not carry directory context",
-                reason=DecodeFailure.MALFORMED_WIRE,
+                reason=DecodeFailure.DIRECTORY_MISMATCH,
             )
         _verify_directory_bounds(body, directory)
     return Record(

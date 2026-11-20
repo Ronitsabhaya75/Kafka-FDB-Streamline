@@ -174,9 +174,9 @@ surfaces as `VersionEnd.bridge_timestamp_ns`. Unknown fields are ignored. An abs
 | `type` | not `int`, or `bool` | outside 0..255 |
 | `param1`, `param2` | not `bytes` (incl. `bytearray`, `memoryview`, `None`) | — |
 | `stream_name` | not `str` | `""`, or not UTF-8-encodable |
-| `source_id` | not `str` (when not `None`) | `""`, or not UTF-8-encodable |
-| `stream_id` | not `int` (when not `None`) | outside `0..2**64 - 1` |
-| `directory` | not `FDBDirectoryContext`, `subspace_prefix` not `bytes`, or `path` not tuple of `str` | empty `subspace_prefix`, all-`\xff` `subspace_prefix`, empty `path`, or `path` element not UTF-8-encodable |
+| `source_id` | not `str` (when not `None`) | `""`, not UTF-8-encodable, or set without `stream_id` |
+| `stream_id` | not `int` (when not `None`) | outside `0..2**64 - 1`, or set without `source_id` |
+| `directory` | not `FDBDirectoryContext`, `subspace_prefix` not `bytes`, or `path` not tuple of `str` | empty `subspace_prefix`, all-`\xff` `subspace_prefix`, empty `path`, `path` element not UTF-8-encodable, or mutation key/range outside prefix |
 | other integer keywords | `type(x) is not int` (rejects `bool`, `IntEnum`, `float`) | outside its range in §2.1; `max_record_bytes < 1`; an assigned `sequence_no` past 2**32-1 |
 | strict clear range | — | ambiguous clear range crossing boundaries or unresolved under `strict_directory_clears=True`; `strict_directory_clears=True` without `directory_resolver` |
 
@@ -213,7 +213,8 @@ SerializationError(Exception)
 
 | `DecodeFailure` | Condition |
 |---|---|
-| `MALFORMED_WIRE` | protobuf cannot parse (corrupt, truncated, invalid UTF-8 `stream_name`, `VersionEnd` carrying a directory, empty directory path/prefix, or mutation key/range outside directory subspace prefix); cause chained |
+| `MALFORMED_WIRE` | protobuf cannot parse bytes or invalid UTF-8 string on wire (cause chained); empty `source_id` or unpaired `stream_id`/`source_id` on wire |
+| `DIRECTORY_MISMATCH` | directory context violation on wire: empty directory path or prefix, `VersionEnd` carrying a directory, or mutation key/range outside directory subspace prefix |
 | `NO_RECORD_ARM` | no `record` arm set: `b""`, foreign bytes, or an arm from a newer schema |
 | `NO_MUTATION_ARM` | mutation with no `mutation` arm set |
 | `MISSING_VERSION_INDEX` | mutation without `version_index` |
@@ -221,7 +222,7 @@ SerializationError(Exception)
 | `TYPE_CODE_OUT_OF_RANGE` | `mutation_type` outside 0..255 |
 | `EMPTY_BATCH` | `batch` arm with no mutations |
 | `INCONSISTENT_BATCH` | mixed `fdb_version`, or `sequence_no[i] != sequence_no[0] + i`; `index` = first offender |
-| `UNSUPPORTED_FORMAT_VERSION` | state format version not in `SUPPORTED_FORMAT_VERSIONS` (currently only `1`) |
+| `UNSUPPORTED_FORMAT_VERSION` | state format version not in supported format versions (`2` for `CDCCheckpoint`, `1` for `LeaderLease`) |
 
 Arms that are present but all-default (e.g. empty `version_end` → `VersionEnd(0, 0, None)`) are
 accepted: presence is checked, not content.

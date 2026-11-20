@@ -111,6 +111,7 @@ def serialize_version_group(
     _checks.envelope(stream_name, bridge_timestamp_ns)
     _checks.stream_id(stream_id)
     _checks.source_id(source_id)
+    _checks.identity_pair(stream_id, source_id)
 
     raw_mutations = list(_checks.mutations(mutations))
     checked_natives: list[tuple[int, bytes, bytes]] = []
@@ -147,13 +148,15 @@ def serialize_version_group(
                         index=index,
                     )
         elif dir_ctx is not None:
-            if not p1.startswith(dir_ctx.subspace_prefix):
-                raise InputValueError(
-                    f"Mutation key does not start with resolved directory subspace "
-                    f"prefix at version {fdb_version}, sequence {index}",
-                    field="mutations",
-                    index=index,
-                )
+            _checks.check_mutation_within_directory(
+                code,
+                p1,
+                p2,
+                dir_ctx,
+                field="mutations",
+                index=index,
+                fdb_version=fdb_version,
+            )
 
         resolved_directories.append(dir_ctx)
 

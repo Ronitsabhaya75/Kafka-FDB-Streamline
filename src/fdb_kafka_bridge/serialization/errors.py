@@ -63,6 +63,7 @@ class DecodeFailure(enum.Enum):
     """Why bytes are not a decodable record. The value is the metric label."""
 
     MALFORMED_WIRE = "malformed_wire"
+    DIRECTORY_MISMATCH = "directory_mismatch"
     NO_RECORD_ARM = "no_record_arm"
     NO_MUTATION_ARM = "no_mutation_arm"
     MISSING_VERSION_INDEX = "missing_version_index"
