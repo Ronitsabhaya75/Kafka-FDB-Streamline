@@ -54,6 +54,9 @@ def test_v1_record_reads_as_held(fake_env: LeaseEnv) -> None:
         ("x", TOKEN),
         (0, TOKEN),
         (1, b"short"),
+        (2.0, 1, TOKEN, "pod"),
+        (True, 1, TOKEN),
+        (1.0, 1, TOKEN),
     ],
 )
 def test_unreadable_owner_records(fake_env: LeaseEnv, value: bytes | tuple) -> None:
@@ -72,6 +75,15 @@ def test_fake_tuple_matches_known_bytes() -> None:
         300,
         -300,
         None,
+    )
+    assert fake_fdb.pack((True, False, 2.0, -2.0)) == (
+        b"\x27\x26\x21\xc0" + bytes(7) + b"\x21\x3f" + b"\xff" * 7
+    )
+    assert fake_fdb.unpack(fake_fdb.pack((True, False, 2.0, -2.0))) == (
+        True,
+        False,
+        2.0,
+        -2.0,
     )
 
 
@@ -132,16 +144,18 @@ def test_claim_landed_under_commit_unknown_anchors_on_that_attempt(
     assert claimed is not None
     assert claimed.started == started
     assert claimed.lease.epoch == 1
-    assert len(fake_env.db.transactions[-1].priorities) == 2
+    assert fake_env.db.transactions[-1].priorities == ["system_immediate"] * 2
 
 
 def test_claim_not_landed_under_commit_unknown_anchors_on_retry(
     fake_env: LeaseEnv,
 ) -> None:
+    # Failed attempt's 0.1 s, then the fake on_error's first 10 ms backoff.
+    retry_start = fake_env.clock.monotonic() + 0.1 + 0.01
     fail(fake_env, "commit", 1021, advance=0.1)
     claimed = fake_env.leases().claim(S)
     assert claimed is not None
-    assert claimed.started > 1000.1
+    assert claimed.started == retry_start
 
 
 @pytest.mark.parametrize(
@@ -174,12 +188,13 @@ def test_release_failure_reports_not_released(fake_env: LeaseEnv) -> None:
     assert not leases.release(claimed.lease)
 
 
-def test_release_of_unreadable_record_is_refused(fake_env: LeaseEnv) -> None:
+def test_release_of_unreadable_record_is_a_format_error(fake_env: LeaseEnv) -> None:
     leases = fake_env.leases()
     claimed = leases.claim(S)
     assert claimed is not None
     fake_env.put(fake_env.store.subspace.pack((S, "owner")), b"bad")
-    assert not leases.release(claimed.lease)
+    with pytest.raises(CheckpointFormatError):
+        leases.release(claimed.lease)
     assert fake_env.get(fake_env.store.subspace.pack((S, "owner"))) == b"bad"
 
 

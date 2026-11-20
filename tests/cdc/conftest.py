@@ -1,6 +1,7 @@
 """Lease environments: the in-memory fake and, when enabled, live FoundationDB."""
 
 import os
+import signal
 import sys
 import uuid
 from collections.abc import Callable, Iterator
@@ -17,6 +18,11 @@ from fdb_kafka_bridge.cdc.lease import Leases
 from tests.cdc import fake_fdb
 
 LIVE = os.environ.get("FDB_CDC_INTEGRATION") == "1"
+LIVE_TEST_TIMEOUT_S = 30.0
+
+
+def _live_timed_out(signum: int, frame: object) -> None:
+    raise TimeoutError(f"live lease test exceeded {LIVE_TEST_TIMEOUT_S} s")
 
 
 @dataclass
@@ -108,11 +114,17 @@ def lease_env(
         path=("bridge-tests", uuid.uuid4().hex),
     )
     store.open()
+    # FakeClock never advances on its own, so a real-FDB retry loop bounded only by
+    # the fake clock would spin forever; fail the test on wall-clock time instead.
+    previous = signal.signal(signal.SIGALRM, _live_timed_out)
+    signal.setitimer(signal.ITIMER_REAL, LIVE_TEST_TIMEOUT_S)
     try:
         yield LeaseEnv(
             "live", import_module("fdb"), fake_fdb.FakeClock(), store, monkeypatch
         )
     finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
         begin, end = store.key_range()
         del client.db[begin:end]
         client.close()

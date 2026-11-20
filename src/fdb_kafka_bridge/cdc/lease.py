@@ -27,7 +27,7 @@ WATCH_PERIOD_S: float = 0.1
 WATCH_TIMEOUT_S: float = 0.2
 STALE_S: float = 1.0
 SELF_DROP_S: float = 0.8
-STOP_BUDGET_S: float = STALE_S - SELF_DROP_S
+STOP_BUDGET_S: float = 0.2
 CLAIM_TIMEOUT_S: float = 1.0
 CLAIM_RETRY_LIMIT: int = 5
 RELEASE_TIMEOUT_S: float = 1.0
@@ -138,6 +138,9 @@ def decode_owner(value: bytes | None) -> OwnerRecord | None:
         fields = import_module("fdb.tuple").unpack(value)
     except (ValueError, TypeError, IndexError, struct.error) as exc:
         raise CheckpointFormatError("Unreadable owner record") from exc
+    # Literal patterns compare with ==, which would accept True or 1.0 as v1.
+    if not fields or type(fields[0]) is not int:
+        raise CheckpointFormatError(f"Unreadable owner record {fields!r}")
     match fields:
         case (2, epoch, owner_id, str() as pod_name) if _is_epoch(epoch) and (
             owner_id is None or _is_owner_id(owner_id)
@@ -278,10 +281,12 @@ class Leases:
         # reads our owner_id anchors on the earliest of them: no watcher can have
         # seen the record before that attempt began.
         maybe_committed: list[float] = []
+        starts: list[float] = []
         tr = self.store.client.db.create_transaction()
         try:
             while True:
                 start = self.clock.monotonic()
+                starts.append(start)
                 try:
                     tr.options.set_priority_system_immediate()
                     tr.options.set_timeout(int(CLAIM_TIMEOUT_S * 1000))
@@ -297,7 +302,9 @@ class Leases:
                         return None
                     if record is not None and record.owner_id == owner_id:
                         lease = Lease(stream_name, record.epoch, owner_id)
-                        return Claimed(lease, maybe_committed[0])
+                        # Reading our fresh owner_id implies a maybe-committed
+                        # attempt; the first start is a conservative fallback.
+                        return Claimed(lease, min(maybe_committed, default=starts[0]))
                     if not (
                         record is None or record.owner_id is None or current == seen
                     ):
@@ -394,6 +401,7 @@ class Leases:
             Whether the owner record now shows this tenure released.
 
         Raises:
+            CheckpointFormatError: If the owner record is unreadable.
             TypeError: If ``lease.stream_name`` is not bytes.
         """
         fdb = import_module("fdb")
@@ -404,7 +412,7 @@ class Leases:
                 try:
                     tr.options.set_timeout(int(RELEASE_TIMEOUT_S * 1000))
                     tr.options.set_retry_limit(RELEASE_RETRY_LIMIT)
-                    record = _record(tr.get(key).value)
+                    record = decode_owner(tr.get(key).value)
                     if not _shows(record, lease.epoch, lease.owner_id):
                         # Every claim raises the epoch, so only this tenure can
                         # have written (epoch, None): our own earlier attempt.
@@ -467,14 +475,6 @@ class Leases:
                 del tr[key]
 
         self.store.run_transaction(clear, write=True)
-
-
-def _record(value: bytes | None) -> OwnerRecord | None:
-    """Decode an owner record, treating an unreadable one as absent."""
-    try:
-        return decode_owner(value)
-    except CheckpointFormatError:
-        return None
 
 
 def _shows(record: OwnerRecord | None, epoch: int, owner_id: bytes | None) -> bool:

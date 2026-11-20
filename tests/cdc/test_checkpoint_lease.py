@@ -7,7 +7,13 @@ from fdb_kafka_bridge.cdc.checkpoint import (
     CheckpointFencedError,
     CheckpointFormatError,
 )
-from fdb_kafka_bridge.cdc.lease import Lease, LeaseValue, encode_owner
+from fdb_kafka_bridge.cdc.lease import (
+    Claimed,
+    Lease,
+    LeaseValue,
+    decode_owner,
+    encode_owner,
+)
 from tests.cdc.conftest import LeaseEnv
 
 S = b"stream"
@@ -49,11 +55,29 @@ def test_released_or_missing_owner_fences(lease_env: LeaseEnv) -> None:
         store.verify_owner(b"other", Lease(b"other", 1, claimed.lease.owner_id))
 
 
-def test_v1_claim_does_not_satisfy_a_lease(lease_env: LeaseEnv) -> None:
+def test_save_loses_to_a_claim_racing_its_commit(lease_env: LeaseEnv) -> None:
+    store = lease_env.store
+    claimed = lease_env.leases("pod-a").claim(S)
+    assert claimed is not None
+    lease = claimed.lease
+    store.save(S, CheckpointCursor(1, 10), lease)
+    stale = LeaseValue(encode_owner(1, lease.owner_id, "pod-a"), 0)
+    taken: list[Claimed | None] = []
+    lease_env.race(lambda: taken.append(lease_env.leases("pod-b").claim(S, stale)))
+    with pytest.raises(CheckpointFencedError):
+        store.save(S, CheckpointCursor(1, 11), lease)
+    [taker] = taken
+    assert taker is not None
+    assert store.load(S, taker.lease) == CheckpointCursor(1, 10)
+
+
+def test_v1_record_never_satisfies_a_lease(lease_env: LeaseEnv) -> None:
     store = lease_env.store
     store.claim(S)
+    record = decode_owner(lease_env.get(store.subspace.pack((S, "owner"))))
+    assert record is not None and record.version == 1
     with pytest.raises(CheckpointFencedError):
-        store.load(S, Lease(S, 1, bytes(16)))
+        store.load(S, Lease(S, record.epoch, record.owner_id))
 
 
 def test_unreadable_owner_is_a_format_error(lease_env: LeaseEnv) -> None:

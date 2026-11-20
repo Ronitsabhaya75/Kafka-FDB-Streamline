@@ -4,11 +4,13 @@ Models what the lease conformance suite relies on: MVCC snapshot reads, read
 conflict ranges (snapshot reads add none), ``add`` as a blind little-endian
 counter, per-transaction timeout measured on an injected clock from creation,
 ``on_error`` retry limits and backoff, and the tuple layer for ``None``,
-``bytes``, ``str`` and ``int``. ``Database.on_op`` lets a test inject latency or
-errors at ``get``, ``get_range``, ``commit`` and ``committed`` (after the writes
-apply, so raising there models ``commit_unknown_result`` on a landed commit).
+``bytes``, ``str``, ``int``, ``bool`` and ``float``. ``Database.on_op`` lets a
+test inject latency or errors at ``get``, ``get_range``, ``commit`` and
+``committed`` (after the writes apply, so raising there models
+``commit_unknown_result`` on a landed commit).
 """
 
+import struct
 import threading
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
@@ -67,6 +69,15 @@ def _pack_one(value: object) -> bytes:
         return b"\x01" + _escape(value)
     if isinstance(value, str):
         return b"\x02" + _escape(value.encode("utf-8"))
+    if isinstance(value, bool):
+        return b"\x27" if value else b"\x26"
+    if isinstance(value, float):
+        raw = bytearray(struct.pack(">d", value))
+        if raw[0] & 0x80:
+            raw = bytearray(b ^ 0xFF for b in raw)
+        else:
+            raw[0] ^= 0x80
+        return b"\x21" + bytes(raw)
     if type(value) is int:
         if value == 0:
             return b"\x14"
@@ -120,6 +131,18 @@ def unpack(key: bytes, prefix_len: int = 0) -> tuple:
             raw_int = int.from_bytes(key[pos : pos + n], "big")
             out.append(raw_int if code >= 0x14 else raw_int - ((1 << (8 * n)) - 1))
             pos += n
+        elif code in (0x26, 0x27):
+            out.append(code == 0x27)
+        elif code == 0x21:
+            raw = bytearray(key[pos : pos + 8])
+            if len(raw) != 8:
+                raise ValueError("truncated tuple double")
+            if raw[0] & 0x80:
+                raw[0] ^= 0x80
+            else:
+                raw = bytearray(b ^ 0xFF for b in raw)
+            out.append(struct.unpack(">d", raw)[0])
+            pos += 8
         else:
             raise ValueError(f"unknown tuple type code {code:#x}")
     return tuple(out)

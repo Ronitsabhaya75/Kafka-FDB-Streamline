@@ -382,11 +382,13 @@ class CheckpointStore:
 
     def _check_lease(self, tr: Any, lease: "Lease") -> None:
         # Deferred to break the import cycle: lease.py imports this module.
-        from fdb_kafka_bridge.cdc.lease import decode_owner
+        from fdb_kafka_bridge.cdc.lease import OWNER_RECORD_V2, decode_owner
 
         value = tr.get(self.subspace.pack((lease.stream_name, "owner"))).value
         record = decode_owner(value)
-        if record is None or (record.epoch, record.owner_id) != (
+        # A v1 record is a process claim, never a lease's tenure.
+        if record is None or (record.version, record.epoch, record.owner_id) != (
+            OWNER_RECORD_V2,
             lease.epoch,
             lease.owner_id,
         ):
