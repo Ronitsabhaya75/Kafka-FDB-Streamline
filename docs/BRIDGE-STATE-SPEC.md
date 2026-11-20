@@ -90,7 +90,7 @@ Control-plane state operations differ fundamentally from streaming mutation reco
   - `InputTypeError`: An argument has the wrong Python type (e.g. non-bytes passed to deserializer).
   - `InputValueError`: A model field value is outside its valid domain (e.g. invalid format version, negative epoch).
   - `StateDecodeError`: Raised when decoding malformed or unsupported state bytes:
-    - `DecodeFailure.UNSUPPORTED_FORMAT_VERSION`: `format_version` not in supported set (currently only `1`).
+    - `DecodeFailure.UNSUPPORTED_FORMAT_VERSION`: `format_version` not in supported set (`2` for `CDCCheckpoint`, `1` for `LeaderLease`).
     - `DecodeFailure.VERSION_OUT_OF_RANGE`: `last_consumed_version` outside `-1..2**63 - 1`.
     - `DecodeFailure.MALFORMED_WIRE`: Corrupt protobuf bytes, missing required identities, or invalid timestamp components.
 
@@ -110,7 +110,7 @@ from fdb_kafka_bridge.serialization import (
 
 # Example Checkpoint Serialization
 checkpoint = CDCCheckpoint(
-    format_version=1,
+    format_version=2,
     source_id="fdb-primary",
     stream_name="orders",
     stream_id=12345,

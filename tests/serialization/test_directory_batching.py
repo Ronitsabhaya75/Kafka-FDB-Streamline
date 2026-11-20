@@ -32,6 +32,7 @@ from fdb_kafka_bridge.serialization.model import (
 from fdb_kafka_bridge.serialization.serializer import (
     serialize_batch,
     serialize_mutation,
+    serialize_version_end,
 )
 from fdb_kafka_bridge.serialization.version_group import serialize_version_group
 from fdbkafka.cdc.v1 import mutations_pb2
@@ -661,6 +662,17 @@ def test_deduplication_identity() -> None:
             source_id="s1",
         )
 
+    with pytest.raises(
+        InputValueError, match="stream_id and source_id must both be present"
+    ):
+        serialize_version_end(
+            fdb_version=7000,
+            total_mutations=1,
+            stream_name="stream_dedup",
+            bridge_timestamp_ns=1000,
+            stream_id=7,
+        )
+
     # Wire with empty or unpaired source_id / stream_id raises RecordDecodeError
     wire_empty_source = mutations_pb2.FDBMutationRecord(
         stream_name="stream_dedup",
@@ -1103,3 +1115,68 @@ def test_resolver_validation_error_carries_index() -> None:
         )
     assert exc_info.value.field == "directory.subspace_prefix"
     assert exc_info.value.index == 1
+
+
+def test_serialize_version_end_identity_pair() -> None:
+    # 1. Half-set: stream_id provided without source_id
+    with pytest.raises(
+        InputValueError, match="stream_id and source_id must both be present"
+    ) as exc_sid:
+        serialize_version_end(
+            fdb_version=1000,
+            total_mutations=0,
+            stream_name="stream_end",
+            bridge_timestamp_ns=1000,
+            stream_id=7,
+        )
+    assert exc_sid.value.field == "source_id"
+
+    # 2. Half-set: source_id provided without stream_id
+    with pytest.raises(
+        InputValueError, match="stream_id and source_id must both be present"
+    ) as exc_src:
+        serialize_version_end(
+            fdb_version=1000,
+            total_mutations=0,
+            stream_name="stream_end",
+            bridge_timestamp_ns=1000,
+            source_id="src-1",
+        )
+    assert exc_src.value.field == "stream_id"
+
+    # 3. Both omitted
+    wire_omitted = serialize_version_end(
+        fdb_version=1000,
+        total_mutations=0,
+        stream_name="stream_end",
+        bridge_timestamp_ns=1000,
+    )
+    rec_omitted = deserialize_record(wire_omitted)
+    assert rec_omitted.stream_id is None
+    assert rec_omitted.source_id is None
+
+    # 4. Valid pair
+    wire_valid = serialize_version_end(
+        fdb_version=1000,
+        total_mutations=0,
+        stream_name="stream_end",
+        bridge_timestamp_ns=1000,
+        stream_id=42,
+        source_id="src-1",
+    )
+    rec_valid = deserialize_record(wire_valid)
+    assert rec_valid.stream_id == 42
+    assert rec_valid.source_id == "src-1"
+
+    # 5. Valid pair with stream_id=0 boundary
+    wire_zero = serialize_version_end(
+        fdb_version=1000,
+        total_mutations=0,
+        stream_name="stream_end",
+        bridge_timestamp_ns=1000,
+        stream_id=0,
+        source_id="src-0",
+    )
+    rec_zero = deserialize_record(wire_zero)
+    assert rec_zero.stream_id == 0
+    assert rec_zero.source_id == "src-0"

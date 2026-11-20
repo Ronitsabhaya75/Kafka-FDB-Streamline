@@ -168,6 +168,7 @@ def serialize_version_end(
     _checks.envelope(stream_name, bridge_timestamp_ns)
     _checks.stream_id(stream_id)
     _checks.source_id(source_id)
+    _checks.identity_pair(stream_id, source_id)
     timestamp = _wire.timestamp(bridge_timestamp_ns)
     return _wire.record(
         stream_name,
