@@ -2,7 +2,8 @@
 
 Contract for `fdb_kafka_bridge.cdc.checkpoint`, `bridge.startup`, and `bridge.cli`.
 Related: [bridge state machine](BRIDGE-PIPELINE-SPEC.md),
-[CDC listener](CDC-CONSUMER-SPEC.md), [producer](KAFKA-PRODUCER-SPEC.md).
+[CDC listener](CDC-CONSUMER-SPEC.md), [producer](KAFKA-PRODUCER-SPEC.md),
+[failover](FAILOVER-SPEC.md).
 Trello: [FoundationDB Commit Version Checkpointing](https://trello.com/c/QmqdoJy5)
 (card #59; daemon card #61 is only partially covered).
 
@@ -132,8 +133,7 @@ The stream name is intentionally stored in the key, rather than duplicated in th
 startup separately checks the checkpoint's registration ID against that named stream.
 There is no `updated_by_instance` audit field in the cursor value. Process identity is
 kept in the separate owner record's random token for fencing, not as a human-readable
-writer history. A separate last-writer audit field remains a follow-up; deployments
-still require one active process per stream.
+writer history. A separate last-writer audit field remains a follow-up.
 
 `SinkIdentity` uses Kafka's broker-reported cluster ID, obtained through
 `MutationProducer.cluster_id(timeout)`, plus the configured topic **name**. Bootstrap
@@ -155,20 +155,20 @@ This replaces the pre-merge experimental Directory Layer layout; existing experi
 checkpoints need an explicit migration/replay plan before switching. No automatic
 fallback can infer whether absent progress is safe.
 
-Before loading a checkpoint, a process claims `(raw_stream_name, "owner")` by writing
-tuple-packed `(1, epoch + 1, random_instance_token)`. The leading `1` is the owner
-record format version so later lease/release fields can extend the layout without
-colliding with unversioned binaries. The token prevents an ABA match if an owner key
-is deleted and recreated. A retry after an uncertain claim commit reuses its token.
-Rebuilds verify the original claim; they never take ownership back. Unversioned
-two-field owner records are rejected as `CheckpointFormatError`.
-`subspace` and `run_transaction()` are public seams for future lease support.
+Current (v1): before loading a checkpoint, a process claims `(raw_stream_name, "owner")`
+once by writing `(1, epoch + 1, random_instance_token)`; rebuilds verify that claim and
+never take ownership back. A retry after an uncertain claim commit reuses its token.
+Unversioned two-field records raise `CheckpointFormatError`.
+Owner record v2, the heartbeat and the conditional claim replace this: see
+[failover lease state](FAILOVER-SPEC.md#lease-state).
 
 Every save reads and validates the owner in the same transaction, even for an equal
 cursor. A takeover conflicts with an in-flight save; subsequent saves by the old owner
 raise permanent `CheckpointFencedError`. Ownership is also checked before resume ack
 and every pipeline ack attempt, including retries after a successful checkpoint.
 These checks do not atomically fence a native ack already in flight or Kafka output.
+The save fence carries over to failover, comparing `(epoch, owner_id)`; see
+[lease state](FAILOVER-SPEC.md#lease-state).
 
 Every save is an optimistic FDB transaction that reads the stored value before writing:
 
@@ -215,11 +215,10 @@ Before stream registration or checkpoint advancement:
    missing history. The native 1007 refusal is also terminal if retention changes later.
 5. Require an explicit range if the stream does not exist; only then register it.
 
-Ownership is claimed before the saved stream ID and resume cursor are validated.
-Consequently a starter that later fails either check still evicts the live owner: the
-old owner's next ownership check/save fails, even though the replacement also stopped.
-This is a known availability limitation. Keep one active starter and use `Recreate`;
-pre-validating an unclaimed read and rechecking after claim is follow-up work.
+Ownership is claimed before the saved stream ID and resume cursor are validated, so a
+starter that fails either check still evicts the live owner. Failover retires this
+limitation: claim → checks, and a failed check blocks the stream instead of exiting;
+see [taking and giving up a stream](FAILOVER-SPEC.md#taking-and-giving-up-a-stream).
 
 An existing stream with no checkpoint logs a warning and uses cluster `min_version`.
 No startup check removes or re-registers an existing stream. If both registration and
@@ -246,7 +245,7 @@ Flags override environment variables:
 | `--kafka-bootstrap-servers` | `KAFKA_BOOTSTRAP_SERVERS` | `localhost:9092` |
 | `--cluster-file` | `FDB_CLUSTER_FILE` | Binding default |
 | `--topic` | `KAFKA_TOPIC` | `fdb.cdc.<stream_name>` |
-| `--transactional-id` | `STREAMLINE_TRANSACTIONAL_ID` | Nontransactional |
+| `--transactional-id`¹ | `STREAMLINE_TRANSACTIONAL_ID` | Nontransactional |
 | `--subspace-prefix` | `STREAMLINE_SUBSPACE_PREFIX` | Consume existing stream |
 | `--checkpoint-path` | `STREAMLINE_CHECKPOINT_PATH` | `fdb-kafka-bridge/checkpoints` |
 | `--checkpoint-timeout-s` | `STREAMLINE_CHECKPOINT_TIMEOUT_S` | 5 |
@@ -256,6 +255,9 @@ Flags override environment variables:
 | `--ack-timeout-s` | `STREAMLINE_ACK_TIMEOUT_S` | 5 |
 | `--proxy-consume-poll-timeout-s` | `CDC_PROXY_CONSUME_POLL_TIMEOUT` | 5 |
 | `--max-record-bytes` | `STREAMLINE_MAX_RECORD_BYTES` | Derived from stream-name key |
+
+¹ Failover replaces it with `--transactional-id-prefix`; see
+[Kafka fencing](FAILOVER-SPEC.md#kafka-fencing).
 
 Prefixes are UTF-8 text or `0x`-prefixed hexadecimal bytes. A path is slash-separated
 non-empty tuple-prefix components. The default record cap accounts for the stream-name
@@ -293,6 +295,9 @@ automatic retries. A `CDCConsumerClosedError` during a requested SIGINT/SIGTERM 
 is treated as clean shutdown, including cancellation before a resumed acknowledgement
 is restored. The same exception without a requested signal remains a runtime failure
 (exit 1); unrelated worker failures and teardown errors retain their normal exit codes.
+Under failover, exit 3 shrinks to pod-level checks; stream-level refusals block the
+stream instead. See [error mapping](FAILOVER-SPEC.md#error-mapping) and
+[exit codes](FAILOVER-SPEC.md#deployment-exit-codes-and-alerts).
 
 A worker failure takes precedence over a secondary `stop()` failure: teardown errors are
 logged, but the original worker error and its exit code are preserved. A teardown failure
@@ -319,6 +324,7 @@ bypass a live owner's checks or to make a sink mismatch disappear during normal 
    call `delete(raw_stream_name)` only after accepting startup from the stream's current
    `min_version`. Leave the owner key intact; the replacement process claims a new epoch.
    Corrupt/incompatible owner data requires a separately planned offline migration.
+   Owner key semantics under failover: [lease state](FAILOVER-SPEC.md#lease-state).
 5. Start one bridge process against the agreed sink and verify end-to-end progress and
    downstream state before re-enabling automatic restarts. Keep the preserved metadata
    with the recovery record.
@@ -342,14 +348,15 @@ with FDBClient(cluster_file="/etc/foundationdb/fdb.cluster") as client:
 
 The context manager opens and closes the FDB client. `store.open()` resolves the plain
 subspace without claiming ownership; `delete()` removes only this stream's cursor key.
-All bridge processes must remain stopped for this operation.
+All bridge processes must remain stopped for this operation; with a failover pool that
+means every pod, not just the leader.
 
 ## Scope and verification
 
-Use `replicas: 1` and `strategy: Recreate` for Kubernetes deployments. Owner fencing protects checkpoint writes during
-accidental overlap, but cannot retract old in-flight Kafka records or native
-acknowledgements. There are no leases, heartbeats or automatic multi-pod failover in this
-backend. All deployments of a stream must use the same checkpoint path and sink. A sink
+A single-process deployment uses `replicas: 1` and `strategy: Recreate`. Owner fencing
+protects checkpoint writes during accidental overlap, but cannot retract old in-flight
+Kafka records or native acknowledgements. A failover pool deploys per
+[failover deployment](FAILOVER-SPEC.md#deployment-exit-codes-and-alerts). All deployments of a stream must use the same checkpoint path and sink. A sink
 change needs an explicit replay/backfill plan; deleting progress does not recover history
 that was already acknowledged. A stalled stream retains TLog history, so monitor progress
 and repeated failures.

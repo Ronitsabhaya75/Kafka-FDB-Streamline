@@ -150,7 +150,7 @@ so an ack after an empty reply still needs its checkpoint first. Skipping both t
 for an empty reply is safe, which is why [§2.7](#27-threads-blocking-and-the-network-thread-) can
 coalesce them. Empty replies are the norm.
 `consume()` is a long poll. The proxy caps each server-side lease at `CDC_PROXY_CONSUME_POLL_TIMEOUT`
-(5.0 s, `fdbserver/core/ServerKnobs.cpp:186`; `CDCProxy.cpp:1544-1552`), but the client renews an
+(5.0 s, `fdbserver/core/ServerKnobs.cpp:187`; `CDCProxy.cpp:1544-1552`), but the client renews an
 empty, unadvanced lease itself (`NativeCdc.cpp:809-814`), so `wait()` returns only on data, an
 advanced watermark, or an error ([§2.7](#27-threads-blocking-and-the-network-thread-)).
 
@@ -469,7 +469,7 @@ consumer is "confined to the network thread" (`ThreadSafeTransaction.cpp:109-135
 | Operation | Blocks | Mechanism |
 |---|---|---|
 | `Future.wait()` | The calling thread only, with the GIL released | Not `fdb_future_block_until_ready`. It registers `on_ready` and parks on a per-thread `multiprocessing.Semaphore` (`impl.py:733-756`). The library is loaded as `ctypes.CDLL` (`impl.py:1819-1830`). |
-| Outstanding `consume()` | Nothing client-side | The proxy holds the request until the stream's buffered frontier passes the cursor, which tag peeks advance even with no mutations, or for up to `CDC_PROXY_CONSUME_POLL_TIMEOUT` (5.0 s, server knob), then replies empty at the old cursor (`CDCProxy.cpp:771-791, 1468-1482, 1544-1552`). The client re-polls on an empty, unadvanced reply (`NativeCdc.cpp:809-814`), so **`wait()` does not return at lease expiry**. It returns on mutations, an advanced watermark, or an error, so an idle stream probably returns empty-but-advanced replies at peek cadence (UNVERIFIED). No timeout parameter. |
+| Outstanding `consume()` | Nothing client-side | The proxy holds the request until the stream's buffered frontier passes the cursor, which tag peeks advance even with no mutations, or for up to `CDC_PROXY_CONSUME_POLL_TIMEOUT` (5.0 s, server knob), then replies empty at the old cursor (`CDCProxy.cpp:771-791, 1468-1482, 1544-1552`). The client re-polls on an empty, unadvanced reply (`NativeCdc.cpp:809-814`), so **`wait()` does not return at lease expiry**. It returns on mutations, an advanced watermark, or an error. Since upstream #13991 an idle stream returns empty-but-advanced replies almost immediately: ~0.5 ms apart observed (devcontainer, single node, FDB 8.0.0); the 5 s bound applies only while the frontier is stalled. No timeout parameter. |
 | `on_ready` callback | The network thread, so every FDB op in the process | Runs there, or immediately on the caller if the future is ready (`api-python.rst:1194`), after taking the GIL. "…performing CPU intensive tasks will block the FoundationDB client thread and therefore all database access from that client" (`developer-guide.rst:430`). |
 | `wait()` inside a callback on an unready future | **Silent** deadlock | Documented: "Blocking in a callback on a non-ready future will cause a deadlock" (`developer-guide.rst:430`). C raises `blocked_from_network_thread` only on its own block path (`ThreadHelper.h:313-317`). Python's semaphore path skips that check. |
 | Reply decode | The network thread, then the caller | C++ deep-copies each reply on the network thread (`ThreadSafeTransaction.cpp:67-90`). Python copies again on the waiting thread (`impl.py:942-970`). Up to 10 MB per reply (L1). |
@@ -482,7 +482,7 @@ consumer is "confined to the network thread" (`ThreadSafeTransaction.cpp:109-135
 | A second `consume`/`acknowledge` while one is outstanding | **Real.** The second future fails with `client_invalid_operation`. The Python lock guards only issuing the call. | `NativeCdc.cpp:833-839, :880-886` |
 | `consume()` N+1 before `acknowledge()` of N | **Real, data loss.** The ack covers the latest delivered position, including the unproduced batch. | `NativeCdc.cpp:848` |
 | `close()` with a consume in flight | Does not cancel it. The reply is still valid, but the handle can no longer ack. | `ThreadSafeTransaction.cpp:118-127` |
-| `cancel()` (or dropping an unready future), then consume again | **Real, up to 5 s.** The handle frees at once, but the proxy holds `activeConsumes` until data arrives or the lease expires, so the next consume from any handle can draw `client_invalid_operation`. Inferred, not observed. | `fdb_c.cpp:270-280`; `NativeCdc.cpp:810-811, :827-829`; `CDCProxy.cpp:1511-1520` |
+| `cancel()` (or dropping an unready future), then consume again | **Real, but brief in practice.** Cancel or destroy does not release the proxy hold: the proxy keeps one `activeConsume` lease per stream (not tied to the connection) until the frontier passes the cursor, ownership changes or the stream is removed, a buffer-limit error, or `CDC_PROXY_CONSUME_POLL_TIMEOUT`. Meanwhile a consume from another handle draws `client_invalid_operation`; a new consume from the *same* handle replaces the hold (#14054). Since #13991 the hold ends within ms unless the frontier is stalled; killing a consumer and consuming from a new handle saw 0 errors in 10 trials (0.6–7 ms). Takeover handling: [failover spec](FAILOVER-SPEC.md#taking-and-giving-up-a-stream). | `fdb_c.cpp:270-280`; `NativeCdc.cpp:810-811, :827-829`; `CDCProxy.cpp:1511-1520` |
 | `get_position()` from another thread | Safe. It reads a spinlocked copy that lags an outstanding consume. | `ThreadSafeTransaction.cpp:62-65, :84-96, :137` |
 
 **Kafka.** confluent-kafka `produce()` only enqueues and raises `BufferError` when the queue is full.
@@ -590,7 +590,7 @@ Python raw as `fdb.FDBError`. The binding adds only `RuntimeError` (API < 800, m
 |---|---|---|---|
 | `transaction_too_old` (1007) | Requested data already popped, a retention-invariant violation, terminal | **`True`** (`fdb_c.cpp:176`) | Stop. A conventional retry loop spins forever on unrecoverable data loss. Alert, then rebuild. |
 | `server_overloaded` (1211) | Reply-budget or buffer-limit trip, including the L1 poison pill | **`False`**, absent from every predicate list (`fdb_c.cpp:167-184`) | Back off and retry with a bound. If it repeats at one version, it is L1: escalate, do not spin. |
-| `client_invalid_operation` (2000) | Concurrent consumer, unproven cursor, or a resume that skipped reconcile, or a predecessor's cancelled or abandoned poll still holding the proxy lease (≤ 5 s) | `False` | Terminal for the request. Distinguish fencing loss from cursor-proof failure before retrying. Within 5 s of a cancel or crash, back off past the lease and retry once. |
+| `client_invalid_operation` (2000) | Concurrent consumer, unproven cursor, or a resume that skipped reconcile, or a predecessor's cancelled or abandoned poll still holding the proxy lease (ms normally; up to `CDC_PROXY_CONSUME_POLL_TIMEOUT` while the frontier is stalled) | `False` | Terminal for the request. Distinguish fencing loss from cursor-proof failure before retrying. On a new handle's first consume, retry the same handle with short backoff for up to the knob; a 2000 beyond it means another live consumer. |
 
 ### Retention: what to watch (L3) ▲
 

@@ -37,7 +37,8 @@ Schema: [`mutations.proto`](../protobuf/proto/fdbkafka/cdc/v1/mutations.proto).
   Every returned record must be durably processed before ack.
 - **Idle acknowledgement cadence:** an idle reply carries no version groups, only an
   advanced watermark. By default each one returns a single zero-mutation `VersionEnd` that
-  must be acked before the next poll (one ack per ~5 s idle reply). Setting
+  must be acked before the next poll (one ack per idle reply; idle replies arrive almost
+  immediately, ~0.5 ms apart observed on a single-node cluster). Setting
   `idle_ack_max_replies` (N) and/or `idle_ack_max_seconds` (T) enables cumulative-ack
   coalescing ([CDC deep dive §1.3](CDC-DEEP-DIVE.md#13-acknowledgement-semantics-),
   [§2.7](CDC-DEEP-DIVE.md#27-threads-blocking-and-the-network-thread-)): an idle reply
@@ -160,7 +161,11 @@ otherwise used as given; the caller owns the full budget, see
     (2000). 1007 requires operator recovery. The listener retries 2000 only on the
     first consume of each new handle (fresh or resume), within
     `proxy_consume_poll_timeout_seconds`, then
-    raises it as terminal. Match that setting to the server's consume poll timeout.
+    raises it as terminal. Match that setting to the server's consume poll timeout
+    (`CDC_PROXY_CONSUME_POLL_TIMEOUT`, default 5.0 s, set via
+    `--knob_cdc_proxy_consume_poll_timeout` or `foundationdb.conf`; needs a restart).
+    The predecessor's proxy hold normally ends within ms; cancelling it client-side does
+    not release it ([deep dive §2.7](CDC-DEEP-DIVE.md#27-threads-blocking-and-the-network-thread-)).
 
 Only these three CDC error codes are classified ([CDC deep dive §3](CDC-DEEP-DIVE.md#errors-we-have-to-map-),
 whose standard `is_retryable` predicate is wrong about two of them). Any other native

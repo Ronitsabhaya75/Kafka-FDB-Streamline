@@ -192,4 +192,5 @@ defaults.
 without requesting or creating a topic. A missing identity is a `ValueError`;
 metadata retrieval errors propagate. Closed/fatal instances reject the operation.
 The FDB checkpoint backend binds progress to this identity and the configured topic;
-see [FDB checkpoints](FDB-CHECKPOINT-SPEC.md).
+see [FDB checkpoints](FDB-CHECKPOINT-SPEC.md). Per-stream transactional IDs under
+failover: [Kafka fencing](FAILOVER-SPEC.md#kafka-fencing).

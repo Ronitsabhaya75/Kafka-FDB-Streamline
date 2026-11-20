@@ -86,7 +86,7 @@ If the checkpoint or the acknowledgement budget fails after delivery, the next `
 Parsed via `from_dict(data)`:
 - `fdb`: `api_version` (default 800), `cluster_file` (optional path).
 - `cdc`: `stream_name` (required; empty or whitespace-only is rejected), `begin_key` / `end_key` (paired hex strings or bytes, `begin_key < end_key`), `max_record_bytes` (optional; `None` derives it from the stream name, see [CDC spec](CDC-CONSUMER-SPEC.md)), `cursor_file` (optional path), `checkpoint_path` (optional tuple/list of directory-prefix components, mutually exclusive with `cursor_file`), `checkpoint_timeout_seconds` (default 5), `checkpoint_retry_limit` (default 10), `ack_timeout_seconds` (default 5), `proxy_consume_poll_timeout_seconds` (default 5; match the server knob).
-- `kafka`: `bootstrap_servers`, `topic`, `transactional_id` (optional non-empty string; setting it enables transactional mode).
+- `kafka`: `bootstrap_servers`, `topic`, `transactional_id` (optional non-empty string; setting it enables transactional mode). Failover replaces it with `transactional_id_prefix` ([Kafka fencing](FAILOVER-SPEC.md#kafka-fencing)).
 - `pipeline`: `flush_timeout_seconds`, `backoff_base_seconds`, `backoff_max_seconds`, `shutdown_timeout_seconds`.
 
 Unknown keys at any level raise `ValueError`, so a typo fails instead of silently falling back to a default.
@@ -184,3 +184,5 @@ The `streamline-daemon` command wraps this same `Bridge` with signal handling an
 FDB checkpoints by default. It chooses `fdb.cdc.<stream_name>` unless overridden.
 See [FDB checkpoint and CLI contract](FDB-CHECKPOINT-SPEC.md) for the wire format,
 configuration, single-process ownership requirement, exit codes and tests.
+Lease-based take/give-up in `Bridge`:
+[taking and giving up a stream](FAILOVER-SPEC.md#taking-and-giving-up-a-stream).
