@@ -341,7 +341,8 @@ jobs:
               echo "=== Running Durable Bridge Tests ==="
               PYTHONPATH=/workspace:/workspace/src:/workspace/protobuf/gen \
               python3 -m pytest \
-                tests/bridge/ tests/cdc/test_checkpoint*.py \
-                --cov=fdb_kafka_bridge.cdc.checkpoint --cov-branch \
+                tests/bridge/ tests/cdc/test_checkpoint*.py tests/cdc/test_lease*.py \
+                --cov=fdb_kafka_bridge.cdc.checkpoint --cov=fdb_kafka_bridge.cdc.lease \
+                --cov-branch \
                 --cov-report=term-missing --cov-fail-under=100 -v
             '

@@ -5,11 +5,14 @@ import struct
 from collections.abc import Callable
 from dataclasses import dataclass
 from importlib import import_module
-from typing import Any, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar
 from uuid import uuid4
 
 from fdb_kafka_bridge.cdc.client import FDBClient
 from fdb_kafka_bridge.cdc.listener import strinc
+
+if TYPE_CHECKING:
+    from fdb_kafka_bridge.cdc.lease import Lease
 
 T = TypeVar("T")
 KeyRange = tuple[bytes, bytes]
@@ -135,6 +138,19 @@ def check_overlap(key_range: KeyRange, captured: list[KeyRange]) -> None:
         begin < other_end and other_begin < end for other_begin, other_end in captured
     ):
         raise CheckpointOverlapError("Checkpoint subspace overlaps CDC")
+
+
+def check_stream_name(stream_name: object) -> None:
+    """Reject non-bytes stream names, which would collide with text-led pod keys.
+
+    Args:
+        stream_name: Candidate raw stream name.
+
+    Raises:
+        TypeError: If ``stream_name`` is not ``bytes``.
+    """
+    if not isinstance(stream_name, bytes):
+        raise TypeError("stream_name must be bytes")
 
 
 class CheckpointStore:
@@ -279,7 +295,9 @@ class CheckpointStore:
         Raises:
             CheckpointFencedError: If an existing claim has been superseded.
             CheckpointError: If ownership data is malformed or the claim fails.
+            TypeError: If ``stream_name`` is not bytes.
         """
+        check_stream_name(stream_name)
         key = self.subspace.pack((stream_name, "owner"))
         token = uuid4().bytes
 
@@ -301,16 +319,22 @@ class CheckpointStore:
 
         self._owners[stream_name] = self.run_transaction(claim, write=True)
 
-    def verify_owner(self, stream_name: bytes) -> None:
+    def verify_owner(self, stream_name: bytes, lease: "Lease | None" = None) -> None:
         """Refuse acknowledgement or rebuild after another process takes ownership.
 
         Args:
             stream_name: Raw name of a previously claimed stream.
+            lease: Tenure to verify; without one, the process claim is verified.
 
         Raises:
             CheckpointFencedError: If ownership is absent or has changed.
+            CheckpointFormatError: If a lease is given and the owner record is
+                unreadable.
+            TypeError: If ``stream_name`` is not bytes.
+            ValueError: If ``lease`` belongs to another stream.
         """
-        self.run_transaction(lambda tr: self._check_owner(tr, stream_name))
+        self._check_args(stream_name, lease)
+        self.run_transaction(lambda tr: self._check_owner(tr, stream_name, lease))
 
     def _decode_owner(self, value: bytes) -> tuple[int, bytes]:
         """Decode a versioned owner record as ``(epoch, token)``.
@@ -336,7 +360,17 @@ class CheckpointStore:
         except (ValueError, TypeError, IndexError, struct.error) as exc:
             raise CheckpointFormatError("Invalid checkpoint owner") from exc
 
-    def _check_owner(self, tr: Any, stream_name: bytes) -> None:
+    def _check_args(self, stream_name: bytes, lease: "Lease | None") -> None:
+        check_stream_name(stream_name)
+        if lease is not None and lease.stream_name != stream_name:
+            raise ValueError("Lease belongs to another stream")
+
+    def _check_owner(
+        self, tr: Any, stream_name: bytes, lease: "Lease | None" = None
+    ) -> None:
+        if lease is not None:
+            self._check_lease(tr, lease)
+            return
         expected = self._owners.get(stream_name)
         if expected is None:
             raise CheckpointFencedError("Claim stream ownership before saving")
@@ -345,6 +379,18 @@ class CheckpointStore:
             raise CheckpointFencedError(
                 "Stream ownership changed; stopping stale owner"
             )
+
+    def _check_lease(self, tr: Any, lease: "Lease") -> None:
+        # Deferred to break the import cycle: lease.py imports this module.
+        from fdb_kafka_bridge.cdc.lease import decode_owner
+
+        value = tr.get(self.subspace.pack((lease.stream_name, "owner"))).value
+        record = decode_owner(value)
+        if record is None or (record.epoch, record.owner_id) != (
+            lease.epoch,
+            lease.owner_id,
+        ):
+            raise CheckpointFencedError("Lease lost; stopping stale leader")
 
     def _decode(self, value: bytes | None) -> CheckpointCursor | None:
         if value is None:
@@ -362,34 +408,50 @@ class CheckpointStore:
         except (ValueError, TypeError, IndexError, OverflowError, struct.error) as exc:
             raise CheckpointFormatError("Invalid checkpoint data") from exc
 
-    def load(self, stream_name: bytes) -> CheckpointCursor | None:
+    def load(
+        self, stream_name: bytes, lease: "Lease | None" = None
+    ) -> CheckpointCursor | None:
         """Read and validate a stream's persisted cursor.
 
         Args:
             stream_name: Raw stream name.
+            lease: Tenure fencing the read; without one, the read is fenced only
+                after a process claim.
 
         Returns:
             Stored cursor, or None when no checkpoint exists.
+
+        Raises:
+            CheckpointFencedError: If the fence fails.
+            TypeError: If ``stream_name`` is not bytes.
+            ValueError: If ``lease`` belongs to another stream.
         """
+        self._check_args(stream_name, lease)
         key = self.subspace.pack((stream_name,))
 
         def load(tr: Any) -> CheckpointCursor | None:
-            if stream_name in self._owners:
-                self._check_owner(tr, stream_name)
+            if lease is not None or stream_name in self._owners:
+                self._check_owner(tr, stream_name, lease)
             return self._decode(tr.get(key).value)
 
         return self.run_transaction(load)
 
-    def save(self, stream_name: bytes, cursor: Any) -> None:
+    def save(
+        self, stream_name: bytes, cursor: Any, lease: "Lease | None" = None
+    ) -> None:
         """Save a monotonic cursor after all its Kafka records are durable.
 
         Args:
             stream_name: Raw stream name.
             cursor: Native cursor exposing stream_id and last_consumed_version.
+            lease: Tenure fencing the write; without one, the process claim does.
 
         Raises:
             CheckpointError: If identity, progress, format or transaction checks fail.
+            TypeError: If ``stream_name`` is not bytes.
+            ValueError: If ``lease`` belongs to another stream.
         """
+        self._check_args(stream_name, lease)
         self.key_range()
         new = CheckpointCursor(cursor.stream_id, cursor.last_consumed_version)
         key = self.subspace.pack((stream_name,))
@@ -405,7 +467,7 @@ class CheckpointStore:
 
         def save(tr: Any) -> None:
             stored = self._decode(tr.get(key).value)
-            self._check_owner(tr, stream_name)
+            self._check_owner(tr, stream_name, lease)
             if validate_progress(stored, new):
                 tr[key] = value
 
@@ -416,7 +478,11 @@ class CheckpointStore:
 
         Args:
             stream_name: Raw stream name.
+
+        Raises:
+            TypeError: If ``stream_name`` is not bytes.
         """
+        check_stream_name(stream_name)
         self.key_range()
         key = self.subspace.pack((stream_name,))
 
